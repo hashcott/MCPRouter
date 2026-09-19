@@ -5,6 +5,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "dependencies": {
-    "@mcprouter/core": "workspace:*"
+    "@mcprouter/core": "workspace:*",
+    "zod": "4.6.5"
   }
 }
