@@ -4,5 +4,7 @@
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
-  "dependencies": { "@mcprouter/core": "workspace:*" }
+  "dependencies": {
+    "@mcprouter/core": "workspace:*"
+  }
 }

@@ -3,5 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "bin": { "mcprouter": "./dist/main.js" }
+  "bin": {
+    "mcprouter": "./dist/main.js"
+  }
 }
