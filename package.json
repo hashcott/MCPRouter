@@ -1,0 +1,25 @@
+{
+  "name": "mcprouter",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "packageManager": "pnpm@10.12.4",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -b",
+    "build:clean": "tsc -b --clean && tsc -b",
+    "lint": "oxlint . && prettier --check .",
+    "format": "prettier --write .",
+    "test:unit": "vitest run --project unit",
+    "test:int": "vitest run --project integration",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.1",
+    "oxlint": "1.83.0",
+    "prettier": "3.9.7",
+    "typescript": "7.0.2",
+    "vitest": "5.0.1",
+    "@vitest/coverage-v8": "5.0.1"
+  }
+}

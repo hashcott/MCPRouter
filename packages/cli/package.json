@@ -1,0 +1,7 @@
+{
+  "name": "mcprouter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": { "mcprouter": "./dist/main.js" }
+}

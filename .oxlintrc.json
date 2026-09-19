@@ -1,0 +1,15 @@
+{
+  "plugins": ["import", "typescript"],
+  "categories": { "correctness": "error", "suspicious": "warn" },
+  "rules": {
+    "no-restricted-properties": [
+      "error",
+      {
+        "object": "AsyncLocalStorage",
+        "property": "enterWith",
+        "message": "Use .run() only. enterWith() leaks a principal across async boundaries (spec §8)."
+      }
+    ]
+  },
+  "ignorePatterns": ["dist", "coverage", "node_modules"]
+}
