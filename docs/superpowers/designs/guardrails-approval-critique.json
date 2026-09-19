@@ -1,0 +1,207 @@
+{
+  "subsystem": "Guardrails B \u2014 human-in-the-loop approval (packages/server/src/guardrails/) + untrusted-content labelling & managed-secret egress (packages/core/src/secrets/)",
+  "verdict": "needs-revision",
+  "over_engineered": [
+    {
+      "target": "inspectResult(): links{total,distinct,oddSchemes,hosts[]}, mimeTypes[], the URL_RE scan over the first 256 KB of every result, mcpr_result_links_total, mcpr_result_odd_scheme_total, and result_shape on every tool.call audit row",
+      "why": "Nothing consumes any of it. The design's own deferred list says 'add domain reputation when operators actually look at the link counts we already report' \u2014 you cannot justify shipping a speculative signal by pointing at the follow-up it enables. Meanwhile it puts a regex scan over up to 256 KB on the hot path of every tool call, forever, and inflates every audit row's jsonb.",
+      "instead": "Keep bytes, blocks, truncatedBytes \u2014 all three already fall out of the settled truncation step and cost zero. Delete the URL regex, hosts, distinct, oddSchemes, mimeTypes and both counters. Add them when an operator asks 'which hosts is this server sending me', which is also when you will know what shape they want. ~-150 LOC."
+    },
+    {
+      "target": "labelling:'meta+wrap' \u2014 the two-block envelope, the 110-bit base32 nonce, envelopeId, the 512 B truncation reserve, the ordering rule, and the whole `labelling` setting",
+      "why": "The design states plainly that no client honours it and that it is off by default. In v1 it is a setting, a nonce generator, a documented interaction with the 1 MB ceiling, a truncation-ordering invariant and a test suite that together produce exactly zero behaviour change for every install. This is the 'infrastructure for a host behaviour that does not exist yet' the design lists as its own risk \u2014 and then ships anyway.",
+      "instead": "Ship `_meta['io.mcprouter/provenance']` only: five lines, always on, mutates nothing, and it is the part a future host would key off. Delete the mode, the envelope, the nonce and the setting; keep the nonce ARGUMENT as a three-line comment for whoever adds wrapping. ~-120 LOC and one fewer generated setting."
+    },
+    {
+      "target": "ArgsPreview: `v:1`, per-leaf `type`, `foldedLeaves`, `len`, the two-valued `redacted` enum, the 64-leaf fold ceremony",
+      "why": "A bespoke versioned wire format with its own spec text, for a projection whose only reader is one card. `type` is inferable from the value, `v:1` versions a structure written and read in the same release, `foldedLeaves` is a number nobody acts on.",
+      "instead": "`Array<{path, value?, redacted?: 'secret'|'size', label?}>` plus the existing argsBytes. Keep the 8 KB DB CHECK \u2014 that one is load-bearing, it is what makes the cap real rather than hoped-for \u2014 and keep the 64-leaf cap as a silent truncation."
+    },
+    {
+      "target": "Three encodings in rebuildSecretMatcher (literal, unpadded base64, encodeURIComponent)",
+      "why": "Half-measure, which is the worst option: enough coverage to feel like a control, not enough to be one. base64url, padded base64 and hex all walk straight through, and base64url is what a token that has been through a URL or a JWT actually looks like.",
+      "instead": "Either literal-only \u2014 the design's own argument for why literal matching has no false-confidence problem applies exactly to it \u2014 or do the encodings properly: literal, base64 padded and unpadded, base64url, hex, percent. The second is four more entries in the same alternation and costs nothing. Pick one; do not ship three arbitrary forms."
+    },
+    {
+      "target": "approvalHoldMs default 300_000",
+      "why": "GB-D1 concedes the SDK's default client timeout is 60 s, so a 300 s hold spends 240 of those seconds writing keep-alives into a socket whose peer has given up. Each such hold burns a pending-budget token (cap 3) and retains up to 4 MB of argument memory, and the approval_timeout text it finally produces is read by nobody. At this default the most expensive mechanism in the design is also the least likely to work.",
+      "instead": "Default to 55_000 so the `approval_pending` text lands in the model's context while the turn is still alive \u2014 that text is what triggers the retry-after-approval loop, which is the path that actually works. Keep the 30 s\u2013900 s range. And re-read the risk the design already wrote: if measurement shows holds are nearly always abandoned, delete the hold and ship (b)+(c), ~300 LOC smaller."
+    }
+  ],
+  "contradicts_settled_design": [
+    {
+      "target": "`ALTER TABLE secrets ADD COLUMN scan_egress boolean NOT NULL DEFAULT true`",
+      "settled": "`secrets` is the only encrypted store, one seal/open pair, AES-256-GCM with AAD derived from the columns.",
+      "fix": "If AAD is literally 'the columns', adding scan_egress changes the AAD and every existing secret fails to open at the next boot \u2014 a silent total outage of every upstream. The migration must state that AAD is an explicit frozen field list (id \u2016 server_id \u2016 key) and that scan_egress is excluded from it, with one runnable check: seal a row, add the column, open it."
+    },
+    {
+      "target": "GB-D3 splitting core's public API into `resolveTool` + `callResolved`, scheduled in P7",
+      "settled": "Phase plan: P1 is 'one tool end-to-end' \u2014 the call path is built there.",
+      "fix": "A change to packages/core's public call API is not a P7 add-on; scheduling it there means P1 builds the call path against `callTool` and P7 rewrites it. Land the split in P1 (free there \u2014 callTool is literally their composition) and let P7 add only the guardrail steps between them. Same for the $smart seam: call_tool must be written to call the server-side guardedCall in P5, not rewired in P7."
+    },
+    {
+      "target": "`let matcher` as module-level mutable state in packages/core/src/secrets/resolver.ts, rebuilt 'wherever the resolved-config cache is invalidated'",
+      "settled": "The Engine is constructed with an injectable TransportFactory as the test seam; core is a library, not a process singleton.",
+      "fix": "A module global means two Engines in one process \u2014 and every test file in one worker \u2014 share one matcher, and 'wherever the cache is invalidated' is not a call site. Make it a field on the resolver instance the Engine already owns, rebuilt in exactly one function. Same diff size, no cross-test bleed."
+    },
+    {
+      "target": "ApprovalFrame's cache rule: 'both settled rules apply, in this order \u2014 setQueryData then invalidateQueries'",
+      "settled": "One cache rule: status/sync PATCH via setQueryData; changed/call INVALIDATE with refetchType:'active'; log never touches Query.",
+      "fix": "This is a third rule dressed as two. Put the global pending count in the existing `status` frame \u2014 it is a status number \u2014 and make `approval` a plain changed-family frame that only invalidates ['approvals']. The badge still updates everywhere and the console keeps exactly two cache behaviours."
+    },
+    {
+      "target": "'approval.decided and approval.args.read are written synchronously' against the settled bounded audit queue",
+      "settled": "audit_event is written off the critical path by a bounded queue (cap 10 000), flushed every 250 ms or at 200 rows.",
+      "fix": "The exception is right \u2014 a decision that is not durable must not be actioned \u2014 but it gives audit_event two writers with different durability. Specify that the synchronous write happens inside the same transaction as the decide UPDATE, not as a second statement or a second connection, and add one line to the audit design naming these two evt values as the only exceptions. Otherwise the next implementer routes them through the queue and the invariant dies silently."
+    }
+  ],
+  "security_holes": [
+    {
+      "attack": "requireSecondPerson is a complete no-op. The decide handler runs `UPDATE ... SET status='approved' ... RETURNING *` FIRST, then checks `if (cfg.requireSecondPerson && row.selfApproved) -> 403, row stays pending`. The row does not stay pending \u2014 it is already committed as approved with a live expiresAt. The 403 only suppresses notifyWaiters; the ticket sits in the table and the caller's next identical retry consumes it. An operator with one API key self-approves every call on an install that believes second-person approval is enforced.",
+      "fix": "Make it a precondition, not a postcondition. One statement, ownership computed in SQL and pushed into the WHERE clause (`AND (NOT $requireSecondPerson OR $principalOwnerUserId IS DISTINCT FROM $meId)`), so a self-approval under the setting returns zero rows and the row is genuinely untouched. This also fixes the sketch's other bug: `selfApproved: await ownsPrincipal(me.id, row.principalKind, row.principalId)` reads `row` inside the statement that produces it.",
+      "severity": "critical"
+    },
+    {
+      "attack": "`prompts/get` and `resources/read` are entirely ungated. The whole subsystem hangs off tools/call; the settled cache covers tools AND prompts AND resources and isExposed is kind-aware, but guardedCall is not. A caller blocked from putting a managed credential in a tool argument puts it in a prompts/get argument map or in the query string of a resources/read URI and it goes upstream unscanned, with no guardrail event and no approval path.",
+      "fix": "guardedCall takes `kind`. Run findManagedSecrets over prompt arguments and over the full resource URI including query and fragment. Policy and approval for prompts/resources may be deferred with a stated ceiling; the egress scan cannot \u2014 it is the only control here that blocks anything, and shipping it on one of three methods is the definition of false confidence.",
+      "severity": "high"
+    },
+    {
+      "attack": "`walkStrings(args, '', 16, 4096, ...)` \u2014 depth <=16, <=4096 leaves, both caps silently stopping the scan. Pad an object with 4096 one-character leaves (a few KB, nowhere near the 4 MB body limit) and put the credential in leaf 4097, or nest it 17 deep. findManagedSecrets returns [] and the call is allowed.",
+      "fix": "Do not walk to detect. Run the alternation once over JSON.stringify(args) \u2014 no caps, one pass, faster than the walk \u2014 and walk the tree afterwards only to compute the JSON pointer for reporting (that walk may cap freely; a hit with an unknown pointer is still a block). If the walk is kept, hitting either cap must fail closed to guardrail_unavailable, never to 'no hits'.",
+      "severity": "high"
+    },
+    {
+      "attack": "Encoding bypass. base64url, padded standard base64 and hex are all absent from the matcher. `Buffer.from(secret).toString('base64url')`, or one `.replace(/\\+/g,'-').replace(/\\//g,'_')`, defeats the control entirely \u2014 and base64url is the common form for anything that has travelled through a URL or a JWT.",
+      "fix": "Add base64url, padded base64 and lower/upper hex to the forms array: four lines in the same alternation, identical cost. Or drop to literal-only and say so. Do not ship a matcher covering three of six trivially reachable encodings while the block message asserts the credential 'genuinely' cannot leave.",
+      "severity": "high"
+    },
+    {
+      "attack": "Server flapping between two definitions. call_hash covers {serverId, bareName, args} and nothing about what the tool IS. An upstream serving definition A at discovery and definition B after a reconnect gets an operator to approve arguments against A and executes them against B \u2014 and resolveTool re-running at resume returns the NEW definition, so the re-check actively assists the attack. The ticket path is worse: a 10-minute window spanning a full reconnect cycle.",
+      "fix": "Store `definitionHash` on approval_request, computed at request time from the cached input_schema + description; the settled design already says tool_embedding is where a definition hash belongs, so the storage decision is made. On mismatch at consume time: do not dispatch and do not auto-deny \u2014 expire the ticket and enqueue a fresh card marked 'tool definition changed since approval'. Render the hash prefix on the card through <Id>.",
+      "severity": "high"
+    },
+    {
+      "attack": "Dedup and single-use contradict each other. waiters++ joins N identical calls to one card; the card says '2 calls waiting'; the operator approves; notifyWaiters wakes all N; the call-scope UPDATE with LIMIT 1 FOR UPDATE SKIP LOCKED lets exactly ONE consume. What the other N-1 do is unspecified and every plausible implementation is wrong \u2014 either they fall through and create a new pending card (the operator is asked again for what they just approved, which is the fatigue the design claims to have solved), or they fail in a way the model cannot act on. If an implementer instead loosens single-use to fix it, a lingering ticket lets a later identical call execute on a decision the operator believed applied to two specific in-flight calls.",
+      "fix": "Add `remaining integer` set to waiters at decide time. Consumption becomes `SET remaining = remaining - 1, status = CASE WHEN remaining = 1 THEN 'consumed' ELSE 'approved' END WHERE remaining > 0 ... RETURNING` \u2014 still one atomic statement. The card then honestly reads 'approve 2 waiting calls'. A waiter joining after the decision does not get the ticket, which the existing WHERE status='pending' already ensures.",
+      "severity": "high"
+    },
+    {
+      "attack": "The secret_egress text returned to the caller names the label: 'contains a credential MCPRouter manages (github.PAT)'. The caller is the untrusted party. This is a confirmation oracle \u2014 anyone who can reach one approval-free tool can test an arbitrary candidate string against the install's managed secrets and get a definitive yes plus a human-readable label. An attacker holding a rotated-but-similar value, a partially observed token, or a guess from another system gets confirmation for free, and enumerates the label namespace on every hit.",
+      "fix": "Model-facing text gets the reason and the JSON pointer only: 'Blocked: argument /token contains a credential MCPRouter manages. Nothing was sent upstream.' Strip label and secretId from GuardrailMeta.secretHits on the wire. Labels stay in the audit event and the operator card, the only two places they help.",
+      "severity": "high"
+    },
+    {
+      "attack": "Step ordering: findManagedSecrets (6) runs BEFORE policy.evaluate (7), so the oracle above is reachable even on tools policy would deny outright. The attacker gets the secret-confirmation signal on every callable tool rather than only the allowed ones.",
+      "fix": "Swap 6 and 7. Policy first, egress scan second. A one-line reorder, strictly smaller attack surface, and it also stops a policy_deny from paying for a regex pass over a 4 MB body.",
+      "severity": "medium"
+    },
+    {
+      "attack": "The hold path never re-authenticates. At resume it re-runs checkGrant and resolveTool against a Principal object materialised up to five minutes earlier. Revoking a compromised mcpr_ key, deleting a user or expiring an OAuth token mid-hold does not stop the held call \u2014 better-auth already said yes and nobody asks again. The retry path re-authenticates naturally, so the mechanism the design calls primary is the weaker of the two.",
+      "fix": "Re-verify the credential through better-auth at resume (apiKey verify / session lookup / token introspection) and rebuild the Principal before checkGrant. One extra call on a path that has already waited a minute. Order: re-verify -> acquire slot -> checkGrant -> resolveTool -> definitionHash check -> consume -> dispatch.",
+      "severity": "medium"
+    },
+    {
+      "attack": "scope:'tool' window grants have no use cap \u2014 use_count increments forever until expiresAt. 'Approve 15m' is unlimited calls to that tool with arbitrary arguments for fifteen minutes, which converts the fatigue attack the design says it defeats into exactly the blanket permission it says is unreachable: flood until the operator takes the one exit the UI offers, then issue ten thousand calls. The alert-dialog text is honest about the arguments and silent about the volume.",
+      "fix": "Add maxUses to the grant (default 20, same fixed-enum treatment as TTL) enforced in the same UPDATE: `AND use_count < max_uses`. Put it in the dialog: 'up to 20 calls, until 14:27'. A window grant that cannot be exhausted is not a bounded grant.",
+      "severity": "medium"
+    },
+    {
+      "attack": "`canonicalJson` is named and never defined, and nothing binds the hash to the bytes actually dispatched. Two implementers produce two canonicalisations (key order, NFC normalisation, number formatting, lone surrogates, duplicate-key and __proto__ handling). Any gap between what was hashed and what is sent upstream is an approval granted for one payload and used for another.",
+      "fix": "Name RFC 8785 (JCS) explicitly, serialise ONCE at step 8, hash those exact bytes, dispatch those exact bytes at step 10. Arguments that do not round-trip through JCS are denied, not guessed at. One runnable check: two bodies differing only in key order hash the same and dispatch identically; a body with a lone surrogate is rejected rather than silently rewritten.",
+      "severity": "medium"
+    },
+    {
+      "attack": "The retry instruction and the pending cap fight each other, and the loser is availability. approval_pending tells the model 'call this tool again with identical arguments'. Doing so hits 8d, bumps waiters, and takes another pending-budget token and another held connection. Three obedient retries and the model is told 'too many of your calls are already awaiting approval' for the single call it was instructed to retry. Any client with a 60 s timeout and automatic retry self-DoSes in under three minutes.",
+      "fix": "Only the request that CREATES a card holds. An identical call finding an existing pending card returns approval_pending immediately with the approvalId and a retryAfterMs \u2014 no hold, no budget token, waiters++ only for the count. This also caps held connections at one per card and bounds retained argument memory to the global pending cap.",
+      "severity": "medium"
+    },
+    {
+      "attack": "The approval card is a decision surface rendering two attacker-influenced strings as facts: sourceIp (behind any reverse proxy this is the proxy's address or a spoofable X-Forwarded-For, and the design never says which) and principalName (for an apiKey this is the key's user-supplied name \u2014 'github (pre-approved by admin)', or homoglyphs of a trusted key). An operator glancing at a card at 3am is reading text the requester chose.",
+      "fix": "sourceIp: populate only from a configured trusted-proxy hop count, null otherwise, and render 'unknown' rather than a lie. principalName: render through the <Id> mono component with a hard length cap and no styling, and always show the immutable better-auth apiKey id beside it \u2014 the id is the part the operator can check.",
+      "severity": "low"
+    }
+  ],
+  "underspecified": [
+    {
+      "target": "The per-principal pending cap of 3",
+      "ambiguity": "Step 8c checks `pendingFor(principalId) >= 3`, which reads as a DB count of pending rows; step 9 acquires `pendingBudget.acquire(principalKey)` with cap 3, an in-memory semaphore of held connections. With dedup these are different numbers \u2014 three identical calls join ONE row but take THREE tokens. One implementer builds a card cap, the other a connection cap, and queue-full behaviour diverges.",
+      "resolve_as": "Two named counters. `maxPendingCardsPerPrincipal` (DB, default 3) gates card creation at 8c. `maxHeldPerPrincipal` (in-memory, default 3, effectively 1 once only the creator holds) gates the hold at 9. Surface both in the zod block; do not let one number mean two things."
+    },
+    {
+      "target": "ToolUnavailableError propagation through $smart's call_tool meta-tool",
+      "ambiguity": "The design correctly requires call_tool to re-enter guardedCall but never says what happens when the INNER resolveTool throws: a JSON-RPC error for the outer tools/call, or an isError CallToolResult of call_tool. The two differ in whether the byte-identical `Tool not found: ${name}` invariant survives the meta-tool.",
+      "resolve_as": "Propagate as a JSON-RPC error with the identical message and the INNER name, exactly as a direct call would. The dedicated test the design already demands must assert byte-identity of direct and $smart-routed errors for a nonexistent tool, a disabled tool and an out-of-group tool."
+    },
+    {
+      "target": "resolveQueuedDuplicates() after a scope:'tool' decision",
+      "ambiguity": "A follow-up UPDATE over pending rows matching (principal_id, server_id, tool_name) misses rows inserted between the decide UPDATE and the follow-up, leaving a held waiter blocked on a decision that conceptually already happened. Also unspecified: do resolved duplicates become individually consumable tickets, or do they all redeem against the window grant?",
+      "resolve_as": "Do not resolve duplicates by UPDATE. Make the window grant the single source of truth: mark duplicates consumed with viaGrant and let every waiter, including later ones, redeem against the window grant at step 8a, which already precedes card creation. Race gone, and 'approve 15m' is one row instead of N."
+    },
+    {
+      "target": "Resume against a stale catalog",
+      "ambiguity": "The settled state machine says a ready server whose transport drops keeps serving its cached catalog with stale:true. So resolveTool at resume succeeds against a dead upstream, callResolved fails \u2014 after the ticket has been consumed.",
+      "resolve_as": "Treat a dispatch failure inside the 10 s resume budget as non-consuming: roll `remaining` back in the same transaction that records the failure. State this explicitly, or a flapping upstream silently eats approvals."
+    },
+    {
+      "target": "Retained argument memory during a hold",
+      "ambiguity": "bodyLimit is 4 MB and full arguments live in process memory for the hold duration; with a global pending budget of 50 that is a 200 MB worst case, and nothing bounds it or says what happens at the limit.",
+      "resolve_as": "Refuse to hold above a stated argument size (256 KB): create the card and return approval_pending immediately without holding. Same code path as the 'only the creator holds' fix, and the ticket mechanism already makes it survivable."
+    },
+    {
+      "target": "CHECK constraint named `approval_human_only`",
+      "ambiguity": "The constraint is `decided_by IS NULL OR decided_at IS NOT NULL`, which enforces nothing about humanness. A reviewer reading the schema will believe the 'an API key can never approve' invariant is enforced in the database. It is not \u2014 it lives entirely in route middleware.",
+      "resolve_as": "Rename it `approval_decision_complete` and add one line to the table comment stating the user-only invariant is enforced at the route layer and nowhere else. A constraint whose name overstates what it checks is the same false confidence this design correctly refuses elsewhere."
+    },
+    {
+      "target": "Phase placement and cost",
+      "ambiguity": "B1 is priced at +1.0w in P7 while containing a held-SSE response path, a five-status table with three indexes, a ticket protocol, a queue screen, a four-command CLI and five audit events \u2014 and GB-D3's core API split is scheduled there too, although P1 builds the call path.",
+      "resolve_as": "GB-D3 moves into P1 at +0.0w (it refactors code being written anyway). B2 stays P4, +0.5w as written, dropping to ~+0.25w with the inspectResult and envelope cuts. B1 is +1.5w, not +1.0w. Revised total ~14.25\u201314.5 dev-weeks; say it now rather than discovering it in P7."
+    }
+  ],
+  "missing": [
+    {
+      "gap": "No retention or GC for approval_request, which directly falsifies GB-D2's headline claim. The sweep only touches pending/approved; denied, expired and consumed rows live forever, each carrying an args_preview that keeps scalars verbatim up to 256 chars across up to 64 leaves \u2014 up to 8 KB of real argument material per row, permanently. 'The approval queue cannot become an argument archive even if the database is stolen' is true for fifteen minutes and false after that. Fix: delete or null args_preview at decide time, plus a dated retention sweep alongside the existing 30 s one.",
+      "severity": "high"
+    },
+    {
+      "gap": "Nothing surfaces a guardrail BLOCK to an operator. The design adds an SSE frame for approvals but a secret_egress or guardrail_unavailable denial goes only to the model and into audit_event. The false-positive story ('the fix is one checkbox, named in the error message') assumes the operator reads the error \u2014 but the error is delivered to the model, in a chat the operator may not be in. The first false positive is therefore diagnosed by grepping audit_event, not by clicking a checkbox. Emit blocks on the existing /api/events channel (operator|admin only) and badge them in the console.",
+      "severity": "high"
+    },
+    {
+      "gap": "No boot reset of `held`. The abort path sets held=false; a crash does not. After a restart, rows are held=true with no in-memory arguments, so GET /api/approvals/:id/args either 500s or 410s while the card tells the operator a caller is still waiting. One statement at boot under the existing pg_advisory_lock: UPDATE approval_request SET held=false WHERE held.",
+      "severity": "medium"
+    },
+    {
+      "gap": "No way to undo a deny. A misclick denies, the cooldown refuses identical retries for ten minutes with 'Do not retry.', and there is no clear-cooldown or change-decision affordance in the UI, the API or the CLI. This is the single most likely reason an operator turns the subsystem off. Allow a denied card to be re-decided within denyCooldownMs \u2014 it becomes an ordinary ticket, audited as a second approval.decided carrying the prior decision.",
+      "severity": "medium"
+    },
+    {
+      "gap": "No approval metrics at all, in a subsystem half of which is explicitly scheduled into P4 observability. Add mcpr_approval_pending (gauge, no labels), mcpr_approval_decisions_total{decision} and mcpr_guardrail_blocked_total{reason}: all zero- or low-cardinality, none violating the settled no-multiplication rule. Time-to-decision belongs in audit, not a histogram.",
+      "severity": "medium"
+    },
+    {
+      "gap": "The policy engine's failure mode is install-wide. Per-call fail-closed is right, but policy.evaluate runs on EVERY tools/call, so one bug in the other agent's evaluator takes the whole gateway to zero and nothing in this design constrains what evaluate may do. Require it to be a synchronous pure function over already-loaded rules, no I/O, hard per-call time budget \u2014 so 'unavailable' is only ever per-input, never global \u2014 and give it a loud console state instead of letting operators discover it in the model's error text.",
+      "severity": "medium"
+    },
+    {
+      "gap": "decisionNote (280 chars, operator-authored) is interpolated verbatim into the model-facing approval_denied text, immediately after a paragraph asserting every guardrail string is 'flat and instruction-free'. The operator is trusted so this is not an injection hole, but the claim as written is false and should not enter a spec unqualified. Strip control characters and newlines, and state that the note is trusted operator-authored text.",
+      "severity": "low"
+    }
+  ],
+  "keep": [
+    "The pending row IS the ticket. Collapsing hold, machine-readable deny and pre-approval into one table and one atomic UPDATE is the best idea in the document, and the observation that 'the operator said yes' and 'the caller is still waiting' are independent facts is exactly right. It is also what makes the MRTR upgrade a new handler instead of a migration.",
+    "Step 5 (resolveTool) strictly before every guardrail step. This is the invariant that preserves the byte-identical 'Tool not found' property, the reasoning is correct, and it must not move.",
+    "Naming $smart's call_tool re-entry as the highest-value bypass and demanding a dedicated test rather than a code comment. Correct; my only change is moving the seam into P5, where call_tool is actually written.",
+    "No raw-arguments column, ever: bind the reveal to the live hold, require audit:payload:read on top of operator, audit the read. The reasoning \u2014 an approval queue of pending write-calls is a higher-value target than the audit table the project already refuses to fill \u2014 is exactly right. It just needs retention to actually deliver it.",
+    "No 'approve all' anywhere, in the UI or the CLI. Holding that line under fatigue pressure is the whole game, and scope:'tool' with a fixed TTL enum is the right shape for the exit an operator actually needs \u2014 it only wants a use cap to be safe.",
+    "The partial unique index on (principal_id, call_hash) WHERE status='pending' as the dedup mechanism, plus the deny cooldown. Making repeats free to dismiss rather than making dismissal cheap is the correct inversion of the fatigue problem.",
+    "All four approval routes rejecting principal.kind !== 'user' before any other check, and the CLI inheriting that property by using the same routes instead of restating it. A stolen mcpr_ key that can trigger approvals but can never grant, list or reveal them is the right blast radius.",
+    "Refusing generic prompt-injection heuristics, generic PII regexes and entropy-based secret detection by name, using the same reasoning the project already used to reject the regex redactor \u2014 and saying out loud that the provenance label helps no client today instead of calling it a defence.",
+    "isError at HTTP 200 for guardrail refusals while ToolUnavailableError stays a JSON-RPC error, justified by the fact that a thrown error makes hosts abort the turn and kills the retry-after-approval path. Two idioms on one endpoint is the correct trade and the argument for it is sound.",
+    "Fail closed everywhere, including the case where the DB write for a held call fails (abort the hold immediately rather than waiting 300 s for a decision nobody can record).",
+    "The accessibility specifics: aria-live=off on the countdown with a polite announcement only on status change, real buttons, an alert-dialog stating the exact grant in words, reveal as an inline expansion rather than a second layer. These are the parts that get cut first and must not be.",
+    "Redacting in the projection before it is written to Postgres rather than masking in the renderer. Right layer, and it is what makes the 8 KB DB CHECK meaningful instead of decorative.",
+    "The nonce reasoning for the envelope \u2014 upstream text can emit a fixed ASCII closing marker and escape. Keep the three-line argument even after deleting the code, so whoever ships wrapping later does not rediscover it the hard way."
+  ]
+}

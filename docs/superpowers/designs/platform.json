@@ -1,0 +1,416 @@
+{
+  "subsystem": "Platform: monorepo, build, config, CLI, Docker, CI, test strategy, and the master phase plan",
+  "summary": "This is the scaffolding the other seven subsystems stand on, plus the one ordered delivery sequence that reconciles their phases. The single idea that makes it leaner than mcphub: there is exactly one of everything. One database (Postgres 16 + pgvector), one migration chain (drizzle files covering our tables AND better-auth's generated ones), one config schema that fails fast at boot, one build tool per artifact kind (tsc for Node, vite for the SPA, nothing else), one Docker image with no INSTALL_EXT variant, one npm package (the CLI), one test runner. mcphub carries two storage backends \u00d7 two DAO switches \u00d7 three catalogs \u00d7 five auth stacks \u00d7 two era transports, and pays for it with a Dockerfile that installs Rust and Docker-in-Docker, a CI file whose build and integration jobs are commented out (.github/workflows/ci.yml:48-113), and coverage thresholds set to zero (jest.config.cjs:31-38). We delete the variants instead of testing them. The two gates that are non-negotiable and that mcphub does not have: `pnpm build` runs on every PR, and an end-to-end test drives a real `@modelcontextprotocol/sdk` client through the built gateway into a real upstream MCP server.",
+  "total_loc_estimate": 1920,
+  "phase": "MASTER PHASE PLAN \u2014 one ordered sequence, reconciling all eight subsystem designs. Each phase ships a usable vertical slice. Sizes are dev-weeks for one strong full-stack dev.\n\nP0 SKELETON THAT BOOTS \u2014 1.0w \u2014 deps: none \u2014 owner: platform (me).\nScope: pnpm workspace + 4 packages + `tsc -b` project references; zod config schema with fail-fast exit 78; drizzle schema stub + migration runner under a pg advisory lock; Dockerfile + docker-compose with pgvector health-gated; pino logger with request-id; `/health/live|ready`; `/metrics`; vitest + testcontainers harness; CI with every gate already at its FINAL numbers (they pass trivially because there is no code \u2014 this is deliberate, gates never get \"turned on later\", which is exactly how mcphub's jobs ended up commented out).\nDemo: `docker compose up` \u2192 ready in <15s; `curl /health/ready` 200; unset AUTH_SECRET \u2192 process exits 78 printing `AUTH_SECRET: must be at least 32 characters \u2014 run \\`mcprouter secret\\`` and nothing else; CI green on an empty PR.\n\nP1 ONE TOOL, END TO END \u2014 2.0w \u2014 deps: P0 \u2014 owners: core engine + HTTP edge + auth.\nScope: core upstream registry (generation counter + `connectStillWanted` guard, mcphub mcpService.ts:832/:2035), stdio + streamable-http + SSE upstream clients, SSRF guard with per-redirect validation (mcphub :1382-1396), tool cache namespaced `<server><sep><tool>` at cache time (:638); server: legacy-era (2025-11-25) Streamable HTTP `POST /mcp`, 405 on GET/DELETE (we never ship the standalone stream, so this is free); better-auth core + apiKey plugin wired as configuration, not code.\nDemo: `mcprouter servers add` an npx-launched filesystem server, create a key, point Claude Code at `https://hub/mcp` with that bearer key, list and call a tool. A real client through a real upstream on day 21.\n\nP2 SCOPE AND THE VISIBILITY INVARIANT \u2014 1.5w \u2014 deps: P1 \u2014 owners: auth/authz + core.\nScope: Group = membership + per-server item selection in one record (mcphub entities/Group.ts:23-33 \u2014 this shape is right, keep it); per-server tool enable/disable enforced at CALL time not only list time (their CVE fix afcc72f); identical error text for hidden and nonexistent (their ToolUnavailableError :2654); key\u2194group full-containment scoping (GHSA-454m-4vm6-842f, sseService.ts:228-302); audit rows written per call.\nDemo: two keys, two groups. Key A lists 4 tools, key B lists 2. Calling a key-A-only tool with key B returns a response byte-identical to calling a tool that was never defined. This is the phase where the security tests hit their 90% per-glob gate.\n\nP3 THE OPERATOR UI \u2014 2.5w \u2014 deps: P2 (needs the REST surface + auth) \u2014 owner: web. CAN RUN IN PARALLEL with P4 if a second dev exists; this is the natural fork point.\nScope: vite + React 19 + Tailwind v4 `@theme` token block + shadcn/ui properly installed + TanStack Query + cmdk palette; servers grid with live status dots, server form, groups, keys, users, log stream, keyboard-first navigation.\nDemo: an operator who has never seen the CLI adds a server, builds a group, issues a scoped key and copies a client config block \u2014 entirely in the browser, dark, dense, no page over 1.5s to interactive.\n\nP4 OBSERVABILITY FOR REAL \u2014 1.0w \u2014 deps: P1 (instrument as you build; this phase lands the surfaces) \u2014 owner: observability.\nScope: prom-client histograms per server/tool/outcome; OTel sdk-node started only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; pino JSON + pino-roll file sink; request-id propagated client\u2192hub\u2192upstream; persisted activity log with retention job; `/api/health` deep view; per-server latency sparkline in the UI.\nDemo: a Grafana panel of p95 tool latency per upstream, and one distributed trace spanning client \u2192 hub \u2192 upstream. mcphub's own docs admit they have none of this and punt to an external APM.\n\nP5 CONTEXT COST + SMART ROUTING \u2014 2.0w \u2014 deps: P2 (scope resolution) and P0 (pgvector) \u2014 owner: routing/cost.\nScope: cl100k token counting over the exact projected payload; per-server and per-group gross vs exposed; `$smart` meta-tools with progressive disclosure; pgvector cosine search with the scope predicate pushed INTO the SQL (never filter after LIMIT); embedding sync skipped by tool-set hash; hash-fallback embeddings when no API key so the feature works with zero configuration.\nDemo: a 14-server group costing 61k tokens of tool definitions drops to 1.2k under `$smart`, the UI shows both numbers side by side, and `search_tools` still finds the right tool. A scoped search over a 1000-row fixture returns zero out-of-scope rows at LIMIT 5 \u2014 the regression test that proves the SQL-side filter.\n\nP6 MARKETPLACE AND INSTALL \u2014 1.0w \u2014 deps: P3 \u2014 owner: catalog.\nScope: registry.modelcontextprotocol.io proxy WITH caching (mcphub re-parses a 2.4 MB servers.json on every call, marketService.ts:12-34); install flow writes a server config; MCPB upload with traversal-hardened name and atomic rename (their mcpbController.ts:97-166 is correct, reproduce it).\nDemo: search the registry from the cmdk palette, press enter, the server is connected and its tools are listed 10 seconds later.\n\nP7 HARDENING AND 1.0 \u2014 1.5w \u2014 deps: all \u2014 owners: all.\nScope: secrets encrypted at rest \u2014 upstream OAuth tokens, env and headers, AES-256-GCM with AAD (mcphub stores all three in plaintext: oauthSettingsStore.ts:107-129, config/index.ts:150-252 \u2014 this is our headline differentiator, not a corner-cut); upstream OAuth client with RFC 9728 discovery + RFC 8707 `resource` on both authorize and token; MCPRouter-as-AS via the better-auth `mcp` plugin with DCR left OFF; rate limits via the apiKey plugin; accessibility pass (roles, focus traps, no emoji-as-UI); docs; e2e against the released image; multi-arch signed release.\nDemo: `docker run ghcr.io/\u2026/mcprouter:1.0.0`, a team of five operators, three clients, and `pg_dump | grep -c 'sk-'` returns 0.\n\nTOTAL: 12.5 dev-weeks of scope. Honest calendar: ~4 months for one dev (12.5w + ~30% for SDK quirks, misbehaving upstream servers, and review), or ~10 weeks for two devs forking at P3 (web) / P4-P5 (backend). Anyone promising a 1.0 in six weeks is planning to delete a gate.\n\nNOT IN THIS PLAN: P8 MODERN ERA (2026-07-28). Trigger: `@modelcontextprotocol/sdk` ships `LATEST_PROTOCOL_VERSION = '2026-07-28'`. Size: 1.0w IF P1 held the line \u2014 a new handler in `packages/server/src/mcp/modern.ts` beside `legacy.ts`, MRTR `InputRequiredResult` plumbing, `subscriptions/listen`, `-32020`/`-32022`, and deleting the session map. It becomes a 6-week rewrite if session identity ever leaks into `packages/core`, which is why the tsconfig project reference and the core package.json (no hono, no better-auth) mechanically forbid it from P0 onward.",
+  "decisions": [
+    {
+      "id": "P-01",
+      "decision": "Four packages, one solution tsconfig, TypeScript project references. `core` (MCP engine + drizzle schema + migrations, deps: sdk/zod/drizzle/pino/pg \u2014 NO hono, NO better-auth) \u2190 `server` (hono + better-auth + HTTP/MCP edge) ; `web` (vite SPA, no TS dep on either) ; `cli` (type-only import of core, zero runtime workspace deps). Dependency direction is one-way and enforced twice: by `references` in tsconfig, and by pnpm's isolated node_modules, which makes `import { Hono } from 'hono'` inside core fail to resolve rather than fail review.",
+      "rationale": "The binding constraint from the spec facts is that session identity must never enter `packages/core`. A prose rule gets violated in month three. A package boundary that cannot resolve the import gets violated never. This is also what makes the future modern-era handler a new file instead of an engine rewrite.",
+      "mcphub_contrast": "mcphub is one package. `src/services/mcpService.ts` is 5006 lines and holds engine, transport, session and HTTP concerns together, which is exactly why `enableSessionRebuild` had to rehydrate private SDK internals (sseService.ts:105) \u2014 there was no seam to put the era behind. We spend 48 lines of tsconfig to buy that seam.",
+      "cost": "~90 LOC of tsconfig + package.json"
+    },
+    {
+      "id": "P-02",
+      "decision": "Build with `tsc -b` and nothing else for core/server/cli; `vite build` for web. No tsup, no unbuild, no esbuild script. `verbatimModuleSyntax: true`, `module: nodenext`, explicit `.js` in relative imports.",
+      "rationale": "Ladder rung 3/4. We ship a Docker image, not a library \u2014 nobody tree-shakes our server, so bundling buys zero and costs a config file, a sourcemap hop and a class of 'works in dev, breaks in the bundle' ESM bugs. `tsc -b` gives real incremental builds and `--watch` for free. `verbatimModuleSyntax` is load-bearing beyond style: it guarantees the CLI's `import type` of core erases, so the published CLI genuinely has zero runtime dependencies.",
+      "mcphub_contrast": "mcphub also uses plain tsc, and that part is right \u2014 but their `verify-dist.js` never runs in CI because the build job is commented out (ci.yml:48-113), so the thing tsc produces is unverified on every PR. We keep their tool and add the gate they removed.",
+      "cost": "0 new deps"
+    },
+    {
+      "id": "P-03",
+      "decision": "Distribution is split by audience. The hub ships ONLY as a multi-arch Docker image on GHCR. The CLI ships ONLY as an npm package named `mcprouter` (~60 KB, zero runtime deps, `node:util.parseArgs` + global fetch). An unknown subcommand prints usage and exits 1. There is no `serve` fall-through.",
+      "rationale": "The product requires Postgres 16 + pgvector, so `npx mcprouter` without a database was never going to work \u2014 pretending otherwise just adds a code path. Splitting means the thing an operator installs on their laptop is 60 KB and installs in two seconds, while the thing that runs in prod is a pinned image.",
+      "mcphub_contrast": "mcphub's `bin/cli.js:13-29` routes known subcommands to the CLI and falls through to the SERVER BOOTSTRAP for everything else. Reject it: a typo (`mcphub sever list`) boots a production server that runs migrations as a side effect, `--help` is ambiguous about which program is answering, and it welds the client package to the server package so the CLI can never be small. One `if` and an exit code buys all of that back.",
+      "cost": "~15 LOC in cli/main.ts"
+    },
+    {
+      "id": "P-04",
+      "decision": "One zod schema for all env vars, parsed once at boot in `packages/server/src/config.ts`, composed from a `CoreConfigSchema` that `packages/core` exports for its own vars. On failure, print EVERY issue as `VAR: message` plus a remediation hint, print no values, and `process.exit(78)` (EX_CONFIG). `AUTH_SECRET`, `DATABASE_URL` and `PUBLIC_URL` are REQUIRED with no fallback. Every secret also accepts `<VAR>_FILE` pointing at a mounted file. The config object carries a `toJSON` that redacts secrets so a stray `logger.info({config})` cannot leak them.",
+      "rationale": "Boot-time validation is a trust boundary and the doctrine's explicit carve-out. Exit 78 rather than 1 so an orchestrator's restart policy can distinguish 'this will never work' from 'transient'. `_FILE` is six lines and is how Docker `secrets:` and Kubernetes projected volumes actually deliver secrets. `PUBLIC_URL` must be required, not inferred from the Host header, because RFC 8707 token audiences and RFC 9728 resource identifiers are validated against it \u2014 inferring it from a request header is host-header injection straight into the audience claim.",
+      "mcphub_contrast": "mcphub generates a random JWT secret per process when JWT_SECRET is unset (config/jwt.ts:4-14). That is silent, and it breaks the moment you run two replicas: replica B rejects every token replica A issued, intermittently, with no log line explaining it. Our failure is a hard stop with the exact fix command in the message. mcphub also stores `env`/`headers` as plaintext and expands `${VAR}` at connect time (config/index.ts:150-252) with no boot-time check that the referenced var exists \u2014 we validate placeholders at save time, not at 3am.",
+      "cost": "~120 LOC + 80 LOC of tests"
+    },
+    {
+      "id": "P-05",
+      "decision": "Real drizzle migration files in `packages/core/drizzle/`, applied in-process at boot, wrapped in `pg_advisory_lock` so concurrent replicas serialize. better-auth's tables are generated into `packages/core/src/db/auth-schema.ts` via `@better-auth/cli generate` and re-exported from the schema barrel, so drizzle-kit sees them and ONE migration chain covers the whole database. CI runs `drizzle-kit generate` and fails on `git diff --exit-code drizzle/`.",
+      "rationale": "The advisory lock is three lines and removes the entire class of 'two pods raced the same DDL' incidents. Folding better-auth into our chain means one `pnpm db:migrate`, one rollback story, and one `pg_dump` that restores to a working system. The CI diff check is the cheapest possible answer to 'someone edited schema.ts and forgot the migration' \u2014 it catches it on the PR, not on the deploy.",
+      "mcphub_contrast": "mcphub uses `synchronize: true` (db/connection.ts:92) \u2014 no migrations at all \u2014 except `vector_embeddings`, which is `synchronize: false` with hand-written DDL and ALTERs (:217-263), while better-auth runs a SEPARATE kysely migration system. Three schema-management strategies in one database. Their own AGENTS.md admits adding one persisted field touches seven layers. Ours touches one file plus a generated migration.",
+      "cost": "~40 LOC + 15 LOC drizzle.config.ts"
+    },
+    {
+      "id": "P-06",
+      "decision": "Base image `node:22-bookworm-slim`, with `uv`/`uvx` copied as static binaries from `ghcr.io/astral-sh/uv` and one managed CPython baked in at build time (`uv python install 3.13`). Add `git` and `ca-certificates`. Nothing else. Non-root `USER node`. No INSTALL_EXT variant, no Rust, no Docker-in-Docker, no Playwright, no procps. Target \u2264400 MB uncompressed, amd64 + arm64.",
+      "rationale": "mcphub is right that the image must run both `npx` and `uvx` \u2014 that requirement is real and they paid to learn it. They are wrong about the direction: `uv` is a static Rust binary that needs no Python installation and fetches its own interpreter, so you can add uvx to a Node base far more cheaply than you can add Node to a Python base. Baking the interpreter at build time keeps first-run latency and egress-restricted deploys working. procps disappears because we kill stdio children by process group (`process.kill(-pid)` on a detached spawn) instead of pulling in tree-kill.",
+      "mcphub_contrast": "mcphub uses `python:3.13-slim-trixie` + hand-installed Node 22 + procps (Dockerfile:7-14), and INSTALL_EXT=true adds Rust, a Docker Engine daemon and amd64-only Playwright \u2014 which is why their full variant is multi-GB and cannot be cleanly multi-arch. Dropping DinD is also a security decision: hosting MCP servers via a privileged inner Docker daemon is a container-escape surface. Run those as sibling containers and add them as streamable-http upstreams. We DO copy their CMD lesson verbatim: the runtime stage has no pnpm and no corepack, CMD is `node dist/index.js`, because corepack re-download breaks non-root and egress-restricted runs (their Dockerfile:67-71).",
+      "cost": "~55 LOC Dockerfile"
+    },
+    {
+      "id": "P-07",
+      "decision": "Three health surfaces with different audiences. `GET /health/live` \u2014 unauthenticated, no DB, always 200 unless the event loop is wedged. `GET /health/ready` \u2014 unauthenticated, 200 only if the DB answers and migrations are applied, 503 otherwise, body is one status word with no error strings. `GET /api/health` \u2014 authenticated, the full picture including per-upstream state. Upstream MCP server health is deliberately NOT in the readiness probe.",
+      "rationale": "A dead upstream must not pull the hub out of the load balancer \u2014 the hub is still correctly serving every other server and correctly reporting the failure. Conflating them means one flaky third-party MCP server can take down your whole gateway. The unauthenticated probes leak nothing: a Postgres connection error string in a public 503 body tells an attacker your DB host, port and version.",
+      "mcphub_contrast": "mcphub's `GET /health` is unauthenticated, returns 503 on DB failure but returns 200 with body \"degraded\" when servers are down (healthController.ts:32-46) \u2014 so a naive `httpGet 200` probe passes a hub whose upstreams are all dead. Our split makes the probe honest in both directions.",
+      "cost": "~60 LOC"
+    },
+    {
+      "id": "P-08",
+      "decision": "`packages/web` builds to `dist/` with vite `base: './'`; `packages/server` serves it with `serveStatic` from `@hono/node-server`, mounted LAST, behind a catch-all that explicitly excludes `/api`, `/mcp`, `/health`, `/metrics` and `/.well-known`. `assets/*` gets `immutable, max-age=31536000` (vite hashes the filenames), `index.html` gets `no-store`. Subpath deployment comes free from `new URL(PUBLIC_URL).pathname` fed to `app.basePath()`. Dev uses vite's proxy \u2014 no CORS code anywhere.",
+      "rationale": "Ladder rung 5: the installed dependency already does static serving with range requests and etags. The exclusion list is an allowlist inversion done deliberately: a new API prefix that someone forgets to exclude serves index.html and produces a confusing 200-with-HTML instead of a 404, so the list lives next to the route registration with a comment. Subpath support costs two lines because we already require PUBLIC_URL for OAuth.",
+      "mcphub_contrast": "mcphub threads a separate `config.basePath` through the whole app and mounts every route family under it (server.ts:141-168). We derive it from the URL we already have to require, so there is no second source of truth about where the hub lives \u2014 and no way for the OAuth redirect URI and the asset base to disagree.",
+      "cost": "~20 LOC"
+    },
+    {
+      "id": "P-09",
+      "decision": "vitest 5, not jest. Three layers with distinct file suffixes: `*.test.ts` (unit, no I/O, colocated with source), `*.itest.ts` (integration, real Postgres via `@testcontainers/postgresql` running the EXACT `pgvector/pgvector:pg16` image production uses), `test/e2e/*.e2e.ts` (a real SDK `Client` against the built server and a real fixture upstream). `retry: 0` in CI \u2014 a flaky test is deleted, not retried.",
+      "rationale": "Our whole stack is Node ESM and the SDK is ESM-first. vitest transforms with esbuild natively; jest needs ts-jest plus `--experimental-vm-modules` and still fights ESM mocking. We already have vite for the web package, so vitest is zero marginal dependency and the web tests share one config. Using the identical pgvector image in tests and prod matters specifically because HNSW index behaviour and operator availability differ by pgvector build.",
+      "mcphub_contrast": "mcphub runs Jest + ts-jest ESM over 209 files, and `tests/setup.ts` forces `DB_URL=sqlite::memory:` while their Postgres integration job is disabled \u2014 so DB mode, pgvector smart routing and activity logging are only ever exercised against a database they do not ship. Their runner choice cascaded into testing the wrong database. That is the failure we are buying out of.",
+      "cost": "~45 LOC config + 50 LOC test/setup"
+    },
+    {
+      "id": "P-10",
+      "decision": "Every PR runs: frozen-lockfile install \u2192 oxlint + prettier --check \u2192 `pnpm build` (tsc -b + vite build) \u2192 unit \u2192 integration (testcontainers) \u2192 e2e (real SDK client through the built server) \u2192 `drizzle-kit generate` + `git diff --exit-code drizzle/` \u2192 amd64-only Docker build (no push). Coverage gates: global lines 70 / functions 70 / branches 60, plus hard per-glob gates of lines 90 / branches 85 on `packages/core/src/security/**` and `packages/core/src/tools/**`, and 85/75 on `packages/server/src/mcp/**`. Hard 8-minute timeout on the e2e job. Any PR that edits `.github/workflows/ci.yml` to skip or disable a job requires a second approval via CODEOWNERS.",
+      "rationale": "A uniform 90% gate makes people write tests for glue code and then quietly lower the gate. A modest global floor plus a ruthless gate on exactly the modules where CVEs actually occurred (tool visibility, SSRF, scope resolution) puts the effort where the bugs are. The CODEOWNERS rule exists because the historically observed failure mode is not 'the gate was never set' \u2014 it is 'the gate was set, it got slow, and someone commented it out'.",
+      "mcphub_contrast": "mcphub's ci.yml runs lint, tsc and jest with Codecov, but the build and integration-test jobs are entirely commented out (ci.yml:48-113) so `pnpm build` and `verify-dist.js` never execute on a PR, and all four coverage thresholds are 0 (jest.config.cjs:31-38). They also have no e2e against a built image at all. Every gate we set is one they have and disabled, plus the e2e they never had.",
+      "cost": "~110 LOC ci.yml"
+    },
+    {
+      "id": "P-11",
+      "decision": "Supply chain: all GitHub Actions pinned to commit SHAs, workflow-level `permissions: contents: read`, `pull_request` (never `pull_request_target`) so PR jobs hold no secrets, PR Docker builds never push. Releases are tag-driven: buildx multi-arch push to GHCR with `--provenance --sbom`, cosign keyless signing via GitHub OIDC, and `npm publish --provenance` for the CLI. No changesets.",
+      "rationale": "Pinned SHAs and no-secrets-on-PR are the two controls that actually stop the common compromised-action attack; everything else in this area is theatre. Provenance, SBOM and cosign are literally three flags on tools we are already running, so the ladder says take them. Changesets is a whole workflow ceremony for exactly one published package \u2014 the git tag is the version.",
+      "mcphub_contrast": "mcphub's release is tag-driven multi-arch to Docker Hub plus npm plus a GitHub release and a bilingual release-notes validator \u2014 more machinery than we need, and no signing, SBOM or provenance on any of it.",
+      "cost": "~70 LOC release.yml"
+    },
+    {
+      "id": "P-12",
+      "decision": "Graceful shutdown on SIGTERM: stop accepting new connections, let in-flight tool calls finish up to `SHUTDOWN_TIMEOUT_MS` (default 10s), SIGTERM then SIGKILL every stdio child's process GROUP, close the pool, exit 0. And an honest documented ceiling: because v1 serves the legacy era, downstream session state lives in `packages/server` memory, so multi-replica deployments need session affinity on `/mcp`. Everything else \u2014 required AUTH_SECRET, advisory-locked migrations, no in-memory config \u2014 is already replica-safe.",
+      "rationale": "Killing the process group rather than the pid is what prevents orphaned `npx`/`uvx` grandchildren accumulating until the container OOMs, and it is stdlib (`spawn(..., {detached:true})` + `process.kill(-pid)`), which is how we delete the tree-kill dependency and therefore procps from the image. Stating the affinity requirement out loud is the point: it is transitional debt that the 2026-07-28 spec deletes for us, so we document it rather than build a Redis-backed session store we will throw away.",
+      "mcphub_contrast": "mcphub attacks the same problem from the wrong end with `enableSessionRebuild`, which rehydrates private SDK internals to survive restarts (sseService.ts:105) \u2014 brittle across every SDK version bump, in service of a concept the spec is removing. We write one paragraph of documentation instead of a subsystem.",
+      "cost": "~40 LOC"
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "Env",
+      "kind": "env",
+      "sketch": "// packages/server/src/config.ts  \u2014 the complete v1 env surface\nimport { z } from 'zod';\n\nexport const Env = z.object({\n  // ---- REQUIRED, no default, no fallback ----\n  DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),\n  AUTH_SECRET:  z.string().min(32, 'must be >= 32 chars \u2014 run `mcprouter secret`; a per-process random value breaks every additional replica'),\n  PUBLIC_URL:   z.url().describe('absolute origin (+optional path) clients reach the hub at; OAuth redirect_uri and the RFC 8707 resource audience are derived from it'),\n\n  // ---- process ----\n  NODE_ENV: z.enum(['production','development','test']).default('production'),\n  PORT:     z.coerce.number().int().min(1).max(65535).default(3000),\n  HOST:     z.string().default('0.0.0.0'),\n  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),\n\n  // ---- storage ----\n  DB_POOL_MAX:     z.coerce.number().int().positive().default(10),\n  MIGRATE_ON_BOOT: z.stringbool().default(true),\n  DATA_DIR:        z.string().default('/app/data'),\n  WEB_DIST:        z.string().default('/app/web'),\n\n  // ---- logging / telemetry ----\n  LOG_LEVEL:  z.enum(['trace','debug','info','warn','error','fatal']).default('info'),\n  LOG_FORMAT: z.enum(['json','pretty']).default('json'),\n  LOG_DIR:    z.string().optional(),            // set => pino-roll file sink\n  OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(), // set => start sdk-node. OTel's own name; we invent nothing.\n\n  // ---- trust boundary knobs ----\n  TRUST_PROXY_HOPS:           z.coerce.number().int().min(0).default(0),\n  UPSTREAM_ALLOW_PRIVATE_IPS: z.stringbool().default(false), // WARN at boot when true\n  STDIO_ENABLED:              z.stringbool().default(true),\n\n  // ---- embeddings (core) ----\n  EMBEDDING_PROVIDER: z.enum(['none','openai','azure','gemini']).default('none'),\n  EMBEDDING_API_KEY:  z.string().optional(),\n  EMBEDDING_BASE_URL: z.url().optional(),\n  EMBEDDING_MODEL:    z.string().default('text-embedding-3-small'),\n  EMBEDDING_DIM:      z.coerce.number().int().positive().default(1536),\n}).superRefine((c, ctx) => {\n  if (c.EMBEDDING_PROVIDER !== 'none' && !c.EMBEDDING_API_KEY)\n    ctx.addIssue({ code: 'custom', path: ['EMBEDDING_API_KEY'],\n      message: `required when EMBEDDING_PROVIDER=${c.EMBEDDING_PROVIDER} (use 'none' for the zero-key hash fallback)` });\n});\n\nexport type Config = z.infer<typeof Env>;",
+      "notes": "EMBEDDING_PROVIDER='none' keeps Smart Routing usable with zero configuration via a deterministic hash embedding \u2014 mcphub's 100-dim fallback (vectorSearchService.ts:1029) is a good idea, reproduced. No BASE_PATH var: the subpath comes from PUBLIC_URL's pathname."
+    },
+    {
+      "name": "loadConfig",
+      "kind": "type",
+      "sketch": "// same file \u2014 parse once, fail loud, never print a value\nimport { readFileSync } from 'node:fs';\n\n/** Docker `secrets:` / k8s projected volumes deliver secrets as files. FOO_FILE wins over FOO. */\nfunction sourceEnv(src: NodeJS.ProcessEnv = process.env): Record<string, string|undefined> {\n  const plain = Object.fromEntries(Object.entries(src).filter(([k]) => !k.endsWith('_FILE')));\n  const fromFiles = Object.entries(src)\n    .filter(([k, v]) => k.endsWith('_FILE') && v)\n    .map(([k, v]) => [k.slice(0, -5), readFileSync(v!, 'utf8').trim()]);\n  return { ...plain, ...Object.fromEntries(fromFiles) };\n}\n\nconst SECRET_KEYS = ['AUTH_SECRET','DATABASE_URL','EMBEDDING_API_KEY'] as const;\n\nexport function loadConfig(src?: NodeJS.ProcessEnv): Config {\n  const r = Env.safeParse(sourceEnv(src));\n  if (!r.success) {\n    console.error('MCPRouter cannot start \u2014 invalid configuration:\\n');\n    for (const i of r.error.issues) console.error(`  ${i.path.join('.') || '(env)'}: ${i.message}`);\n    console.error('\\nSee .env.example. Values are never echoed.');\n    process.exit(78); // EX_CONFIG: permanent, do not restart-loop\n  }\n  // one logger.info({config}) must not exfiltrate the database password\n  return Object.defineProperty(r.data, 'toJSON', {\n    value: () => ({ ...r.data, ...Object.fromEntries(SECRET_KEYS.map(k => [k, '[redacted]'])) }),\n    enumerable: false,\n  });\n}",
+      "notes": "Tested directly: one unit test per required var asserts exit code 78 and that the message names the var. `loadConfig(fakeEnv)` takes an injected env so the tests need no process mutation."
+    },
+    {
+      "name": "runMigrations",
+      "kind": "type",
+      "sketch": "// packages/core/src/db/migrate.ts\nimport { migrate } from 'drizzle-orm/node-postgres/migrator';\n\nconst LOCK_ID = 0x6d63_7072; // 'mcpr'\n\n/** Safe to call from every replica at boot: the advisory lock serialises DDL. */\nexport async function runMigrations(pool: Pool, folder: string): Promise<void> {\n  const c = await pool.connect();\n  try {\n    await c.query('SELECT pg_advisory_lock($1)', [LOCK_ID]);\n    await migrate(drizzle(c), { migrationsFolder: folder });\n  } finally {\n    await c.query('SELECT pg_advisory_unlock($1)', [LOCK_ID]).catch(() => {});\n    c.release();\n  }\n}\n\n/** A pgvector column's dimension is fixed by its migration. Catch the mismatch at boot, not at first search. */\nexport async function assertEmbeddingDim(db: Db, expected: number): Promise<void> {\n  const [row] = await db.execute(sql`SELECT atttypmod AS dim FROM pg_attribute\n    WHERE attrelid = 'tool_embeddings'::regclass AND attname = 'embedding'`);\n  if (row?.dim !== expected)\n    throw new Error(`EMBEDDING_DIM=${expected} but tool_embeddings.embedding is vector(${row?.dim}). `\n      + `Changing the dimension needs a migration: pnpm db:generate after editing schema.ts, then redeploy.`);\n}",
+      "notes": "Integration test: two concurrent runMigrations() against a fresh container both succeed and the migration table has one row per file. This is the whole multi-replica DDL story \u2014 40 lines instead of a leader-election sidecar."
+    },
+    {
+      "name": "health + static routes",
+      "kind": "route",
+      "sketch": "GET  /health/live    \u2192 200 {status:'ok'}                 unauth, no DB, no version string\nGET  /health/ready   \u2192 200 {status:'ready'} | 503 {status:'unready'}\n                       unauth, DB ping with a 500ms timeout + migrations-applied check.\n                       Upstream MCP health is deliberately EXCLUDED: a dead upstream\n                       must not evict the hub from the load balancer.\nGET  /api/health     \u2192 200 full: per-upstream state, tool counts, versions, migration id   [auth: session or api key]\nGET  /metrics        \u2192 200 text/plain; version=0.0.4                                        [auth: api key with permission metrics:read]\n\n// static, mounted LAST, after every API family\napp.get('/assets/*', serveStatic({ root: cfg.WEB_DIST, onFound: (_p, c) =>\n  c.header('Cache-Control', 'public, max-age=31536000, immutable') }));   // vite hashes filenames\napp.get('*', async (c, next) => {\n  // exclusion list lives here on purpose: adding an API family without updating it\n  // serves index.html with a 200 instead of a 404, which is confusing to debug.\n  if (/^\\/(api|mcp|health|metrics|\\.well-known)(\\/|$)/.test(c.req.path)) return next();\n  return serveStatic({ path: 'index.html', root: cfg.WEB_DIST })(c, next);\n});",
+      "notes": "If WEB_DIST does not exist the static mounts are skipped and the server logs `UI not built \u2014 API only`. That is the dev-without-vite-build case and the API-only deployment case, one branch covering both."
+    },
+    {
+      "name": "mcprouter (CLI)",
+      "kind": "component",
+      "sketch": "mcprouter <command> [args]           # node:util.parseArgs, global fetch, ZERO runtime deps\n\n  login [--url URL] [--key KEY]      # prompts for the key if not given; verifies with GET /api/me\n  logout\n  servers  ls | add <file.json|-> | rm <name> | toggle <name> [--on|--off] | logs <name>\n  groups   ls | add <name> | rm <name> | add-server <group> <server> | rm-server <group> <server>\n  tools    ls [--group G] [--server S]\n  call     <tool> [k=v ...] [--params-json JSON] [--group G]   # the debugging workhorse\n  keys     ls | create <name> [--group G] [--expires 30d] | rm <id>\n  doctor                            # GET /api/health \u2014 DB, migration id, embedding dim, per-upstream state\n  secret                            # prints crypto.randomBytes(48).toString('base64'). AUTH_SECRET is required,\n                                    # so the tool that makes one is one command away.\n\nAuth  : Authorization: Bearer <api key>. ONE scheme.\nSource: --url/--key flag \u2192 MCPROUTER_URL/MCPROUTER_API_KEY \u2192 credentials file.\nStore : $XDG_CONFIG_HOME/mcprouter/config.json (fallback ~/.config), dir 0700, file 0600,\n        written temp+rename. On READ, refuse if the mode is group/world readable.\nExit  : 0 ok \u00b7 1 usage/unknown command \u00b7 2 API error (body printed) \u00b7 3 auth error\nDist  : npm `mcprouter`, engines node>=22. Also baked into the Docker image.",
+      "notes": "Dropped vs mcphub's CLI: config profiles, cache clear, discover, install, export, reinstall, prompts, resources. Install belongs to the UI marketplace \u2014 a second implementation of it in the CLI is the definition of unrequested. `doctor` and `secret` are new and exist because our config is strict: if you make configuration fail hard, you owe the operator the tools to satisfy it."
+    },
+    {
+      "name": "vitest.config.ts",
+      "kind": "type",
+      "sketch": "export default defineConfig({\n  test: {\n    projects: ['packages/*'],\n    include: ['**/*.test.ts'],\n    retry: 0,                              // a flaky test is deleted, not retried\n    coverage: {\n      provider: 'v8',\n      reporter: ['text-summary', 'lcov'],\n      exclude: ['**/*.itest.ts', 'test/**', '**/dist/**', '**/drizzle/**'],\n      thresholds: {\n        lines: 70, functions: 70, branches: 60, statements: 70,\n        // hard gates on exactly the modules where mcphub shipped CVEs\n        'packages/core/src/security/**': { lines: 90, branches: 85 },\n        'packages/core/src/tools/**':    { lines: 90, branches: 85 },\n        'packages/server/src/mcp/**':    { lines: 85, branches: 75 },\n      },\n    },\n  },\n});\n\n// integration: separate config, include ['**/*.itest.ts'], globalSetup starts ONE\n// pgvector/pgvector:pg16 container, truncates between files, honours TEST_DATABASE_URL\n// to skip the container entirely (macOS devs without a Docker daemon).",
+      "notes": "The global numbers are deliberately unambitious so nobody games them; the per-glob numbers are the real gate. Compare mcphub jest.config.cjs:31-38 where all four thresholds are 0."
+    },
+    {
+      "name": "gateway.e2e.ts",
+      "kind": "component",
+      "sketch": "// test/e2e/gateway.e2e.ts \u2014 the one test that proves the product works.\n// Real SDK Client \u2192 real built server \u2192 real upstream MCP server.\nconst pg    = await new PostgreSqlContainer('pgvector/pgvector:pg16').start();\nconst app   = await createApp(loadConfig(testEnv(pg)));     // in-process, no docker exec: ~2s not ~40s\nconst { url, close } = serve(app);\nconst key   = await seedAdminKey();\n\n// upstream A: stdio   (node test/fixtures/echo-server.ts)\n// upstream B: streamable-http (the same fixture, --http)\nawait api('POST /api/servers', { name: 'echo', type: 'stdio', command: 'node', args: [FIXTURE] });\n\nconst client = new Client({ name: 'e2e', version: '0' });\nawait client.connect(new StreamableHTTPClientTransport(new URL(`${url}/mcp`), {\n  requestInit: { headers: { authorization: `Bearer ${key}` } } }));\n\nexpect((await client.listTools()).tools.map(t => t.name)).toContain('echo-echo');\nexpect(await client.callTool({ name: 'echo-echo', arguments: { s: 'hi' } })).toMatchObject({ content: [{ text: 'hi' }] });\n\n// THE invariant (mcphub CVE afcc72f): disable at list time \u21d2 disabled at call time,\n// and a hidden tool is indistinguishable from one that never existed.\nawait api('PATCH /api/servers/echo/tools/echo', { enabled: false });\nexpect((await client.listTools()).tools.map(t => t.name)).not.toContain('echo-echo');\nconst hidden  = await client.callTool({ name: 'echo-echo',  arguments: {} }).catch(e => e);\nconst missing = await client.callTool({ name: 'echo-nope',  arguments: {} }).catch(e => e);\nexpect(hidden.message).toBe(missing.message);        // byte-identical\n\n// transport shape (legacy era today; the modern-era twin lands beside it)\nexpect(await rawPost('/mcp', notification)).toMatchObject({ status: 202, body: '' });\nexpect((await rawGet('/mcp')).status).toBe(405);     // standalone GET stream is not served\n\n// resilience\nawait killUpstream(); expect(await client.callTool(...)).toBeJsonRpcError();\nawait restartUpstream(); expect(await client.callTool(...)).toSucceed();\nawait close(); await pg.stop();",
+      "notes": "Runs in-process via createApp rather than `docker compose exec` so it is ~90s not ~8min and therefore never gets commented out. A separate release-gated job runs the same assertions against the published image. This whole file is what mcphub lacks: 'no e2e against a built image'."
+    },
+    {
+      "name": "Dockerfile",
+      "kind": "type",
+      "sketch": "FROM node:22-bookworm-slim AS base\nRUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \\\n && rm -rf /var/lib/apt/lists/*\nCOPY --from=ghcr.io/astral-sh/uv:0.9 /uv /uvx /usr/local/bin/\nENV NPM_CONFIG_CACHE=/home/node/.cache/npm UV_CACHE_DIR=/home/node/.cache/uv \\\n    UV_PYTHON_INSTALL_DIR=/home/node/.local/share/uv/python\nRUN su node -c 'uv python install 3.13'     # deterministic uvx, no first-run download, works air-gapped\n\nFROM base AS build\nRUN corepack enable\nWORKDIR /src\nCOPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./\nCOPY packages/*/package.json packages/\nRUN pnpm install --frozen-lockfile\nCOPY . .\nRUN pnpm build && pnpm deploy --filter @mcprouter/server --prod /out\n\nFROM base AS runtime\nWORKDIR /app\nCOPY --from=build --chown=node:node /out ./\nCOPY --from=build --chown=node:node /src/packages/web/dist ./web\nUSER node\nENV NODE_ENV=production WEB_DIST=/app/web DATA_DIR=/app/data\nEXPOSE 3000\nHEALTHCHECK --interval=15s --timeout=3s --start-period=20s \\\n  CMD node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health/live').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))\"\n# no pnpm, no corepack at runtime \u2014 corepack re-download breaks non-root / egress-restricted\n# runs (mcphub Dockerfile:67-71, a lesson worth copying verbatim)\nCMD [\"node\", \"dist/index.js\"]",
+      "notes": "One stage set, one variant, amd64+arm64. No entrypoint.sh at all: migrations run in-process under the advisory lock, there is no dockerd to wait for, and npm registry config is plain env. mcphub's entrypoint.sh includes a 15s sleep waiting for dockerd."
+    },
+    {
+      "name": "docker-compose.yml",
+      "kind": "type",
+      "sketch": "services:\n  db:\n    image: pgvector/pgvector:pg16          # EXACT image the integration tests run\n    environment: [POSTGRES_PASSWORD, POSTGRES_USER=mcprouter, POSTGRES_DB=mcprouter]\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./deploy/initdb:/docker-entrypoint-initdb.d:ro   # 01-vector.sql: CREATE EXTENSION vector;\n    healthcheck: { test: [\"CMD-SHELL\",\"pg_isready -U mcprouter\"], interval: 5s, retries: 20 }\n\n  app:\n    image: ghcr.io/<org>/mcprouter:1\n    depends_on: { db: { condition: service_healthy } }\n    env_file: .env\n    ports: [\"3000:3000\"]\n    read_only: true\n    tmpfs: [/tmp]\n    cap_drop: [ALL]\n    security_opt: [\"no-new-privileges:true\"]\n    volumes:\n      - data:/app/data                     # MCPB uploads\n      - pkgcache:/home/node/.cache         # ONE volume covers npx (_npx) and uvx caches\n\nvolumes: { pgdata: {}, data: {}, pkgcache: {} }",
+      "notes": "CREATE EXTENSION runs as the superuser in initdb, so the application role never needs superuser. read_only root fs + explicit writable mounts is the containment boundary for stdio upstreams \u2014 spawning arbitrary commands IS the product, so the container, not the app, is the sandbox."
+    },
+    {
+      "name": "ci.yml",
+      "kind": "type",
+      "sketch": "on: [pull_request]           # never pull_request_target \u2014 PR jobs hold no secrets\npermissions: { contents: read }\nconcurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }\n\njobs:\n  check:        # ~3 min\n    - pnpm install --frozen-lockfile        # fails on lockfile drift\n    - pnpm lint                              # oxlint + prettier --check\n    - pnpm build                             # tsc -b + vite build   \u2190 mcphub has this commented out\n    - pnpm test:unit --coverage              # thresholds enforced here\n    - pnpm db:generate && git diff --exit-code drizzle/   # schema edited without a migration\n  integration:  # ~4 min, needs the runner's docker daemon\n    - pnpm test:integration                  # testcontainers pgvector/pgvector:pg16\n  e2e:          # ~2 min, timeout-minutes: 8\n    - pnpm test:e2e\n  image:        # ~3 min\n    - docker/build-push-action@<sha>  platforms: linux/amd64  push: false\n\n# CODEOWNERS: /.github/  \u2192  @platform-owners  (disabling a job needs a second approval)",
+      "notes": "Target wall time \u22648 min for the whole PR. Every action pinned to a SHA. Release workflow adds: buildx amd64+arm64 \u2192 GHCR with --provenance --sbom, cosign keyless, npm publish --provenance for the CLI, and one e2e run against the pushed image."
+    },
+    {
+      "name": "tsconfig topology",
+      "kind": "type",
+      "sketch": "// tsconfig.base.json\n{ \"compilerOptions\": {\n    \"target\": \"ES2023\", \"lib\": [\"ES2023\"], \"module\": \"nodenext\", \"moduleResolution\": \"nodenext\",\n    \"strict\": true, \"noUncheckedIndexedAccess\": true, \"exactOptionalPropertyTypes\": true,\n    \"verbatimModuleSyntax\": true,        // guarantees `import type` erases \u2192 CLI stays dep-free\n    \"composite\": true, \"declaration\": true, \"sourceMap\": true, \"incremental\": true } }\n\n// tsconfig.json (solution)  { \"files\": [], \"references\": [\n//   {\"path\":\"packages/core\"},{\"path\":\"packages/server\"},{\"path\":\"packages/cli\"}] }\n\n// packages/core/tsconfig.json    references: []            deps: sdk, zod, drizzle-orm, pg, pino\n// packages/server/tsconfig.json  references: [core]        deps: hono, better-auth, prom-client, @hono/node-server\n// packages/cli/tsconfig.json     references: [core]        deps: {}   devDeps: @mcprouter/core (types only)\n// packages/web                   vite + tsc --noEmit, no project reference (no TS dep on the server)\n\n// `pnpm build` = tsc -b && pnpm --filter web build",
+      "notes": "`references: []` on core is the load-bearing line: core cannot reference server, and pnpm's isolated node_modules means core cannot even resolve `hono` or `better-auth`. That is how 'session identity never enters core' becomes a compile error rather than a code-review convention."
+    },
+    {
+      "name": "contracts required from the other seven",
+      "kind": "type",
+      "sketch": "// core \u2192 me\nexport function createEngine(deps: { db: Db; logger: Logger; config: CoreConfig }): Engine;\nexport const CoreConfigSchema: z.ZodType<CoreConfig>;   // core owns validation for ITS vars; server composes\nexport async function closeEngine(e: Engine, timeoutMs: number): Promise<void>;\n// every Engine method is (scope: Scope, principal: Principal, ...args) \u2014 never (session, ...)\n\n// server \u2192 me\nexport function createApp(cfg: Config, engine: Engine): Hono;   // pure, testable in-process; no side effects\nexport function serve(app: Hono): { url: string; close(): Promise<void> };\n\n// observability \u2192 me\nexport const registry: import('prom-client').Registry;   // I mount /metrics and build the pino instance at boot\n\n// web \u2192 me\n// builds to packages/web/dist, vite base: './', API base from import.meta.env.BASE_URL\n\n// db ownership: packages/core/src/db/schema.ts (+ auth-schema.ts generated by @better-auth/cli)\n//               packages/core/drizzle/*.sql \u2014 ONE chain, ONE `pnpm db:migrate`\n// test ownership: each subsystem writes *.test.ts beside its source;\n//                 I own vitest.config.ts, test/setup/*, test/fixtures/echo-server.ts, test/e2e/*.",
+      "notes": "The one contract I will reject in review: any core export whose parameter list contains a session id, a transport, a Hono Context, or an Mcp-Session-Id. That is the seam the 2026-07-28 migration depends on."
+    }
+  ],
+  "files": [
+    {
+      "path": "pnpm-workspace.yaml",
+      "purpose": "packages/* glob + pinned catalog of shared dep versions so four package.jsons cannot drift",
+      "loc": 30
+    },
+    {
+      "path": "package.json",
+      "purpose": "root scripts (dev, build, lint, test:unit/integration/e2e, db:generate/migrate), packageManager pin, engines node>=22",
+      "loc": 45
+    },
+    {
+      "path": "tsconfig.base.json",
+      "purpose": "strict + nodenext + verbatimModuleSyntax + composite, extended by all four packages",
+      "loc": 30
+    },
+    {
+      "path": "tsconfig.json",
+      "purpose": "solution file, files:[] + references to core/server/cli \u2014 the enforced dependency direction",
+      "loc": 12
+    },
+    {
+      "path": "packages/{core,server,cli,web}/tsconfig.json",
+      "purpose": "per-package refs and outDir; core's references array is empty on purpose",
+      "loc": 48
+    },
+    {
+      "path": "packages/{core,server,cli,web}/package.json",
+      "purpose": "dependency lists; core lists no hono/better-auth, cli lists no runtime deps at all",
+      "loc": 90
+    },
+    {
+      "path": "packages/server/src/config.ts",
+      "purpose": "the full zod env schema, *_FILE secret sourcing, fail-fast exit 78 reporter, redacting toJSON",
+      "loc": 125
+    },
+    {
+      "path": "packages/server/src/config.test.ts",
+      "purpose": "one case per required var asserting exit 78 and that the message names the var; _FILE precedence; redaction",
+      "loc": 85
+    },
+    {
+      "path": "packages/server/src/health.ts",
+      "purpose": "live/ready/deep handlers; ready excludes upstream state and leaks no error strings",
+      "loc": 60
+    },
+    {
+      "path": "packages/server/src/static.ts",
+      "purpose": "serveStatic mounts, immutable asset caching, SPA fallback with the API exclusion list, skip when WEB_DIST is absent",
+      "loc": 30
+    },
+    {
+      "path": "packages/server/src/shutdown.ts",
+      "purpose": "SIGTERM: drain in flight, kill stdio process groups, close pool, exit within SHUTDOWN_TIMEOUT_MS",
+      "loc": 45
+    },
+    {
+      "path": "packages/core/src/db/migrate.ts",
+      "purpose": "drizzle migrate under pg_advisory_lock + assertEmbeddingDim boot check",
+      "loc": 45
+    },
+    {
+      "path": "packages/core/src/db/migrate.itest.ts",
+      "purpose": "fresh-container apply, idempotent re-apply, two concurrent migrate() calls both succeed",
+      "loc": 55
+    },
+    {
+      "path": "drizzle.config.ts",
+      "purpose": "drizzle-kit config pointing at core's schema barrel and migration folder",
+      "loc": 15
+    },
+    {
+      "path": "packages/cli/src/main.ts",
+      "purpose": "parseArgs dispatch, help text, unknown command -> usage + exit 1 (no server fall-through)",
+      "loc": 170
+    },
+    {
+      "path": "packages/cli/src/http.ts",
+      "purpose": "fetch wrapper: bearer auth, JSON body, error-to-exit-code mapping, --url resolution",
+      "loc": 70
+    },
+    {
+      "path": "packages/cli/src/creds.ts",
+      "purpose": "XDG path resolution, 0700 dir / 0600 file, atomic temp+rename write, refuse to read a world-readable file",
+      "loc": 60
+    },
+    {
+      "path": "packages/cli/src/commands/*.ts",
+      "purpose": "servers, groups, tools, call, keys, doctor, secret \u2014 one small file each, table/JSON output",
+      "loc": 260
+    },
+    {
+      "path": "packages/cli/src/creds.test.ts",
+      "purpose": "mode enforcement, atomic write, precedence flag > env > file",
+      "loc": 55
+    },
+    {
+      "path": "Dockerfile",
+      "purpose": "node:22-bookworm-slim + uv static binaries + prebaked CPython; build/deploy/runtime stages; non-root; healthcheck",
+      "loc": 55
+    },
+    {
+      "path": ".dockerignore",
+      "purpose": "exclude .env, .git, node_modules, dist, test fixtures from the build context",
+      "loc": 12
+    },
+    {
+      "path": "docker-compose.yml",
+      "purpose": "pgvector/pgvector:pg16 health-gated + app with read_only rootfs, cap_drop, three named volumes",
+      "loc": 50
+    },
+    {
+      "path": "deploy/initdb/01-vector.sql",
+      "purpose": "CREATE EXTENSION vector as superuser so the app role never needs superuser",
+      "loc": 3
+    },
+    {
+      "path": "deploy/nginx.conf.example",
+      "purpose": "proxy_buffering off, 3600s read/send timeouts, http/1.1, client_max_body_size 512m, plus a note that we also send X-Accel-Buffering: no",
+      "loc": 40
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "purpose": "the four PR jobs with real gates, SHA-pinned actions, read-only permissions, concurrency cancel",
+      "loc": 110
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "purpose": "tag-driven multi-arch GHCR push with provenance/SBOM/cosign, npm publish --provenance for the CLI, e2e against the pushed image",
+      "loc": 75
+    },
+    {
+      "path": ".github/CODEOWNERS",
+      "purpose": "/.github/ requires platform-owner review \u2014 disabling a CI job needs a second approval",
+      "loc": 5
+    },
+    {
+      "path": "vitest.config.ts",
+      "purpose": "projects, coverage provider and the global + per-glob thresholds, retry 0",
+      "loc": 45
+    },
+    {
+      "path": "vitest.integration.config.ts",
+      "purpose": "*.itest.ts include, globalSetup, longer timeouts",
+      "loc": 20
+    },
+    {
+      "path": "test/setup/postgres.ts",
+      "purpose": "single pgvector testcontainer, truncate-between-files, TEST_DATABASE_URL escape hatch",
+      "loc": 55
+    },
+    {
+      "path": "test/fixtures/echo-server.ts",
+      "purpose": "a real MCP upstream (stdio and --http modes) with a fast tool, a slow progress-reporting tool and an erroring tool",
+      "loc": 80
+    },
+    {
+      "path": "test/e2e/gateway.e2e.ts",
+      "purpose": "real SDK client through the built server: list/call, the hidden-equals-missing invariant, 202/405 transport shape, kill and restart the upstream",
+      "loc": 200
+    },
+    {
+      "path": ".env.example",
+      "purpose": "every var with a comment, required ones left blank, a generate command next to AUTH_SECRET",
+      "loc": 45
+    },
+    {
+      "path": ".nvmrc / .oxlintrc.json / .prettierrc",
+      "purpose": "node 22 pin and two minimal lint/format configs",
+      "loc": 15
+    },
+    {
+      "path": "README.md",
+      "purpose": "five-minute quickstart, the env table, the multi-replica affinity caveat, and the security model paragraph",
+      "loc": 160
+    }
+  ],
+  "security": [
+    "Config ingress (env / *_FILE -> process). Secrets arrive only as env vars or files referenced by <VAR>_FILE; validation errors print variable NAMES and never values; the config object carries a non-enumerable toJSON that replaces AUTH_SECRET, DATABASE_URL and EMBEDDING_API_KEY with '[redacted]' so a boot-time logger.info({config}) cannot exfiltrate the database password. .env is in both .gitignore and .dockerignore. AUTH_SECRET has no random fallback (mcphub config/jwt.ts:4-14) and a <32-char value is a hard exit 78.",
+    "Identity-origin boundary (PUBLIC_URL). The hub's own identity is taken ONLY from the required PUBLIC_URL, never from the Host or X-Forwarded-Host header. OAuth redirect URIs, the RFC 9728 protected-resource document and the RFC 8707 resource audience all derive from that one constant, so a host-header injection cannot mint a token audience the hub will later accept.",
+    "Client-IP boundary (reverse proxy). TRUST_PROXY_HOPS defaults to 0, meaning X-Forwarded-For is ignored and the socket address is used. When set to N, the client IP is the Nth entry from the RIGHT of the XFF chain \u2014 the only parse that a client cannot forge by prepending entries. Audit-log source IPs and rate limits both read that one resolved value.",
+    "Container boundary (stdio upstreams). Spawning arbitrary commands is the product, so the containment is the container, not the app: non-root USER node, read_only root filesystem with tmpfs /tmp and three explicit writable volumes, cap_drop ALL, no-new-privileges, no Docker-in-Docker (mcphub's INSTALL_EXT ships a dockerd, which is a container escape by design). Children are spawned detached and killed by process group so no orphan npx/uvx survives a restart. STDIO_ENABLED=false lets a paranoid operator remove the surface entirely. Documented plainly: hub-admin is root-equivalent on this container.",
+    "Upstream network boundary. UPSTREAM_ALLOW_PRIVATE_IPS defaults to false and every upstream URL plus every redirect hop is checked against it (mcphub mcpService.ts:1382-1396). Unlike mcphub we do NOT bypass the check for admin-owned servers \u2014 that is an implicit ownership rule nobody remembers; ours is one explicit global env that logs a WARN on every boot while it is true.",
+    "Database privilege boundary. CREATE EXTENSION vector runs once in docker-entrypoint-initdb.d as the Postgres superuser, so the application role is a plain owner of its schema and never needs superuser. Schema changes can only come from migration files under an advisory lock; there is no synchronize:true path that lets application code alter production DDL (mcphub db/connection.ts:92).",
+    "Unauthenticated probe boundary. /health/live and /health/ready return a single status word and nothing else \u2014 no version, no migration id, no Postgres error text. Everything an attacker could use for fingerprinting lives behind auth at /api/health. /metrics requires an API key carrying the metrics:read permission (better-auth apiKey `permissions`), because Prometheus series names leak the full upstream server inventory.",
+    "CI supply-chain boundary. Workflows trigger on pull_request (never pull_request_target), workflow-level permissions are contents:read, no secret is available to any PR-triggered job, and PR Docker builds never push. Every action is pinned to a commit SHA. Releases add cosign keyless signing, buildx --provenance --sbom and npm publish --provenance. CODEOWNERS on /.github/ means removing a gate needs a second human.",
+    "CLI credential boundary. The token file is written temp+rename at 0600 inside a 0700 directory, and is REFUSED on read if its mode is group- or world-readable \u2014 mcphub writes 0600 but never verifies on read, so a file that was chmodded or restored from a bad backup is used silently. Flags and env take precedence over the file, so CI never needs to write one.",
+    "Dependency boundary. pnpm install --frozen-lockfile on every PR makes a lockfile change a reviewable diff rather than a surprise; pnpm audit --prod --audit-level=high runs weekly and on PR; the runtime image contains no compilers, no pnpm and no corepack, so a compromised transitive dep has no build toolchain to reach for."
+  ],
+  "deferred": [
+    {
+      "item": "BASE_PATH plumbing beyond PUBLIC_URL's pathname (for reverse proxies that do not strip the prefix)",
+      "add_when": "A user reports the UI 404ing behind a proxy that forwards the full path. Until then vite base:'./' plus app.basePath(new URL(PUBLIC_URL).pathname) covers every proxy that rewrites, which is the default config of nginx, Caddy and Traefik."
+    },
+    {
+      "item": "Publishing packages/core and packages/server to npm",
+      "add_when": "Someone credibly wants to embed the engine in their own Node process, or run the hub without Docker. Today the hard requirement on Postgres 16 + pgvector means npx-without-a-database was never a working path."
+    },
+    {
+      "item": "Changesets / automated changelog generation",
+      "add_when": "There is more than one published package, or more than one release per week. With a single CLI package the git tag is the version and CHANGELOG.md is hand-written in ten lines."
+    },
+    {
+      "item": "Playwright browser e2e for the SPA",
+      "add_when": "The second UI regression that component tests failed to catch. Until then the API e2e covers the contract and the UI is small enough to click through in the PR preview."
+    },
+    {
+      "item": "Helm chart / Kubernetes manifests",
+      "add_when": "A user runs more than one replica. The design is already replica-safe at the data layer (required AUTH_SECRET, advisory-locked migrations, no in-memory config), so this is packaging plus a documented session-affinity annotation \u2014 not a redesign."
+    },
+    {
+      "item": "Native arm64 CI runners",
+      "add_when": "The QEMU-emulated arm64 release build exceeds 15 minutes. PR builds are amd64-only so this only ever affects the release path."
+    },
+    {
+      "item": "A separate migration Job/container instead of MIGRATE_ON_BOOT",
+      "add_when": "An operator's deployment policy forbids the app role from holding DDL privileges. MIGRATE_ON_BOOT=false plus `node dist/migrate.js` already exists for this; only the packaging is missing."
+    },
+    {
+      "item": "Nightly dependency-update and CVE-scan workflow",
+      "add_when": "After 1.0. Before then the dependency set changes faster than a bot could usefully track it."
+    },
+    {
+      "item": "Windows support for stdio upstreams and the CLI",
+      "add_when": "Asked for by a real user. v1 targets Linux containers plus macOS/Linux development; process-group kill semantics differ on Windows and would need a real implementation, not a shim."
+    },
+    {
+      "item": "Dev container / Codespaces definition",
+      "add_when": "The third 'it does not build on my machine'. `docker compose up db` plus node 22 is currently the whole setup."
+    },
+    {
+      "item": "A `mcprouter install <server>` marketplace command in the CLI",
+      "add_when": "Someone needs to provision servers from a script. The UI owns install in P6; a second implementation in the CLI before anyone has asked is the textbook unrequested abstraction."
+    },
+    {
+      "item": "The modern-era (2026-07-28) HTTP handler",
+      "add_when": "@modelcontextprotocol/sdk ships LATEST_PROTOCOL_VERSION='2026-07-28'. Scoped at one week as a sibling file to the legacy handler \u2014 the tsconfig reference topology and core's dependency list exist specifically to keep that estimate true."
+    }
+  ],
+  "risks": [
+    "The e2e job gets slow and someone comments it out \u2014 this is precisely how mcphub's build and integration jobs died (ci.yml:48-113). Mitigations: the e2e runs createApp in-process rather than via docker exec so it is ~90s not ~8min; a hard timeout-minutes:8 turns creep into a failure instead of a tax; CODEOWNERS on /.github/ means disabling it needs a second approval.",
+    "testcontainers needs a Docker daemon, which CI has but many macOS developers do not (Colima/OrbStack/Docker Desktop are all optional installs). Mitigation: TEST_DATABASE_URL bypasses the container entirely and points at `docker compose up db`, and `pnpm test:unit` alone is a complete pre-commit loop. Risk if unmitigated: integration tests become 'the CI-only tests' and stop being run before push.",
+    "tsc project references + verbatimModuleSyntax + mandatory .js extensions in relative ESM imports is real friction for contributors who have only used bundlers. The failure is loud (build error, not runtime), but it will generate 'why does my import not work' issues. Mitigation: one paragraph in CONTRIBUTING and an oxlint rule pointing at the fix.",
+    "Baking a uv-managed CPython at image build time pins us to whatever uv resolves that day, so two builds of the same git SHA weeks apart can differ. Accepted deliberately \u2014 the alternative (downloading a Python at container start) fails in air-gapped and egress-restricted deploys, which is a worse failure. Mitigation: pin the uv image minor and the Python version string; revisit if reproducible builds become a requirement.",
+    "The per-glob 90% coverage gates on security modules can be gamed by tests that import broadly without asserting. Coverage measures execution, not verification. Mitigation: those globs are also the ones where a human reviewer is required, and the e2e asserts the actual invariant (hidden error === missing error) independently of any coverage number.",
+    "EMBEDDING_DIM is fixed by a migration, so changing the embedding model to one with a different dimension is a schema change, not a config change. assertEmbeddingDim fails loudly at boot with the remedy in the message, but an operator who expected to swap models by editing .env will be annoyed. Documented in .env.example next to the variable.",
+    "Requiring AUTH_SECRET, DATABASE_URL and PUBLIC_URL with no defaults means the very first `docker compose up` fails unless .env was filled in. That is a worse thirty-second experience than mcphub's silent random secret, in exchange for never debugging intermittent token rejection across replicas. Mitigation: compose ships an .env.example the quickstart copies in one command, and `mcprouter secret` generates the value.",
+    "Single Docker image with no INSTALL_EXT variant means any upstream MCP server that needs a runtime we do not ship (Rust, Java, Go, a browser) simply cannot run in-container. This is a real capability loss versus mcphub's latest-full. Mitigation and documented answer: run those as sibling containers and register them as streamable-http upstreams \u2014 which is also the safer architecture. Risk accepted; revisit if more than two users hit it.",
+    "v1 serves the legacy era, so downstream session state is in packages/server memory and multi-replica needs session affinity on /mcp. If an operator load-balances round-robin without reading the README, they get intermittent 'unknown session' errors. Mitigation: the README states it, and /api/health reports the replica id so the symptom is diagnosable in one request. The 2026-07-28 spec deletes the requirement outright."
+  ]
+}

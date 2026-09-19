@@ -1,0 +1,239 @@
+{
+  "subsystem": "Guardrails A \u2014 tool-definition integrity (anti rug-pull) + pre-call policy engine",
+  "verdict": "needs-revision",
+  "security_holes": [
+    {
+      "attack": "`defHashes` hashes a FIXED allowlist (name/title/description/inputSchema/outputSchema/annotations). Anything else on the upstream Tool object \u2014 `_meta`, vendor extension keys, future spec fields \u2014 is NOT hashed. If `project()` passes the upstream object through to tools/list (the obvious implementation; nothing says otherwise), an upstream rug-pulls by putting its payload in `_meta.x` or any unlisted key: def_hash never moves, the item stays `approved`, and the injected text lands in the model's context. D1's claim 'defHash covers everything the model will see' is currently FALSE \u2014 it covers everything the hash function happens to enumerate.",
+      "fix": "Make it true by construction, not by enumeration: one function returns `{prose, shape}`; the hash hashes it and `project()` serialises EXACTLY it and nothing else. An upstream field outside that shape is dropped before it reaches the client, so a new spec field becomes a visible missing-capability regression rather than a silent hole. P2 test: a random upstream tool object with 20 junk keys \u2014 the projected JSON deep-equals the hashed shape.",
+      "severity": "critical"
+    },
+    {
+      "attack": "`Engine.callTool` calls the gate; nothing calls it for resources/read or prompts/get. But `policy_rule.itemKind` offers 'prompt'|'resource'|'any' and `PolicyInput.kind` is a three-way union. An operator writes `any server \u00b7 resource \u00b7 secrets* -> deny`, the console renders it as a confident sentence, and it never fires. Worse for integrity: only `resolveTool` is shown consulting `isExposed` \u2014 if readResource/getPrompt filter at LIST time and not CALL time, a quarantined or rejected prompt is still fetchable. That is mcphub's afcc72f CVE reproduced in the two kinds the design forgot.",
+      "fix": "One `resolve(scope, kind, name)` used by all three call paths, one error construction site, one gate call in each (~10 lines; the brand pattern generalises unchanged). If that will not fit in P2, then DELETE 'prompt', 'resource' and 'any' from `policy_rule.itemKind` and pin it to 'tool' \u2014 a selector that silently never matches is exactly the false confidence a guardrail must not ship. Prefer the first.",
+      "severity": "critical"
+    },
+    {
+      "attack": "Smart Routing's vector search is settled to push scope into the SQL. The integrity terms (review='approved' AND approved_hash=def_hash AND defect IS NULL AND enabled AND review<>'rejected') live ONLY in the in-memory `isExposed`. So the search returns quarantined, rejected, defective and disabled items: /mcp/smart hands the calling model the name, description and token cost of an item tools/list deliberately hid, the model calls it and gets `Tool not found`. That is precisely the oracle D4 spent a whole decision avoiding, reintroduced through the back door \u2014 and the MUTATED DESCRIPTION is delivered to the model verbatim, so the rug-pull succeeds while the item is nominally 'quarantined'.",
+      "fix": "The search SQL joins server_item_override and carries the same terms; a P2 property test asserts over a randomised catalog that the SQL result set is a SUBSET of filter(isExposed). Export the WHERE fragment and the JS predicate from one module. Until that test exists, filter smart-search results through `isExposed` in JS after the SQL \u2014 correct-but-slow beats fast-and-leaking.",
+      "severity": "critical"
+    },
+    {
+      "attack": "`require_approval` is a third effect with NO mechanism anywhere: no pending-call table, no approval route, no TTL, no binding of an approval to (principal, tool, args-hash), no UI \u2014 and the deferred list confirms the inline flow waits on an SDK that has not shipped. In v1 it is `deny` with a different audit verb. An operator writes `allow if /repo oneOf(...) else require_approval` believing a human gets pinged; nobody is pinged, the agent fails, and on Tuesday afternoon they change else_effect to `allow` to make the pain stop. The guardrail teaches its own operator to disable it. The prompt's named attack \u2014 an approval granted for one argument set replayed for another \u2014 is unanswerable because there is no approval.",
+      "fix": "Delete `require_approval` from the v1 policy_effect enum and from else_effect. Two effects: allow, deny. Re-add by migration when MRTR lands and there is a channel to ask the question. If it must exist now it ships with an `approval` row keyed (principal_id, server, bare, sha256(canonical(args))), a TTL in minutes, single-use consumption, and a console route \u2014 otherwise the replay attack is wide open.",
+      "severity": "high"
+    },
+    {
+      "attack": "`defHashes` computes canonical(prose) and canonical(shape) IN FULL \u2014 recursive copy, NFC-normalising every string, then JSON.stringify \u2014 and only THEN checks MAX_CANON_BYTES. MAX_DEPTH caps depth, not breadth or node count. A malicious or merely broken upstream returns a tools/list whose inputSchema is 200 MB of flat keys; we allocate a normalised copy plus a giant string per item, across thousands of items, every discovery pass, in a single-process gateway. The JSON.stringify overflow is caught as 'uncanonicalizable' only after the memory and CPU are already spent.",
+      "fix": "Cap BEFORE canonicalising: a node/byte counter threaded through `norm` that throws DefectError('oversize') at ~100k nodes or 256 KiB accumulated, plus a hard response-size cap on the upstream transport client so an oversized tools/list never reaches the parser. Three lines in `norm`, one client option.",
+      "severity": "high"
+    },
+    {
+      "attack": "GET /api/review/:slug/:kind/:name/diff claims 'approved vs current'. NOTHING STORES THE APPROVED DEFINITION. approved_hash is one-way; the cache upsert already overwrote input_schema with the new definition the moment the change landed. schema_hash tells you THAT the shape moved, never WHAT moved. So the entire P3 review pane \u2014 the half the design itself says decides whether anyone keeps the feature on \u2014 cannot be built, and the operator is asked to approve a change they cannot see. Approving blind is worse than not reviewing: it launders the mutation with an attributed human signature.",
+      "fix": "Add `approved_def jsonb` (or the two canonical strings approved_prose/approved_shape) to server_item_override, written in the SAME UPDATE as approved_hash. A few KB across low thousands of rows. Then DELETE schema_hash: with both defs in hand the desc-vs-schema chip is `canonical(prose_a) !== canonical(prose_b)` computed in the diff route. Net zero new columns.",
+      "severity": "high"
+    },
+    {
+      "attack": "`absent` is the one arg op that fails OPEN on a schema change. Rule: 'allow unless /force is present'. Upstream renames the property to /forceOverwrite. Integrity catches the rename (hash moved -> quarantine); an OPERATOR \u2014 not an admin \u2014 sees a one-line diff that looks like a harmless property rename, clicks Approve, and an admin-authored deny is permanently dead while still rendering as a confident sentence in the policy list. Review is `operator`, policy is `admin`: the lower role silently neuters the higher role's control.",
+      "fix": "Free linter \u2014 the data is already on the row. Before rendering Approve, join enabled policy_rules whose server_slug/name_pattern match this item and resolve each constraint's root pointer segment against the NEW input_schema; any that no longer resolves renders as a red 'this approval breaks N policy rules' block above the button. Same check on the policy list page so broken rules look broken. Optionally make `absent` fail closed when the pointer's PARENT object does not exist, distinguishing 'field removed' from 'field omitted'.",
+      "severity": "high"
+    },
+    {
+      "attack": "The deny response carries `reason: {k:'args', ptr, op}`. D4 congratulates itself on never echoing constraint VALUES, but echoing the pointer and the op turns every allowlist into a guided oracle: a compromised or merely persistent agent learns 'the gate checks /repo with oneOf' and brute-forces <=64 string values, or learns '/path is checked with pathUnder' and probes roots. Without ptr+op the attacker guesses blind at both the field and the check; with it the search space collapses to the value set.",
+      "fix": "The WIRE response carries `effect` and `note` only. ptr, op, ruleId and seq go to the audit_event row and the admin explain drawer \u2014 the two places a human allowed to know can read them. Costs nothing: the operator-authored note already carries whatever the operator chose to disclose, which is the entire stated principle.",
+      "severity": "medium"
+    },
+    {
+      "attack": "`policy?: PolicyGate` is OPTIONAL in the Engine constructor with ALLOW_ALL as the default. D10's fail-closed-at-boot story covers 'the snapshot failed to load'; it does not cover 'packages/server forgot to pass the gate' \u2014 a wiring regression, a refactor, a second Engine constructed for a marketplace preview path. The gateway boots green, /healthz says ready, every call is allowed, and no error appears anywhere.",
+      "fix": "Make `policy` and `integrity` REQUIRED constructor params. Tests pass ALLOW_ALL explicitly, which also makes every test that does so visibly a test. Keep exporting ALLOW_ALL \u2014 the value is fine, the default is not. A permissive default on a security seam is config for a value that must never vary in production.",
+      "severity": "medium"
+    },
+    {
+      "attack": "trust='trusted' auto-advances approved_hash on ANY change, and newItemsOnEnabledServer:'approve' auto-approves new items. Both let a trusted server MINT A NEW TOOL NAME at will, and policy rules key on names via literal-plus-star globs. A first-party server compromised in CI adds `Write_File` (or write_file2, or write\u200bfile) and every deny rule written against `write_file` misses it \u2014 no quarantine, no review, no match. Trust was sold as 'skip the click on your own CI'; it silently also means 'skip the policy namespace'.",
+      "fix": "Trust auto-approves CHANGES to already-approved items; a NEW item name on a trusted server still lands `unreviewed`. One extra condition in the upsert, and it preserves the whole habituation argument (CI redeploying the same 40 tools makes no noise) while closing the mint. Pair with: namePattern matched case-insensitively, patterns rejected if non-ASCII, and the console flagging any enabled rule whose pattern currently matches zero exposed items.",
+      "severity": "medium"
+    },
+    {
+      "attack": "`externalRefs` blocks only the literal key `$ref`. JSON Schema has other remote-fetch keys: `$dynamicRef`, `$recursiveRef`, `$schema` pointing at a remote meta-schema, and `$id` re-basing resolution scope so a LOCAL-looking `#/definitions/x` resolves against an attacker's origin. The design also never says which fields the walk covers \u2014 inputSchema only, or outputSchema, prompt `arguments` and resource `annotations` too.",
+      "fix": "Denylist the key SHAPE, not one key: any key matching /^\\$(ref|dynamicRef|recursiveRef|schema|id|anchor)$/ whose value is not a string starting with '#' is external_ref. Run it over the whole hashed shape, not one field. Same ten lines, closes the family instead of one member.",
+      "severity": "medium"
+    },
+    {
+      "attack": "Pointer constraints reach exactly the pointers the operator wrote. {\"path\":\"/tmp/ok\",\"opts\":{\"path\":\"/etc/shadow\"}} passes a `pathUnder /path` rule, and whether that is a bypass depends entirely on whether the upstream tool reads the sibling \u2014 which the operator cannot see. D7 accepts nested-shape gaps in one sentence and moves on, while input_schema sits on the row unused.",
+      "fix": "When a rule constrains a tool whose current input_schema has additionalProperties other than false, the rule editor shows an inline warning naming the unconstrained sibling properties. Pure function over data already in memory, renders at authoring time, zero hot-path cost. This is the difference between 'documented limit' and 'the operator was told'.",
+      "severity": "medium"
+    }
+  ],
+  "contradicts_settled_design": [
+    {
+      "target": "`integrityOk` comment: \"observe: expose, but still event + audit + badge\"",
+      "settled": "`isExposed` is a pure predicate run in a filter loop over the whole catalog on every tools/list; the settled bus rule forbids synchronous I/O in subscribers, and the spirit is that the predicate does none either.",
+      "fix": "State explicitly that isExposed/integrityOk do NO I/O, NO logging and NO allocation. The `changed` event, the audit row and the badge count are emitted ONCE at cache time, inside the generation + client-identity guard, on the transition where def_hash actually moved \u2014 which is already where the design puts the SSE frame. Delete 'event + audit' from the predicate's comment before an implementer reads it as a requirement and writes an audit row per listed tool per list call."
+    },
+    {
+      "target": "Smart Routing vector search versus `isExposed`",
+      "settled": "'ONE predicate isExposed answers both is-it-listed and is-it-callable', and 'push scope into the vector-search SQL, never filter after LIMIT'.",
+      "fix": "Those two settled rules collide the moment integrity becomes a term in the predicate: the SQL must carry it too, which is a second implementation of an authorization-shaped check. Resolve by making the duplication explicit and TESTED rather than accidental \u2014 one module exports both the SQL WHERE fragment and the JS predicate, and a P2 property test asserts SQL subset-of isExposed over a randomised catalog. Anything less and the search leaks quarantined descriptions."
+    },
+    {
+      "target": "POST /api/policy/reorder {ids:[...]} rewriting seq = idx*10 for the whole list",
+      "settled": "D6's own argument for rows-not-a-document: a single JSON document is 'one row edited by concurrent writers, i.e. mcphub's whole-file-rewrite lost-update bug reintroduced'.",
+      "fix": "The reorder route IS a whole-list rewrite with no concurrency control \u2014 two admins reordering in adjacent tabs, last write silently wins, and rule ORDER is the entire semantics of first-match. Add a table-level `policy_version` integer bumped on every write; reorder and PATCH send the version they read and get 409 + the current list on mismatch. The approve route already got this pattern right with $seenHash; apply it consistently."
+    },
+    {
+      "target": "`subjectMatches`: `case 'role': return p.role === r.subjectId`, versus the comment directly above it (\"A machine principal matches a 'role' rule ONLY via its owning user's role\")",
+      "settled": "An API key NEVER implies admin \u2014 admin:false is a LITERAL TYPE on the machine arm of the Principal union, and everything narrower than the three global roles lives on the key's grant.",
+      "fix": "Code and comment disagree, and the permissive reading lets `role admin -> allow *` at seq 0 widen every API key owned by an admin past rules written specifically for keys. Resolve: `role` selectors match HUMAN principals only (p.kind === 'human' && p.role === r.subjectId); machine principals are selected by `api_key` (key id) or `user` (owning user id). Put it in the sketch, not a comment, and test both arms."
+    },
+    {
+      "target": "Metrics introduced by the subsystem",
+      "settled": "Never multiply two medium-cardinality dimensions in one metric; `tool` is a label on counters only; caller identity lives in a separate counter keyed by the better-auth apiKey id.",
+      "fix": "The design names two safe gauges/counters and is silent on the DECISION counter \u2014 exactly where an implementer writes {rule_id, tool, principal, effect}. Pin it now: ONE counter mcprouter_policy_decisions_total{effect} (two values after dropping require_approval) and ONE unlabelled mcprouter_integrity_quarantined gauge. Rule and tool attribution live in audit_event, the settled place for medium-cardinality joins. Also drop the claim that 'which calls did rule 12 permit' is free \u2014 it is a jsonb scan; either accept that or add a partial index, but do not call it free."
+    },
+    {
+      "target": "The operator/admin split across review and policy",
+      "settled": "ONE authorization axis: three global roles as route-group middleware, everything narrower on the API key's grant.",
+      "fix": "Approve is `operator`, policy is `admin`, and approving a definition change silently disarms admin-authored rules (see the `absent` hole). That is a second, undeclared authorization path in which the lower role gains write-through influence over the higher role's control. Ship the 'this approval breaks N rules' block and record approved_by in the policy audit trail, so the coupling is visible and stays on one axis; escalate approval of a rule-breaking change to admin if the linter is deferred."
+    }
+  ],
+  "over_engineered": [
+    {
+      "target": "Three integrity modes: enforce | observe | off",
+      "why": "`off` and `observe` differ only in whether a badge and an audit row are written; both expose everything. The only real choice is block or do-not-block. Three branches, three Settings copy strings \u2014 and the one named 'off', which sounds like the safe way to turn the feature down, is the one that destroys the evidence trail.",
+      "instead": "Two values: enforce | observe. `observe` IS the off switch and it keeps the signal. Structural validation (defect) stays unconditional in both, as already decided. One enum value and one branch deleted, and the 'someone set it to off and we lost the trail' failure ceases to exist."
+    },
+    {
+      "target": "guardrails.newItemsOnEnabledServer: 'quarantine' | 'approve' as a global setting",
+      "why": "It is servers.trust with a wider blast radius and a second name. Two knobs plus an integrity mode means THREE independent ways to make the guardrail not guard, and an operator debugging 'why did this not quarantine' must check all three.",
+      "instead": "Delete the setting; per-server trust subsumes it (trusted auto-approves changes to approved items, reviewed quarantines new ones). Result: one global enum of two values plus one per-server flag. Also demote servers.trust from a two-value pgEnum to `trust_auto_approve boolean not null default false` \u2014 a two-value enum is a boolean wearing a hat, and naming it `trust` invites a speculative third value."
+    },
+    {
+      "target": "`schema_hash` column and the second sha() call",
+      "why": "Its only stated job is labelling a queue chip 'description only' vs 'schema' without re-diffing. Once approved_def exists \u2014 and it must, or the diff route is fiction \u2014 the chip is a two-line comparison in the diff route, and the queue carries it as a computed column on the joined view it already needs.",
+      "instead": "Drop schema_hash. One hash, one column, one meaning. The design nets zero new columns: it loses schema_hash and gains approved_def."
+    },
+    {
+      "target": "MCPR_STRICT_BOOT env var",
+      "why": "Config for a value that never changes. A gateway that cannot load its policy cannot do its job; there is no deployment where running half-alive is correct. D10's own argument ('there is no traffic to break at boot') applies unconditionally.",
+      "instead": "Always exit non-zero when the initial rule load fails. Delete the variable, the branch and its Settings documentation. /healthz ready:false stays for the graceful-drain path."
+    },
+    {
+      "target": "`else_effect` as a per-rule enum column",
+      "why": "The DB CHECK already forbids constraints on deny rules, so else_effect is only meaningful on allow rules \u2014 where, after dropping require_approval, it has exactly one sensible value: deny. An 'allow ... else allow' rule does nothing, and the editor has to explain why it is offered.",
+      "instead": "Drop the column. A rule with constraints is 'allow IF, else deny'. Re-add it the day require_approval becomes real and 'allow if in allowlist, else ask a human' is expressible. Removes a column, an enum reference, a zod field, a UI control and a class of confusing rule."
+    },
+    {
+      "target": "defect_kind pgEnum plus the partial index tool_embedding_changed_idx",
+      "why": "A partial index on a table of 'hundreds to low thousands of rows' that is fully resident in memory anyway is index maintenance bought for a sequential scan of a few thousand rows \u2014 and the queue's real query computes `changed` ACROSS two tables, which that index cannot serve.",
+      "instead": "Keep the enum (honest and free); drop the index. Add it when a page load is measurably slow, which at this row count it will not be."
+    },
+    {
+      "target": "Explain['considered'] behind an overloaded `evaluate` signature with a `trace` flag",
+      "why": "The overload exists to save one array allocation on a path that is already a microsecond linear scan of string compares. The trace is a few hundred small objects on an ADMIN-ONLY debug route.",
+      "instead": "Keep `considered` \u2014 the explain drawer is what makes first-match predictable and it earns its place \u2014 but drop the overload: always build the trace and have `gate` discard it. One signature, one code path, no trace parameter threaded through. Re-add the branch if a profile ever shows it."
+    }
+  ],
+  "underspecified": [
+    {
+      "target": "`resource` items keyed (server_id, kind, item_name)",
+      "ambiguity": "MCP resources are identified by URI, not name; two resources can legitimately share a `name`, and a resource template can collide with a concrete resource. They then share one tool_embedding row and one override row, so their hashes alternate on every discovery and BOTH permanently quarantine \u2014 an availability bug an upstream can induce deliberately.",
+      "resolve_as": "For kind='resource', item_name is `uri ?? uriTemplate`, not `name`; enforce non-null at ingest and mark a resource with neither as defect='uncanonicalizable'. Tools and prompts keep the bare name. Document the exception next to the PK, because the settled 'bare upstream name' phrasing will otherwise be read literally."
+    },
+    {
+      "target": "The error CODE and `data` field of the indistinguishable Tool not found",
+      "ambiguity": "The design pins the MESSAGE to one construction site but never pins the JSON-RPC code or asserts that error.data is absent. 'Byte-identical' is claimed while only the message is controlled; an SDK path that attaches data:{toolName} or picks a different code for a resource versus a tool breaks the invariant without touching the message.",
+      "resolve_as": "One exported constant: code -32602, message `Tool not found: ${name}`, data undefined, for ALL kinds including resources and prompts (using the word 'Tool' for a resource is a feature \u2014 it does not even leak the kind). The P2 invariant test serialises the full JSON-RPC error object and asserts byte equality across all seven hide-reasons, not just the message string."
+    },
+    {
+      "target": "Whether a policy write reloads the snapshot before the HTTP response returns",
+      "ambiguity": "`reload(db)` is shown as a free function with no caller. If a write responds 200 and reloads asynchronously, an admin adds a deny rule, sees success, and the next tool call is still permitted \u2014 the classic 'I turned it off and it kept working' incident.",
+      "resolve_as": "Every write to policy_rule awaits reload() in the same request and responds only after the new snapshot is installed; the body echoes {ruleCount, loadedAt} and the console renders it. If the reload fails after a successful write, respond 200 with snapshotStale:true so the banner is honest rather than rolling the write back."
+    },
+    {
+      "target": "Smart Routing's synthetic meta-tools versus isExposed and versus policy selectors",
+      "ambiguity": "Meta-tools have no tool_embedding row, so s.items.get() misses and isExposed returns false \u2014 smart routing does not work unless something special-cases them, and the special case is a second path around the one predicate. Their serverSlug is also undefined, so `any server \u00b7 * -> deny` either catches them (silently breaking smart routing while the operator thinks they denied upstream tools) or exempts them.",
+      "resolve_as": "Reserve the slug `mcprouter` for built-ins, enumerated in ONE exported array. isExposed returns true for them after the scope check and nothing else. Policy sees serverSlug='mcprouter', so `any server` DOES match \u2014 and the rule editor warns when an enabled deny rule would match a built-in. call_tool re-enters Engine.callTool for the real target, which the brand already forces."
+    },
+    {
+      "target": "Override rows when a server is deleted and re-added with the same slug",
+      "ambiguity": "server_id cascades on delete, so approvals vanish \u2014 but 'the override row SURVIVES an item disappearing' will lead an implementer to expect survival across a server re-add too. A re-added server is a new servers.id, so everything is unreviewed, TOFU fires at enable time, and the whole catalog is silently re-blessed by whoever clicked Enable.",
+      "resolve_as": "That behaviour is correct (a re-added server is a new trust relationship) but must be STATED, and the Add-Server flow must say 'this slug was previously configured; N prior approvals were discarded' when it finds an audit_event for the slug. Cheap, and it stops delete/re-add being a quiet approval reset."
+    },
+    {
+      "target": "`observe` mode versus the changed SSE frame, badge and queue",
+      "ambiguity": "In observe, is a changed item still counted in the header badge and still queued for review? If yes, observe is enforce minus exposure (correct). If no, observe is `off` with extra steps and the mode distinction collapses.",
+      "resolve_as": "Identical to enforce in every respect \u2014 queue, badge, SSE frame, audit row, greyed catalog row \u2014 except that integrityOk returns true. Say it in the Settings .describe() string, which is the text the operator actually reads."
+    },
+    {
+      "target": "Rule count and snapshot size bounds",
+      "ambiguity": "Nothing caps policy_rule rows. '200 rows' is asserted in prose. An import script or a loop writes 50 000 and every tool call scans them, while the reload allocates the whole set.",
+      "resolve_as": "Hard cap 1 000 rules enforced at the POST route with a clear 400; the reload SELECT carries LIMIT 1001 and treats an over-limit result as a FAILED load (fail-stale). The console shows N / 1000. One line each, and it bounds the only unbounded thing on the hot path."
+    },
+    {
+      "target": "`def_seen_at` naming",
+      "ambiguity": "The notes say it 'only moves when the hash moves', but the name says 'seen', so a later implementer writes 'servers we have not discovered recently' queries against it and gets nonsense.",
+      "resolve_as": "Rename to def_changed_at. If 'last successfully discovered' is ever wanted it belongs on `servers`, not per item."
+    },
+    {
+      "target": "Whether the args the gate sees are byte-identical to what dispatch sends upstream",
+      "ambiguity": "The sketch passes the same reference with no await between, so today it is safe by accident. Per-user credential injection, smart-routing argument rewriting and _meta stamping are all plausible future insertions between gate and transport, and any of them makes the checked object different from the sent one.",
+      "resolve_as": "Write it as an invariant, not an accident: dispatch(t, args, signal) receives the SAME object identity the gate received, and a P2 test deep-freezes the args object before callTool so any post-gate mutation throws in strict mode. Future transformations must happen BEFORE the gate or be re-gated."
+    }
+  ],
+  "missing": [
+    {
+      "gap": "THE APPROVED DEFINITION IS NOT STORED, so the diff route \u2014 the centrepiece of the P3 UI and the only thing that makes approval a review rather than a click \u2014 cannot be implemented. approved_hash is one-way and the cache upsert has already overwritten input_schema by the time the operator opens the queue. Without approved_def the operator is structurally forced to approve blind, which is worse than not reviewing because it attaches a human signature to an unseen change.",
+      "severity": "critical"
+    },
+    {
+      "gap": "Flapping is named in the threat list and never answered. `WHERE def_hash IS DISTINCT FROM` suppresses only IDENTICAL redeliveries; a server alternating A<->B every 30s writes, audits and SSE-frames every 30s, and because approval is pure hash equality the item silently RE-EXPOSES every time the definition returns to A. Not an exfiltration bypass (only the cached, exposed definition reaches the model) but an alert-fatigue weapon whose designed outcome is the operator setting trust='trusted' to make it stop. Needs: a rolling per-item change counter, a `flapping` badge, suppression of repeat changed frames for the same item, and the rule that once an item deviates from its approved hash it stays `changed` until an operator acts rather than auto-healing on reversion.",
+      "severity": "high"
+    },
+    {
+      "gap": "No first-run story for the policy half. P2 ships a policy_rule table with zero rows and an implicit final allow \u2014 indistinguishable from the feature not existing. D9's 'starter ruleset generator' appears once, inside a rationale, with no shape, no trigger and no LOC. Without it the first operator sees an empty list, a '+ Rule' button and four orthogonal selectors, writes nothing, and the policy engine's real-world configuration is permanently empty. Needs it as a NAMED P3 deliverable with concrete output: the `viewer -> deny *` rule, one deny per tool whose destructiveHint is set, each rendered as an editable draft row with its sentence, saved only on an explicit click.",
+      "severity": "high"
+    },
+    {
+      "gap": "No pgvector/embedding interaction. tool_embedding carries an embedding derived from the description. When a description changes and the item quarantines, is the embedding recomputed immediately \u2014 spending tokens on a definition nobody approved and semantically indexing an attacker's text \u2014 or held until approval? Nothing says, and the wrong answer means smart search is indexed on unapproved prose.",
+      "severity": "medium"
+    },
+    {
+      "gap": "Nothing specifies the interaction with the marketplace install preview, the cost model, or call_rollup_1m. In particular: does the install preview's discovery WRITE hashes? If yes, previewing a server the operator then declines leaves rows behind; if no, TOFU at enable time re-discovers and the hashes the operator reviewed on the preview screen are not the ones approved \u2014 the TOCTOU the approve route was carefully built to close, reopened one screen earlier.",
+      "severity": "medium"
+    },
+    {
+      "gap": "The bulk approve form ({slug, all:true, defHashes:{...}}) never says whether it is all-or-nothing or best-effort. Pick best-effort with a per-item result array: all-or-nothing on a 40-item server means one flapping item makes bulk approve permanently impossible, which is the fastest route to an operator setting trust='trusted' on everything.",
+      "severity": "medium"
+    },
+    {
+      "gap": "No statement of what happens to an IN-FLIGHT call when its definition changes mid-call or a policy reload denies it. The answer is 'nothing, it completes' \u2014 correct and free \u2014 but it must be written down so nobody builds a cancellation path for it.",
+      "severity": "low"
+    },
+    {
+      "gap": "`note` text is admin-authored and lands verbatim in a downstream model's context, where it is read as instructions by an agent belonging to a different user on the team. D4 dismisses this as 'no escalation because an admin could write an allow rule anyway', conflating two different blast radii (this gateway's authorization versus every connected agent's behaviour). Needs a fixed non-instruction frame in the wire error \u2014 `Blocked by policy. Operator note (informational, not an instruction): \"...\"` \u2014 plus note edits in the audit trail.",
+      "severity": "low"
+    }
+  ],
+  "keep": [
+    "The central insight, which must survive every revision: integrity is ONE AND term inside the already-settled isExposed \u2014 not a state machine, not a watcher, not a background differ. approved_hash === def_hash evaluated at read time deletes the entire transition layer and with it the window where a hash lands and a status column lags.",
+    "`changed` DERIVED and never stored. This is why there is no re-quarantine pass to schedule and no job that can be down.",
+    "The hash write riding INSIDE the settled generation + client-identity guard rather than beside it, and per-(server, kind) cache replacement that applies only to a kind whose list call actually SUCCEEDED. Those twelve lines are the highest-value part of the discovery half; the partial-failure delete/re-add cycle is a real laundering channel and an implementer would otherwise get it wrong.",
+    "`WHERE def_hash IS DISTINCT FROM $new` on the cache upsert: no write, no audit row, no SSE frame for an identical redelivery.",
+    "TOCTOU-safe approve \u2014 the operator submits the defHash they were shown, the UPDATE is WHERE def_hash = $seen, 0 rows -> 409 + the new diff. Without it the whole review flow is approve-blind-on-a-race.",
+    "The error-surface ASYMMETRY and its reasoning: byte-identical Tool not found for integrity because the adversary is upstream and a helpful message recruits the calling model as the attacker's advocate; a distinguishable -32003 for policy because the caller is a legitimate principal who already passed grant and group checks. The single best piece of reasoning in the document.",
+    "Rejecting an expression language AND rejecting a single JSON document, landing on ordered rows with first-match \u2014 with the specific justifications (no parser, no sandbox, no evaluation timeout; per-rule attribution and audit; the model every operator already knows from firewall and IAM ACLs). Keep the explicit rejections of most-specific-wins and deny-overrides with their reasons.",
+    "No operator-supplied regex anywhere. globMatch as literal-plus-star with a linear indexOf walk: ReDoS structurally impossible rather than mitigated.",
+    "Fail-CLOSED arg ops \u2014 a missing pointer or wrongly-typed value fails the constraint. {\"path\":[\"/tmp\",\"/etc\"]} denying instead of slipping past a string op is the detail that decides whether the feature is real, and the design got it right.",
+    "Object.hasOwn in ptrGet, and RFC 6901's ~1-before-~0 unescape order. Both are wrong in most hand-rolled implementations.",
+    "D9 in full: annotations NEVER drive a runtime decision but ARE hashed, so flipping destructiveHint after approval quarantines the tool. That inversion is strictly stronger than a runtime default and turns an untrusted input into a reviewed fact. Keep the starter-ruleset framing too \u2014 it just has to become a real deliverable.",
+    "The diff renderer treated as a trust boundary for the OPERATOR'S EYES: <pre>-escaped never markdown, bidi controls U+202A-202E / U+2066-2069 rendered as literal <U+202E> and never applied, zero-width made visible, whitespace made visible, long lines clamped. The bidi case is the one everyone forgets and missing it defeats the entire review step.",
+    "Whitespace deliberately NOT stripped or collapsed from the hashed prose \u2014 200 newlines followed by injected text is the classic hiding place.",
+    "D1's NFC-on-VALUES-but-not-KEYS reasoning and the explicit refusal of NFKC because it folds full-width and ligature forms that DO change rendering, plus the \\0 domain separator between kind, prose and shape.",
+    "The RESOLVED module-private symbol brand making dispatch unreachable without passing through resolveTool plus the gate \u2014 a bypass is a compile error and a runtime error at once \u2014 together with the P2 spy-on-dispatch invariant test and the explicit call-out that Smart Routing's meta-tool is the single likeliest bypass in this codebase.",
+    "The gate never guarding the console's own API, which makes lockout impossible and therefore makes an MCPR_POLICY_DISABLE escape hatch unnecessary \u2014 so it does not exist and cannot be abused. Correct reasoning, correctly followed through.",
+    "Fail-closed at boot / fail-stale on reload, with /healthz ready:false so a load balancer drains rather than a naive probe passing a degraded gateway, and a successful empty reload honoured as a real empty ruleset rather than second-guessed by a heuristic.",
+    "The override row surviving an item disappearing from upstream: same definition on return means still approved, changed definition means quarantined. Disappear/reappear correctly neutralised.",
+    "The honest limits stated AS limits rather than papered over: pathUnder is lexical and symlinks defeat it (marked in code AND in UI helper text); resource contents are never hashed; a definition-stable tool whose backend behaviour changes is undetectable; the catalog is discovered with admin credentials so per-credential upstream divergence is invisible to every hash.",
+    "Phase placement in P2 rather than P3 for the predicate term and the gate seam, with the right reason: retrofitting a gate into a dispatch path later is exactly the shape of afcc72f. The +2.0w to 14.5 total still holds after this critique, because the deletions (require_approval, `off`, schema_hash, else_effect, newItemsOnEnabledServer, MCPR_STRICT_BOOT) roughly fund the additions (approved_def, gate wired for prompts and resources, the search SQL integrity term, the rule-vs-schema linter).",
+    "WILL IT BE USED \u2014 honest verdict: the integrity half yes, IF approved_def lands and the diff is real; folding TOFU into the Enable click is the correct first-run design and the reviewer genuinely is already on screen. The policy half, no, as written: an empty table with four orthogonal selectors and a third effect that quietly means deny will be configured once, misfire on a Tuesday, and be worked around by widening a rule to allow. The starter ruleset, the one-sentence rule rendering, the explain drawer and dropping require_approval are what decide that, and all four are already half-designed \u2014 finish them or ship policy in P3 only."
+  ]
+}

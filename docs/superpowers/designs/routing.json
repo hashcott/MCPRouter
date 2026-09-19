@@ -1,0 +1,296 @@
+{
+  "subsystem": "Smart Routing + Context Cost",
+  "summary": "Two features, one table, one pipeline. Smart Routing replaces a scope's tool list with three fixed meta-tools (search_tools / describe_tool / call_tool) and answers searches from a single `tool_embedding` table that carries BOTH a tsvector and a nullable pgvector column \u2014 so lexical search is not a degraded fallback bolted on later, it is the same query with a different ORDER BY, always present, and semantic search is that query fused with a vector arm when an embedding provider is configured. The single idea that makes this leaner than mcphub: mcphub has three parallel mechanisms (tool embeddings, a second server-embeddings search blended 0.8/0.2, and a meaningless 100-dim hash fallback) plus a global Progressive-Disclosure toggle; we have one table, one ranking query, PD unconditional, and the server's name and description prefixed into every tool's search text \u2014 which is what their server-embedding arm was reaching for. Context Cost counts the exact object we would put on the wire (post-namespacing, post-alias, post-override), caches it against a single `catalog.revision` integer, and ships one endpoint instead of two. Nothing in `packages/core` sees a session, a header or a URL: everything takes `(ResolvedScope, Principal)`, and `call_tool` re-enters the ordinary public `callTool` with `smart:false`, so the meta-tool is never a privileged path around the enable/disable enforcement.",
+  "total_loc_estimate": 1350,
+  "phase": "Phase 2, split. **2a Context Cost** depends only on the aggregation subsystem's `catalog.projectTools(scope)` + `catalog.revision` \u2014 no DB, no migration \u2014 and can be pulled into Phase 1 if the dashboard needs a real number early. **2b Smart Routing** depends on: (1) `ResolvedScope` from the server package's path resolver, (2) `catalog.toolsForServer` / `toolsChanged` / `callTool` / exported `ToolUnavailableError` from aggregation, (3) the storage subsystem's Drizzle handle, migration runner and `CREATE EXTENSION vector`, (4) the settings subsystem's `embedding` config blob + change event, (5) observability's logger and prom-client registry, (6) the SSRF validator (`assertSafeUrl`) from the upstream-server subsystem for the provider base URL. Blocks nothing else.",
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "Exactly three meta-tools, always: `search_tools`, `describe_tool`, `call_tool`. Progressive Disclosure is unconditional \u2014 there is no toggle, no setting, no per-group override. `describe_tool` takes `names: string[]` (1..20) and returns many schemas in ONE call.",
+      "rationale": "PD's only real cost is the extra round trip, and mcphub pays it once PER CANDIDATE because their describe_tool is single-tool. Batch it and the flow is search -> describe(3 names) -> call: two extra turns total, independent of candidate count, against a saving of roughly 3-5k tokens per search (an inputSchema is typically 60-80% of a tool's footprint; 10 hits with schemas is ~4k tokens, 10 hits without is ~700). There is no configuration under which the toggle should be off, and doctrine says no config for a value that never changes. Deleting it also deletes the branch in cost accounting, the settings row, the UI control and the two code paths through result shaping.",
+      "mcphub_contrast": "mcphub makes PD a global toggle (buildSmartRoutingMetaTools, smartRoutingService.ts:147-297) and swings between 2 and 3 meta-tools, so every downstream consumer \u2014 the tool list, the cost calculator (contextCostService.ts:76-95 computes the footprint twice, with and without PD, just to show the delta), the UI \u2014 carries the branch. Their describe_tool (smartRoutingService.ts:582) is one-tool-per-call, which is the only thing that makes the toggle defensible; fix that and the toggle has no reason to exist.",
+      "cost": "0 LOC (it is the absence of a branch); ~15 LOC for the batched describe handler"
+    },
+    {
+      "id": "D2",
+      "decision": "`search_tools` includes a hit's full `inputSchema` inline when and only when that schema serializes to <= 50 tokens (`schema_tokens` is a stored column, so this is an integer compare, not a tokenization). Otherwise the hit carries `schemaTokens` and no schema. 50 is a constant in the source, not config.",
+      "rationale": "Zero-argument and one-argument tools (`list_repos`, `get_status`, `whoami`) are common and their schemas are ~10-25 tokens. Forcing a describe_tool round trip for them is pure latency with no token win, which is the strongest argument people make FOR the PD toggle. This one-line rule removes that argument entirely while keeping PD unconditional.",
+      "mcphub_contrast": "mcphub's PD is all-or-nothing per install: with PD on, even `{\"type\":\"object\",\"properties\":{}}` costs a round trip; with it off, a 1400-token schema is pushed on every search. Neither is right; the per-hit rule is.",
+      "cost": "3 LOC"
+    },
+    {
+      "id": "D3",
+      "decision": "Dispatch is a `switch` on the three literal names inside `smartCallTool`, reached by one `if (scope.smart)` at the top of the engine's public `callTool`. `call_tool` handles its inner invocation by re-entering that same public `callTool` with `{...scope, smart: false}`. The default arm of the switch throws the exported `ToolUnavailableError`, the identical object the passthrough path throws for a missing tool. `packages/core` never sees a URL, header, session or request object; `packages/server` turns `/mcp/$smart[/<group>]` into `ResolvedScope{smart:true, groupId?}` and hands it in.",
+      "rationale": "Three consequences fall out of the re-entry, for free: (a) meta-tool names are unroutable from inside call_tool by construction \u2014 `call_tool({name:'call_tool'})` hits the passthrough path, finds nothing, and gets ToolUnavailableError, so no recursion guard is needed; (b) enable/disable, group allowlist and audit logging are enforced on the smart path by exactly the same code as the normal path, so the CVE class cannot reappear on one path only; (c) `search_tools` called against a NON-smart scope is indistinguishable from a typo, which is the hidden-vs-nonexistent rule applied to the meta-tools themselves.",
+      "mcphub_contrast": "mcphub intercepts by literal string comparison at the top of handleCallToolRequestImpl (mcpService.ts:3658-3667), a 300-line handler, and the smart path then re-implements the call rather than re-entering \u2014 which is precisely how a filter gets enforced on one path and not the other. Their session->group re-injection before scope checks (sseService.ts:166,705,855) is a symptom of HTTP identity having leaked into the decision; ResolvedScope means there is nothing to re-inject.",
+      "cost": "~110 LOC total for dispatch.ts"
+    },
+    {
+      "id": "D4",
+      "decision": "ONE table, `tool_embedding`, with `search_text text NOT NULL`, `tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', search_text)) STORED`, and `embedding vector(1536) NULL`. The sync job ALWAYS runs and always writes search_text/content_hash/schema_tokens; it writes `embedding` only when a provider is configured. Lexical search therefore needs no separate code path to stand up \u2014 it is the same rows, the same scope predicate, the same shaping.",
+      "rationale": "The nullable column is the whole trick: 'no embedding provider' becomes a data state, not an architectural fork. There is no fallback module, no second store to keep consistent, and switching a provider on later is a backfill of one column, not a migration.",
+      "mcphub_contrast": "mcphub's VectorEmbedding entity is synchronize:false with hand-written DDL and ALTERs (db/connection.ts:217-263), and their no-provider path is a separate 100-dim hash embedder (vectorSearchService.ts:1029) writing into the same vector column \u2014 two incompatible vector spaces in one index, distinguishable only by dimension.",
+      "cost": "~45 LOC schema + ~35 LOC migration"
+    },
+    {
+      "id": "D5",
+      "decision": "No `server_embeddings` table and no tool/server score blend. The server's name and the first 160 chars of its description are prefixed into every tool's `search_text`, so the server signal rides in the tool's own vector and tsvector.",
+      "rationale": "The blend exists to make the query 'github' surface github tools when no individual tool description says 'github'. Prefixing achieves the identical outcome with one string concat, and it composes correctly with the scope predicate (a second arm has to be scoped, ranked, normalized and blended separately). It also fixes the lexical case for free, which a vector-only second arm never could. Ceiling: a query that is purely ABOUT a server ('what can the github server do') returns that server's tools instead of a server summary \u2014 which is the better answer anyway. Upgrade path if someone disagrees: a `server` row type in the same table with a `kind` column, not a second table.",
+      "mcphub_contrast": "mcphub runs a second 'server'-type embedding search and blends 0.8*tool + 0.2*server (vectorSearchService.ts:1496). Two searches, two embedding lifecycles, two staleness stories, one magic weight pair, for a signal a string prefix carries.",
+      "cost": "-1 table, -1 search arm, +2 LOC"
+    },
+    {
+      "id": "D6",
+      "decision": "THE FORK: with no embedding provider, Smart Routing runs in an explicitly-named `lexical` MODE (Postgres FTS over the generated tsvector). It is not called a fallback, it is not silent, and it is not refused. The mode is (a) returned in every `search_tools` response as `mode`, (b) shown in `GET /api/routing/status` and in the UI status strip, and (c) STATED IN THE `search_tools` DESCRIPTION ITSELF, which appends: 'Matching is keyword-based (no embedding provider is configured on this gateway), so use concrete nouns and verbs from the tool's own domain rather than abstract phrasing, and retry with different keywords if nothing matches.' Startup logs one WARN naming the exact config key. The 100-dim hash embedder is not implemented at all.",
+      "rationale": "Three-way argument. (1) The hash is disqualified outright: its cosine similarity correlates with nothing, it returns confident garbage, and \u2014 the decisive part \u2014 the operator cannot tell, because the feature looks like it works. It is worse than absence because it poisons the model's tool selection invisibly. (2) Refusing to enable is coherent but wrong for this product: a team with 2000 tools and no OpenAI key is exactly the team that most needs something smaller than 2000 tool definitions in context. Lexical search at ~60% precision beats brute-force full listing on tokens by two orders of magnitude, and self-hosted air-gapped installs are a first-class deployment mode for a team gateway. (3) The thing that makes lexical honest where the hash is not: the consumer of this API is an LLM, and we can TELL IT how the index works in the tool description and it will change its queries. That is a capability no other fallback has. Tool names and descriptions are short, English, keyword-dense and written by their authors to be descriptive \u2014 `websearch_to_tsquery` over them is a real retrieval system, not a stand-in for one. Lexical mode is also the automatic degradation when the embedding API is merely DOWN: one failed query-embedding attempt falls to the lexical arm and reports `mode:'lexical'` for that response.",
+      "mcphub_contrast": "mcphub falls back to a 100-dim hash (vectorSearchService.ts:1029) with no signal to the operator or the model. We delete that code entirely and get a better no-key experience with less of it, because the lexical arm already exists for the hybrid ranking.",
+      "cost": "~0 net (the lexical arm is D7's second CTE); ~6 LOC for the description variant and the mode plumbing"
+    },
+    {
+      "id": "D7",
+      "decision": "In `semantic` mode, ranking is Reciprocal Rank Fusion of the vector arm and the FTS arm in a single SQL statement: `1.0/(60+vec_rank)*1.0 + 1.0/(60+lex_rank)*0.5`. Both arms carry the scope predicate. In `lexical` mode only the FTS arm runs. No pg_trgm extension: the default FTS parser already splits `create_pull_request` into words, and camelCase is handled by pre-splitting identifiers in TS when building `search_text` (`.replace(/([a-z0-9])([A-Z])/g,'$1 $2').replace(/[_\\-.]/g,' ')`), so trigram would only buy typo tolerance that an LLM-generated query does not need.",
+      "rationale": "Embeddings are reliably mediocre at exact identifier match \u2014 a model that already knows the tool is called `create_pull_request` and searches for that string gets worse results from pure vector search than from FTS. RRF is rank-based so it needs no score normalization between two incomparable scales, and it is one CTE pair, not a reranking stage. The 60 and the 1.0/0.5 weights are constants in the source with a comment naming them as untuned, not settings.",
+      "mcphub_contrast": "mcphub is vector-only with heuristic absolute thresholds of 0.2/0.3/0.4 chosen by query shape (smartRoutingService.ts:389). Three magic numbers that are not portable across embedding models, and no lexical arm at all.",
+      "cost": "~45 LOC of SQL"
+    },
+    {
+      "id": "D8",
+      "decision": "No absolute similarity threshold, ever. Over-fetch `limit*3` rows in SQL, re-filter the result set in TS through the live `ToolFilter` from the catalog, then apply a RELATIVE cut \u2014 drop hits whose fused score is below `0.5 * topScore` \u2014 and truncate to `limit` (default 10, max 25). Guarantee: always return at least 3 hits when 3 survived the scope filter, regardless of the cut. In lexical mode additionally drop `ts_rank_cd == 0` (zero literally means no term overlap, which IS meaningful).",
+      "rationale": "A cosine value of 0.3 means different things on text-embedding-3-small, bge-large and nomic-embed; an absolute threshold silently mis-tunes itself the moment anyone changes model. A relative gap cut is model-independent and needs no tuning. The over-fetch-then-refilter is the security half: the DB's `enabled` column is a 2-second-stale optimization, NOT the enforcement \u2014 the enforcement is the live filter applied to the over-fetched set, which is why 'never filter after LIMIT' is respected (scope is in the SQL) while a just-disabled tool still cannot leak.",
+      "mcphub_contrast": "mcphub's 0.2/0.3/0.4 heuristic by query shape (smartRoutingService.ts:389) is three untunable magic numbers and a fourth undocumented rule for picking between them.",
+      "cost": "~20 LOC"
+    },
+    {
+      "id": "D9",
+      "decision": "`embedding vector(1536)`, ZERO-PADDED for providers with fewer dimensions; providers with more must be configured with a `dimensions` parameter (text-embedding-3-large is Matryoshka and supports this natively). Exactly ONE active model per install, identified by `model_id = '<provider>:<model>:<dims>'` stored on each row and pinned in the WHERE clause; changing it triggers a full re-embed. Index: `USING hnsw (embedding vector_cosine_ops)` with stock m=16/ef_construction=64, plus `SET LOCAL hnsw.iterative_scan='relaxed_order'; SET LOCAL hnsw.max_scan_tuples=20000;` in the search transaction. Never ivfflat.",
+      "rationale": "Zero-padding is mathematically LOSSLESS for cosine \u2014 zeros contribute nothing to either the dot product or the norm \u2014 so one fixed column width serves every provider without a per-dimension table or a runtime ALTER. ivfflat is actively wrong here: at the realistic team-install row count (hundreds to low thousands of tools) `lists = rows/1000` rounds to 1-2, which is a degenerate index, and ivfflat must be built on a POPULATED table, so a migration running on an empty database produces garbage. HNSW builds incrementally from zero rows, needs no training set and no tuning. The iterative_scan SETs are non-negotiable rather than a nicety: without them a filtered HNSW query post-filters its ef_search candidates and can return 3 rows for a LIMIT 30 \u2014 the exact 'filter after LIMIT' bug we were told to avoid. Requires pgvector >= 0.8.0; assert `extversion` once at boot, and if older, log once and skip the SETs (at 2k rows the planner seq-scans anyway, which is exact and ~10ms). Honest note for the reader: at <= 2k rows the index frequently will not be chosen and that is correct; it starts earning its keep past ~20k. Ceiling: a model needing >1536 dims means `ALTER TYPE vector(N)` + re-embed, and >2000 dims means halfvec because pgvector cannot index beyond 2000.",
+      "mcphub_contrast": "mcphub has no migrations at all (synchronize:true, connection.ts:92) with vector_embeddings carved out as synchronize:false hand-written DDL (:217-263), and mixes a 100-dim hash space into the same column as real provider vectors.",
+      "cost": "~10 LOC in the migration + ~12 LOC of padding/version-assert"
+    },
+    {
+      "id": "D10",
+      "decision": "Staleness is per-row: `content_hash = sha256(search_text)` on each row. Sync for a server = build the current rows, diff by `(qualified_name, content_hash, model_id)`, then embed only the added and changed, delete the missing, and UPDATE `enabled` in place. Triggered by the catalog's `toolsChanged(serverId)` event, debounced 2s, single in-process queue with concurrency 1; embedding calls batched 100 inputs per request. A full pass runs once at startup.",
+      "rationale": "A per-row hash subsumes a set-level hash and gives incremental updates for free: adding one tool to a 40-tool server embeds one tool, not forty. Concurrency 1 because this is a single-process deployment by design and every embedding API rate-limits; a queue is cheaper than backoff. The 2s debounce is safe precisely because of D8 \u2014 the live filter, not the DB column, is what prevents a disabled tool from appearing.",
+      "mcphub_contrast": "mcphub hashes the whole tool SET with scrypt to decide whether to resync (vectorSearchService.ts:1189-1250) \u2014 all-or-nothing, so one changed description re-embeds every tool on that server, and scrypt (a deliberately slow password KDF) is a strange choice for a content fingerprint.",
+      "cost": "~150 LOC"
+    },
+    {
+      "id": "D11",
+      "decision": "Tokenizer: `gpt-tokenizer/encoding/o200k_base`, lazily imported once and memoized. Count `encode(JSON.stringify(x)).length` on the EXACT object we would put on the wire \u2014 post-namespacing, post-alias-substitution, post-description-override \u2014 including `outputSchema`, `annotations` and `title` when present. Prompts count `{name,description,arguments}`; resources `{uri,name,description,mimeType}`; resource templates `{uriTemplate,name,description,mimeType}`. The encoding name is returned in the API payload and rendered in the UI next to the number.",
+      "rationale": "Counting the projected object is the only definition that cannot drift from reality, and it is why alias substitution (which changes a name's length) and description overrides are handled correctly with no special case. o200k_base rather than cl100k because cl100k is a generation behind. The number is a comparative budget, not a bill \u2014 Claude's tokenizer differs by roughly +-10% and the UI says so. No config: one encoding forever. Ceiling: exact Claude counts would need a network call per tool via count_tokens, which is not worth it for a relative budget.",
+      "mcphub_contrast": "mcphub counts cl100k over `{name,description,inputSchema}` (utils/tokenCost.ts) \u2014 one encoding generation behind, and it omits outputSchema and annotations, which are real wire bytes and growing.",
+      "cost": "~60 LOC"
+    },
+    {
+      "id": "D12",
+      "decision": "ONE cost endpoint, `GET /api/cost`, returning servers + groups + all in a single payload, plus `GET /api/cost/tools?server=<id>` for the per-tool drill-down. Caching is a `Map<scopeKey,{rev,value}>` compared against a single `catalog.revision` integer that the aggregation subsystem bumps on any tool-cache or tool-setting change \u2014 no TTL, no eviction, no persistence. Tool-result compression is NOT in v1; instead the observability subsystem records `resultBytes` on every call record and `resultTokens` when bytes <= 256 KB.",
+      "rationale": "The dashboard renders servers, groups and the global total on one screen, so two endpoints mean two round trips and two TanStack Query keys for one view; deleting one is doctrine. The revision-keyed cache has no invalidation problem because its key IS the invalidation. On compression: catalog cost is deterministic and operator-controllable, while result compression is a lossy in-flight transformation the operator cannot preview and the model cannot detect \u2014 it silently corrupts downstream reasoning, which is the 'error handling that prevents data loss' line we do not cross. The MCP-native answer already exists and is free: a tool with a large payload should return a `resource_link` and let the client fetch on demand. What we ship instead is the measurement you would need before ever building compression, at roughly one line. Trigger to revisit: a team can point at a specific tool whose p95 result exceeds ~10k tokens and whose upstream will not fix it.",
+      "mcphub_contrast": "mcphub ships GET /api/cost/servers and GET /api/cost/groups separately (routes/index.ts:304) and recomputes live on every poll with no memoization; and it ships toolResultCompressionService.ts (:444) with an explicit `[mcphub:compressed-tool-result ...]` marker \u2014 the marker is the tell that they know the transformation is lossy and needed a way to confess it in-band.",
+      "cost": "~70 LOC routes + ~140 LOC cost.ts"
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "Meta-tool definitions (exact wire text)",
+      "kind": "type",
+      "sketch": "// packages/core/src/routing/metaTools.ts\nconst SERVER_LIST_CAP = 40;\n\nexport function metaTools(scope: ResolvedScope, catalog: Catalog, mode: SearchMode): Tool[] {\n  const names = catalog.serverNames(scope.serverIds);          // sorted, stable\n  const shown = names.slice(0, SERVER_LIST_CAP).join(', ')\n    + (names.length > SERVER_LIST_CAP ? ` (+${names.length - SERVER_LIST_CAP} more)` : '');\n  const lexNote = mode === 'lexical'\n    ? ' Matching is keyword-based (no embedding provider is configured on this gateway), so use'\n    + ' concrete nouns and verbs from the tool\\'s own domain rather than abstract phrasing, and'\n    + ' retry with different keywords if nothing matches.'\n    : '';\n  return [{\n    name: 'search_tools',\n    description:\n      'Find tools by describing the task you want to perform. This gateway fronts multiple MCP'\n    + ' servers and does not list their tools directly \u2014 search first, then call. Returns ranked'\n    + ' matches, each with a qualified name, a description and the token size of its input schema.'\n    + ' Schemas are omitted unless tiny; pass every name you are considering to describe_tool in ONE'\n    + ` call to get them, then invoke with call_tool. Servers in scope: ${shown}.` + lexNote,\n    inputSchema: {\n      type: 'object',\n      properties: {\n        query:   { type: 'string', maxLength: 512, description: 'What you want to do, in plain language. Include the domain noun (repository, invoice, cluster) and the verb (create, list, delete).' },\n        limit:   { type: 'integer', minimum: 1, maximum: 25, default: 10 },\n        servers: { type: 'array', items: { type: 'string' }, description: 'Optional: restrict to these server names.' },\n      }, required: ['query'],\n    },\n    outputSchema: SEARCH_OUTPUT_SCHEMA,\n  }, {\n    name: 'describe_tool',\n    description:\n      'Return the full input schemas for tools found by search_tools. Pass every tool you are'\n    + ' considering in one call. Names that are unknown or not available here are reported in'\n    + ' `notFound` rather than failing the call.',\n    inputSchema: {\n      type: 'object',\n      properties: { names: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 20,\n        description: 'Qualified tool names exactly as returned by search_tools.' } },\n      required: ['names'],\n    },\n  }, {\n    name: 'call_tool',\n    description:\n      'Invoke a tool found via search_tools, by its qualified name. `arguments` must match that'\n    + ' tool\\'s inputSchema exactly \u2014 call describe_tool first unless search_tools already'\n    + ' returned the schema inline.',\n    inputSchema: {\n      type: 'object',\n      properties: {\n        name:      { type: 'string', description: 'Qualified tool name from search_tools.' },\n        arguments: { type: 'object', additionalProperties: true, description: 'Arguments matching that tool\\'s inputSchema.' },\n      }, required: ['name'],\n    },\n  }];\n}",
+      "notes": "Because the description embeds the server list, tools/list for a smart scope changes when the SERVER SET changes. The engine must emit notifications/tools/list_changed for smart scopes on server-set change only \u2014 never on individual tool change, which is the entire point of the mode. Cap at 40 names bounds the fixed footprint at roughly 400 tokens; ceiling noted, upgrade is to drop the list past 100 servers."
+    },
+    {
+      "name": "SmartRouter (dispatch)",
+      "kind": "type",
+      "sketch": "// packages/core/src/routing/dispatch.ts  \u2014 NO http, NO session, NO request object\nexport type ResolvedScope = {            // CONTRACT: owned by scope resolution, built in packages/server\n  kind: 'all' | 'group' | 'server';\n  groupId?: string;\n  serverIds: string[];                   // already authz-filtered; never from caller arguments\n  allowedQualifiedNames: string[] | null;// group per-server item selection; null = all\n  smart: boolean;\n};\n\nexport interface SmartRouterDeps {\n  search: Search;\n  catalog: Catalog;\n  callTool(scope: ResolvedScope, principal: Principal, name: string, args: unknown): Promise<CallToolResult>;\n}\n\nexport function smartListTools(scope: ResolvedScope, catalog: Catalog, mode: SearchMode): Tool[];\n\nexport async function smartCallTool(\n  d: SmartRouterDeps, scope: ResolvedScope, principal: Principal,\n  name: string, args: unknown,\n): Promise<CallToolResult> {\n  switch (name) {\n    case 'search_tools': {\n      const a = SearchArgs.parse(args);                       // zod 4.6.5, throws -32602\n      return json(await d.search.run(scope, a));\n    }\n    case 'describe_tool': {\n      const a = DescribeArgs.parse(args);\n      return json(d.catalog.describeInScope(scope, a.names));  // {tools:[...], notFound:[...]}\n    }\n    case 'call_tool': {\n      const a = CallArgs.parse(args);\n      // re-entry with smart:false: meta-tool names become unroutable by construction,\n      // and enable/disable is enforced by the SAME code as a direct call.\n      return d.callTool({ ...scope, smart: false }, principal, a.name, a.arguments ?? {});\n    }\n    default:\n      throw new ToolUnavailableError(name);  // identical text to a nonexistent tool\n  }\n}\n\n// engine entry point, unchanged shape:\n//   callTool(scope, principal, name, args) {\n//     if (scope.smart) return smartCallTool(deps, scope, principal, name, args);\n//     ... passthrough: filter -> findToolOnServer -> invoke\n//   }",
+      "notes": "json() sets BOTH structuredContent (MCP 2025-06-18+, supported by SDK 1.30) and a text block containing the same JSON, so capable and legacy clients both work. No onProgress in v1 \u2014 core returns a plain Promise; when the modern-era HTTP handler lands, per-request progress streaming is the server package's concern."
+    },
+    {
+      "name": "Search",
+      "kind": "type",
+      "sketch": "// packages/core/src/routing/search.ts\nexport type SearchMode = 'semantic' | 'lexical';\nexport const SearchArgs = z.object({\n  query: z.string().trim().min(1).max(512),\n  limit: z.number().int().min(1).max(25).default(10),\n  servers: z.array(z.string().max(128)).max(50).optional(),\n});\nexport type SearchHit = {\n  name: string;            // qualified <server><sep><tool> \u2014 pass this to call_tool verbatim\n  server: string;\n  description: string;     // truncated to 300 chars\n  score: number;           // fused, 3dp\n  schemaTokens: number;\n  inputSchema?: unknown;   // present iff schemaTokens <= 50\n};\nexport type SearchResponse = { mode: SearchMode; hits: SearchHit[]; searched: number };\n\nexport interface Search { run(scope: ResolvedScope, q: z.infer<typeof SearchArgs>): Promise<SearchResponse>; }\nexport function createSearch(db: Db, embedder: () => Embedder | null, catalog: Catalog): Search;\n\n// run():\n//  1. serverIds = q.servers ? scope.serverIds \u2229 catalog.idsForNames(q.servers) : scope.serverIds\n//     \u2014 INTERSECTION ONLY. An out-of-scope server name is dropped silently, never an error\n//       (an error would confirm the server exists).\n//  2. if (serverIds.length === 0) return { mode, hits: [], searched: 0 }\n//  3. mode = embedder() ? 'semantic' : 'lexical';\n//     semantic: try qvec = await embedder.embed([q.query]); on ANY failure -> log.warn once, mode='lexical'\n//  4. run the SQL (below) with over = q.limit * 3\n//  5. re-filter rows through catalog.filterFor(scope)  \u2014 live enable/disable, defence in depth\n//  6. relative cut: keep hits where score >= 0.5 * hits[0].score, but never fewer than min(3, n)\n//  7. truncate to q.limit; attach inputSchema where schemaTokens <= 50",
+      "notes": "Step 1 is the enumeration boundary: the `servers` argument can only narrow, never widen. Step 5 runs on <= 3*limit rows, i.e. after LIMIT \u2014 permitted because SCOPE is already in the SQL; this pass only catches the <=2s window where the denormalized `enabled` column is stale."
+    },
+    {
+      "name": "Hybrid ranking SQL",
+      "kind": "table",
+      "sketch": "-- semantic mode. lexical mode = the `lex` CTE alone, score = ts_rank_cd, drop rank 0.\nSET LOCAL hnsw.iterative_scan = 'relaxed_order';   -- skipped if pgvector < 0.8\nSET LOCAL hnsw.max_scan_tuples = 20000;\n\nWITH scope AS (SELECT unnest($1::uuid[]) AS server_id),\nvec AS (\n  SELECT te.id, row_number() OVER (ORDER BY te.embedding <=> $2::vector) AS rnk\n  FROM tool_embedding te JOIN scope USING (server_id)\n  WHERE te.enabled AND te.model_id = $3 AND te.embedding IS NOT NULL\n    AND ($4::text[] IS NULL OR te.qualified_name = ANY($4))\n  ORDER BY te.embedding <=> $2::vector\n  LIMIT $6\n),\nlex AS (\n  SELECT te.id, row_number() OVER (ORDER BY ts_rank_cd(te.tsv, q) DESC) AS rnk\n  FROM tool_embedding te JOIN scope USING (server_id),\n       websearch_to_tsquery('english', $5) q\n  WHERE te.enabled AND te.tsv @@ q\n    AND ($4::text[] IS NULL OR te.qualified_name = ANY($4))\n  ORDER BY ts_rank_cd(te.tsv, q) DESC\n  LIMIT $6\n)\nSELECT te.qualified_name, te.server_name, te.tool_name, te.schema_tokens,\n       COALESCE(1.0/(60+vec.rnk), 0) * 1.0\n     + COALESCE(1.0/(60+lex.rnk), 0) * 0.5 AS score\nFROM tool_embedding te\nLEFT JOIN vec ON vec.id = te.id\nLEFT JOIN lex ON lex.id = te.id\nWHERE vec.id IS NOT NULL OR lex.id IS NOT NULL\nORDER BY score DESC\nLIMIT $6;",
+      "notes": "$1 serverIds, $2 query vector, $3 active model_id, $4 group allowlist or NULL, $5 raw query text, $6 = limit*3. Scope ($1) and the allowlist ($4) are INSIDE both CTEs, i.e. before their LIMITs \u2014 this is the 'push scope into the SQL' rule. websearch_to_tsquery is a parameterized function call; the query string is never concatenated. Descriptions are fetched from the in-memory catalog by qualified_name, not from the DB, so the search text and the shown description cannot disagree. 60 / 1.0 / 0.5 are untuned constants, commented as such."
+    },
+    {
+      "name": "tool_embedding",
+      "kind": "table",
+      "sketch": "// packages/core/src/db/schema/routing.ts  (path owned by the storage subsystem)\nexport const toolEmbedding = pgTable('tool_embedding', {\n  id:            uuid('id').primaryKey().defaultRandom(),\n  serverId:      uuid('server_id').notNull().references(() => server.id, { onDelete: 'cascade' }),\n  serverName:    text('server_name').notNull(),\n  toolName:      text('tool_name').notNull(),\n  qualifiedName: text('qualified_name').notNull(),\n  enabled:       boolean('enabled').notNull().default(true),\n  searchText:    text('search_text').notNull(),\n  contentHash:   text('content_hash').notNull(),\n  modelId:       text('model_id'),\n  embedding:     vector('embedding', { dimensions: 1536 }),\n  schemaTokens:  integer('schema_tokens').notNull().default(0),\n  updatedAt:     timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),\n}, t => [ unique('tool_embedding_key').on(t.serverId, t.toolName) ]);\n\n-- drizzle/0004_routing.sql (tsv and the indexes are raw; Drizzle has no generated-tsvector type)\nCREATE EXTENSION IF NOT EXISTS vector;\nCREATE TABLE tool_embedding ( ...as above... );\nALTER TABLE tool_embedding ADD COLUMN tsv tsvector\n  GENERATED ALWAYS AS (to_tsvector('english', search_text)) STORED;\nCREATE INDEX tool_embedding_tsv_idx    ON tool_embedding USING gin (tsv);\nCREATE INDEX tool_embedding_vec_idx    ON tool_embedding USING hnsw (embedding vector_cosine_ops);\nCREATE INDEX tool_embedding_server_idx ON tool_embedding (server_id) WHERE enabled;",
+      "notes": "No pg_trgm. schema_tokens is stored so the <=50-token inline-schema rule is an integer compare in SQL-returned data, and so cost drill-down can be served without the catalog. ON DELETE CASCADE means removing a server needs no cleanup code."
+    },
+    {
+      "name": "search_text builder",
+      "kind": "type",
+      "sketch": "// packages/core/src/routing/embedText.ts\nconst SPLIT = (s: string) => s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_\\-.]+/g, ' ');\n\nexport function searchText(t: CachedTool, serverDescription: string): string {\n  const props = Object.entries((t.tool.inputSchema as any)?.properties ?? {})\n    .slice(0, 30)\n    .map(([k, v]: [string, any]) => `${SPLIT(k)} ${String(v?.description ?? '').slice(0, 120)}`)\n    .join(' ');\n  return [\n    `${t.serverName} ${SPLIT(t.toolName)}`,\n    serverDescription.slice(0, 160),\n    t.tool.description ?? '',\n    props,\n  ].join('\\n').replace(/\\s+/g, ' ').trim().slice(0, 2000);\n}\nexport const contentHash = (s: string) => createHash('sha256').update(s).digest('hex');",
+      "notes": "Server name+description prefixed here is what replaces mcphub's whole server-embedding arm (D5). Property DESCRIPTIONS are included, not just names \u2014 they carry the domain vocabulary ('repository owner', 'ISO 8601 timestamp') that makes a search hit. SPLIT is what lets the FTS arm handle both snake_case (which the default parser already splits) and camelCase (which it does not), and is why pg_trgm is unnecessary. 2000-char cap bounds embedding cost."
+    },
+    {
+      "name": "Embedder",
+      "kind": "type",
+      "sketch": "// packages/core/src/routing/provider.ts\nexport type EmbeddingConfig = {\n  baseUrl: string;                        // OpenAI-compatible /v1/embeddings\n  apiKey: string;\n  apiKeyHeader?: 'Authorization' | 'api-key';  // 'api-key' for Azure OpenAI\n  model: string;\n  dimensions?: number;                    // passed through where the provider supports it\n};\nexport type Embedder = {\n  modelId: string;      // `${host}:${model}:${dims}` \u2014 the staleness key stored per row\n  dims: number;         // MUST be <= 1536\n  embed(texts: string[]): Promise<Float32Array[]>;   // <=100 per call, zero-padded to 1536\n};\nexport function createEmbedder(cfg: EmbeddingConfig | null): Embedder | null;",
+      "notes": "ONE provider shape. OpenAI, Azure OpenAI, Google (generativelanguage.googleapis.com/v1beta/openai/), Ollama, LiteLLM, vLLM and TEI all expose /v1/embeddings; a baseUrl and a header name covers every one. No provider enum, no factory, no per-provider module \u2014 mcphub has three (vectorSearchService.ts:1029). cfg.baseUrl MUST go through the shared assertSafeUrl before the first fetch. dims > 1536 is a startup config error naming the `dimensions` fix."
+    },
+    {
+      "name": "Sync job",
+      "kind": "type",
+      "sketch": "// packages/core/src/routing/sync.ts\nexport type RoutingStatus = {\n  mode: SearchMode; provider: string | null; model: string | null; dims: number | null;\n  rows: number; embedded: number; stale: number; missing: number;\n  lastSyncAt: string | null; lastError: string | null; syncing: boolean;\n};\nexport interface Sync {\n  start(): void;                                // startup full pass + subscribe to toolsChanged\n  enqueue(serverId: string): void;              // debounced 2s, concurrency 1\n  resyncAll(reason: 'model-changed' | 'manual'): void;\n  setEnabled(serverId: string, toolName: string, enabled: boolean): Promise<void>; // same txn as the toggle\n  status(): Promise<RoutingStatus>;\n}\nexport function createSync(db: Db, catalog: Catalog, embedder: () => Embedder | null, log: Logger): Sync;\n\n// syncServer(serverId):\n//   rows   = catalog.toolsForServer(serverId).map(t => ({...t, searchText, contentHash, schemaTokens}))\n//   stored = SELECT tool_name, content_hash, model_id FROM tool_embedding WHERE server_id = $1\n//   upsert rows whose (hash, model_id) differ or are absent; DELETE tool_name NOT IN rows\n//   embed only the changed set, batched 100; on provider error -> row is written WITHOUT an\n//     embedding (search_text/tsv still land, so the tool stays findable lexically), counted in `missing`",
+      "notes": "That last line is the sharp edge of D4/D6: a provider outage degrades a tool to lexical-findable, never to invisible. `stale` in status() is computed by comparing the in-memory catalog hashes against a single SELECT of (qualified_name, content_hash) \u2014 no extra bookkeeping."
+    },
+    {
+      "name": "Context cost",
+      "kind": "type",
+      "sketch": "// packages/core/src/cost/tokens.ts\nexport function countTokens(s: string): number;            // o200k_base, lazily loaded, memoized\nexport const countTool = (t: Tool) => countTokens(JSON.stringify(t));          // the PROJECTED tool\nexport const countSchema = (t: Tool) => countTokens(JSON.stringify(t.inputSchema ?? {}));\nexport const countPrompt = (p: Prompt) => countTokens(JSON.stringify({ name: p.name, description: p.description, arguments: p.arguments }));\nexport const countResource = (r: Resource | ResourceTemplate) => countTokens(JSON.stringify(r));\n\n// packages/core/src/cost/cost.ts\nexport type ServerCost = {\n  serverId: string; name: string; status: string;\n  grossTools: number;  grossTokens: number;     // every tool the server advertises, namespaced\n  exposedTools: number; exposedTokens: number;  // minus per-server tools[name].enabled=false\n  promptTokens: number; resourceTokens: number;\n};\nexport type ScopeCost = {\n  scope: { kind: 'all' | 'group' | 'server'; id?: string; name: string };\n  toolCount: number;\n  passthroughTokens: number;   // the full tools/list this scope would send\n  smartFixedTokens: number;    // the 3 meta-tools, incl. this scope's embedded server list\n  meanToolTokens: number;      // mean over the scope, not p50 \u2014 stated in the UI\n  meanSchemaTokens: number;    // UI renders meanSchemaTokens * 10 as \"PD saves ~X per search\"\n  promptTokens: number; resourceTokens: number;\n};\nexport type CostSnapshot = {\n  asOf: string; encoding: 'o200k_base'; revision: number;\n  all: ScopeCost; servers: ServerCost[]; groups: ScopeCost[];\n};\nexport function costSnapshot(catalog: Catalog, scopes: ResolvedScope[]): CostSnapshot;\nexport function toolCostBreakdown(catalog: Catalog, serverId: string):\n  { qualifiedName: string; tokens: number; schemaTokens: number; enabled: boolean }[];\n\n// cache: const c = new Map<string, {rev: number; value: ScopeCost | ServerCost}>();\n// hit iff c.get(k)?.rev === catalog.revision. No TTL, no eviction (bounded by group count).",
+      "notes": "There is no `withPD` / `withoutPD` pair because PD is unconditional (D1). The counterfactual that replaced it is passthroughTokens vs smartFixedTokens \u2014 the headline saving \u2014 with meanSchemaTokens as the per-search PD saving. Arithmetic stays in the UI; the server ships six integers per scope. Gross-vs-exposed is defined on the PROJECTED object, which is why aliasing (shorter name = fewer tokens) and description overrides are correct with no special case."
+    },
+    {
+      "name": "HTTP routes",
+      "kind": "route",
+      "sketch": "GET  /api/cost                     -> CostSnapshot\n     authz: principal sees only servers/groups it can access; `all` is computed over that subset\nGET  /api/cost/tools?server=<uuid> -> { server, tools: ToolCostRow[] }   // sorted tokens desc\n     authz: same server-visibility check as the MCP route\nGET  /api/routing/status           -> RoutingStatus\n     authz: any authenticated principal; NEVER returns apiKey \u2014 provider is the baseUrl host only\nPOST /api/routing/resync           -> { queued: true }                   // admin only\n\n// MCP surface: nothing new. $smart / $smart/<group> is resolved by the existing path resolver\n// in packages/server into ResolvedScope{ smart: true, groupId? }. No new endpoint.",
+      "notes": "Two cost endpoints where mcphub has two (routes/index.ts:304) \u2014 but ours are /api/cost (one payload, one TanStack key) and the drill-down mcphub does not have at all, which is the view that actually drives the operator action 'this one tool costs 1400 tokens, turn it off'."
+    },
+    {
+      "name": "Settings + metrics",
+      "kind": "env",
+      "sketch": "// settings blob owned by the settings subsystem, read by this one; change event triggers resyncAll\nembedding: { baseUrl, apiKey, apiKeyHeader?, model, dimensions? } | null\n\n// env (bootstrap only; the settings row is authoritative once set)\nMCPROUTER_EMBEDDING_BASE_URL, MCPROUTER_EMBEDDING_API_KEY, MCPROUTER_EMBEDDING_MODEL\n\n// prom-client metrics registered with the observability subsystem\nmcprouter_tool_search_duration_seconds{mode}   histogram\nmcprouter_tool_search_hits                     histogram\nmcprouter_embedding_sync_total{result}         counter   // ok | changed | failed\nmcprouter_context_tokens{scope}                gauge     // set from each CostSnapshot",
+      "notes": "apiKey is never logged, never in RoutingStatus, never echoed by any route. There is no threshold setting, no PD setting, no ranking-weight setting, no tokenizer setting \u2014 all four are constants in source."
+    },
+    {
+      "name": "Routing status strip + cost tiles",
+      "kind": "component",
+      "sketch": "// contract the web subsystem renders (terminal aesthetic, mono for every identifier)\n<RoutingStrip />  // one dense row, always visible on the routing page:\n//   MODE semantic|lexical \u00b7 MODEL <mono> \u00b7 DIMS 1536 \u00b7 1,842/1,842 embedded \u00b7 0 stale\n//   status dot: ok (embedded==rows) | warn (stale>0 || mode=lexical) | err (lastError)\n//   lexical MUST render as a warn dot with the literal text\n//   \"no embedding provider \u2014 keyword matching only\", never as an ok state.\n<CostTable />     // server rows: name \u00b7 gross \u00b7 exposed \u00b7 delta bar \u00b7 click -> /api/cost/tools\n//   header carries the encoding label: \"tokens (o200k_base; Claude differs ~\u00b110%)\"",
+      "notes": "The lexical warn dot is the UI half of D6: the honesty is only real if the operator cannot miss it. Cost numbers render mono and right-aligned; the delta between gross and exposed is the actionable number, so it gets the bar."
+    }
+  ],
+  "files": [
+    {
+      "path": "packages/core/src/routing/metaTools.ts",
+      "purpose": "The three meta-tool definitions, their exact descriptions (semantic + lexical variants), the capped server list, output schemas.",
+      "loc": 120
+    },
+    {
+      "path": "packages/core/src/routing/dispatch.ts",
+      "purpose": "smartListTools + smartCallTool: the three-arm switch, zod arg schemas, scope intersection for `servers`, call_tool re-entry with smart:false, ToolUnavailableError default arm.",
+      "loc": 110
+    },
+    {
+      "path": "packages/core/src/routing/embedText.ts",
+      "purpose": "search_text builder (server name+description prefix, identifier splitting, property descriptions, 2000-char cap) and the sha256 content hash.",
+      "loc": 60
+    },
+    {
+      "path": "packages/core/src/routing/provider.ts",
+      "purpose": "createEmbedder: one OpenAI-compatible /v1/embeddings client, SSRF-checked base URL, batching, dimension assert and zero-padding to 1536, modelId derivation.",
+      "loc": 130
+    },
+    {
+      "path": "packages/core/src/routing/search.ts",
+      "purpose": "The hybrid RRF SQL and the lexical-only SQL, mode selection with embed-failure degradation, over-fetch + live re-filter, relative cut with the min-3 guard, hit shaping and the <=50-token inline schema rule.",
+      "loc": 170
+    },
+    {
+      "path": "packages/core/src/routing/sync.ts",
+      "purpose": "Debounced single-concurrency sync queue: per-row hash diff, batched embed, delete-missing, in-txn enabled toggle, startup full pass, resyncAll on model change, status() computation.",
+      "loc": 150
+    },
+    {
+      "path": "packages/core/src/cost/tokens.ts",
+      "purpose": "Lazily-loaded memoized o200k_base encoder; countTool/countSchema/countPrompt/countResource over the exact projected objects.",
+      "loc": 60
+    },
+    {
+      "path": "packages/core/src/cost/cost.ts",
+      "purpose": "Gross vs exposed per server, passthrough vs smartFixed per scope, means, and the catalog.revision-keyed Map cache; toolCostBreakdown.",
+      "loc": 140
+    },
+    {
+      "path": "packages/core/src/db/schema/routing.ts",
+      "purpose": "Drizzle table definition for tool_embedding (path owned by the storage subsystem; this file is my only addition to the shared schema).",
+      "loc": 45
+    },
+    {
+      "path": "packages/core/drizzle/0004_routing.sql",
+      "purpose": "CREATE EXTENSION vector, the table, the generated tsv column, the GIN and HNSW indexes, the partial server index.",
+      "loc": 35
+    },
+    {
+      "path": "packages/server/src/routes/cost.ts",
+      "purpose": "GET /api/cost and GET /api/cost/tools with per-principal scope visibility filtering.",
+      "loc": 70
+    },
+    {
+      "path": "packages/server/src/routes/routing.ts",
+      "purpose": "GET /api/routing/status (key-redacted) and POST /api/routing/resync (admin).",
+      "loc": 60
+    },
+    {
+      "path": "packages/core/test/search.test.ts",
+      "purpose": "@testcontainers/postgresql: scope leak (a tool outside serverIds is never returned), allowlist enforcement, disabled-tool exclusion via the live re-filter with a deliberately stale DB column, filtered-HNSW returns full k, lexical mode ranks a snake_case and a camelCase identifier query correctly, RRF ordering.",
+      "loc": 130
+    },
+    {
+      "path": "packages/core/test/cost.test.ts",
+      "purpose": "Known-string token counts pinned against o200k_base, gross > exposed when a tool is disabled, alias shortening reduces tokens, revision-cache hit/miss.",
+      "loc": 70
+    }
+  ],
+  "security": [
+    "**Caller arguments -> scope.** `search_tools.servers` and `describe_tool.names` are caller-controlled. `servers` is applied as an INTERSECTION with `scope.serverIds` only (`scope.serverIds \u2229 catalog.idsForNames(requested)`); a name outside scope is dropped silently, never rejected with an error, because an error confirms the server exists. `describe_tool` puts unknown and out-of-scope names in the SAME `notFound` array with no distinguishing text \u2014 the hidden-vs-nonexistent rule (mcphub's ToolUnavailableError, mcpService.ts:2654) extended to discovery.",
+    "**Search result set -> principal.** `server_id = ANY($1)` and the group allowlist `qualified_name = ANY($4)` sit inside BOTH ranking CTEs, before their LIMITs. Scope is never applied to the returned page. The over-fetch (limit*3) plus the live `catalog.filterFor(scope)` pass closes the <=2s window in which the denormalized `enabled` column can lag a toggle; the DB column is an optimization, the live filter is the enforcement.",
+    "**Meta-tool -> invocation.** `call_tool` does not invoke anything itself. It re-enters the engine's public `callTool` with `{...scope, smart:false}`, so per-server disable, per-group allowlist, authz and audit logging run through identical code to a direct call. This is mcphub's CVE afcc72f lesson structurally rather than by a second execution-time gate (their findToolOnServer:3388 has to re-check under both bare and prefixed keys because the two paths diverged). It also makes meta-tool names unroutable from inside call_tool by construction, so no recursion guard exists to forget.",
+    "**Query string -> SQL.** `websearch_to_tsquery('english', $5)` is a parameterized function call and the vector is a bound `$2::vector`; no part of the query is ever concatenated into SQL. Input is bounded first by zod (`query` <=512 chars, `limit` 1..25, `servers` <=50 entries, `names` <=20 entries) so a caller cannot force an unbounded scan or an oversized embedding request.",
+    "**Gateway -> embedding provider (outbound).** `EmbeddingConfig.baseUrl` is operator-supplied (self-hosted Ollama/LiteLLM is a first-class config) and is validated by the SSRF guard the upstream-server subsystem owns \u2014 same `assertSafeUrl`, same per-redirect-hop validation. No admin bypass: unlike mcphub (mcpService.ts:1382-1396) there is no owner-based exemption here, because an operator pasting a hostile base URL is the realistic threat, not a hostile operator.",
+    "**Secret handling.** `embedding.apiKey` is never logged, never returned by `GET /api/routing/status` (which reports only the baseUrl HOST and the model name), and never included in any error message surfaced to a caller \u2014 provider failures are logged server-side and reported to the model as a mode downgrade, not as an upstream error body.",
+    "**Untrusted upstream text -> the model (accepted risk, documented).** Tool descriptions come from upstream servers and are both ranked on and returned to an LLM, so a hostile upstream can write a description engineered to win searches and to carry prompt-injection payload. This is inherent to MCP aggregation (`tools/list` has identical exposure) but Smart Routing amplifies it by ranking. Controls: descriptions truncated to 300 chars in search output, bounding the payload; the originating `server` field is present on every hit so the model and the audit log can attribute it; no prose sanitization is attempted, because heuristic redaction of natural language is a false comfort. Documented in the operator docs with the same ceiling as tools/list.",
+    "**Cost endpoints -> principal.** A group's token cost reveals its tool count and composition, so `/api/cost` filters servers and groups by the same visibility check the MCP route uses, and computes `all` over the visible subset only. `/api/cost/tools?server=` runs the server-visibility check before touching the catalog. `POST /api/routing/resync` is admin-only \u2014 it is an unauthenticated-trigger DoS on a paid API otherwise."
+  ],
+  "deferred": [
+    {
+      "item": "Tool-result compression (summarizing or truncating large tool outputs in flight)",
+      "add_when": "Observability's per-call `resultTokens` shows a specific tool with p95 > 10k tokens AND the upstream server's author will not adopt `resource_link`. Build it then as an explicit per-tool opt-in with a preview, never as a global default, and never without an in-band marker the model can see."
+    },
+    {
+      "item": "Usage feedback into ranking (boost tools that were actually called after being returned)",
+      "add_when": "A team with >500 tools reports that the right tool is consistently outside the top 10. The data is already in the activity log; this is a join, not a new pipeline."
+    },
+    {
+      "item": "`search_prompts` / `search_resources` meta-tools",
+      "add_when": "An install registers more than ~20 prompts or resource templates, so that listing them all is itself a context cost. Until then prompts and resources pass through in full and are merely COUNTED by Context Cost."
+    },
+    {
+      "item": "Cross-encoder or LLM reranking of the top ~30 hits",
+      "add_when": "Hybrid RRF recall is measured bad on a real tool corpus. Costs a model call per search, which is the thing Smart Routing exists to avoid, so the bar is high."
+    },
+    {
+      "item": "`include_schemas_under_tokens` argument on search_tools (making the 50-token inline rule caller-tunable)",
+      "add_when": "Someone measures that the describe_tool round trip is a latency problem for their tool mix. Today it is a source constant with a comment."
+    },
+    {
+      "item": "More than one active embedding model, or per-group models",
+      "add_when": "Probably never. The `model_id` column already exists to make a model swap safe; serving two at once needs a second HNSW index and buys nothing for a single-team install."
+    },
+    {
+      "item": "Cost history / sparklines (persisting CostSnapshot over time)",
+      "add_when": "Someone asks 'did our context get more expensive this month'. One table, one nightly insert of the snapshot; do not build the table before the question is asked."
+    },
+    {
+      "item": "Non-English FTS configurations",
+      "add_when": "A team's tool descriptions are not in English. `'english'` is hardcoded in the generated column, so this is an ALTER plus a config row, and it is cheap when needed."
+    },
+    {
+      "item": "Progress notifications during a slow search",
+      "add_when": "The modern-era (2026-07-28) HTTP handler lands in packages/server and per-request SSE streams exist. Core would take an optional `onProgress` callback then; adding it now would be speculative plumbing through a Promise that resolves in ~50ms."
+    }
+  ],
+  "risks": [
+    "pgvector < 0.8.0 has no `hnsw.iterative_scan`, so a scope-filtered HNSW query can post-filter its candidate set and under-return. Mitigated by a one-time `SELECT extversion FROM pg_extension WHERE extname='vector'` assert at boot: below 0.8 we log once and skip the SETs, and at realistic row counts the planner seq-scans anyway, which is exact. Becomes a real correctness bug only on an old pgvector AND >20k tools.",
+    "Embedding provider outage or a revoked key stalls the sync: new tools land with search_text but no embedding, so they are findable lexically and NOT by vector. This is a deliberate partial-degradation, but it is invisible unless the operator looks \u2014 hence `missing` in RoutingStatus and the warn dot. Risk that nobody looks; a Prometheus alert on `mcprouter_embedding_sync_total{result=\"failed\"}` is the answer and is one rule, not code.",
+    "The token numbers are o200k_base and most of our users will be on Claude, where the count differs by roughly \u00b110%. Labelled everywhere it is rendered, but someone will still quote the number as a bill. Accepted \u2014 the number's job is comparison between scopes, and any tokenizer ranks scopes identically.",
+    "Prompt injection through upstream tool descriptions is amplified by ranking: a hostile description can be written to win searches. Truncation to 300 chars and mandatory server attribution bound it; we cannot eliminate it without sanitizing natural language, which does not work. Same exposure class as tools/list, documented rather than pretended away.",
+    "The relative-score cut (0.5 \u00d7 top) can return a single hit when the top score is an outlier, which reads as a broken search. The min-3 guard covers it, but the guard itself can surface two weak hits alongside one good one. Judgement call; the alternative (an absolute threshold) is worse because it is not portable across models.",
+    "PD-always means an extra model turn on every search. If a team's tools all have tiny schemas the <=50-token inline rule catches them; if their schemas cluster just above 50 tokens they pay a round trip for a ~60-token saving. The constant is one line to change and the deferred `include_schemas_under_tokens` argument is the escape hatch.",
+    "Lexical mode is genuinely worse than semantic on intent-shaped queries ('I need to file a bug' vs `issues_create`). We have chosen to ship it labelled rather than refuse, which means some operators will run in a degraded mode indefinitely without noticing. The three-place labelling (status endpoint, UI warn dot, the tool description the model itself reads) is the mitigation and it is the argument for the choice; if it turns out operators still do not notice, the next step is a dismissible banner, not removal.",
+    "`catalog.revision` is a contract I do not own. If the aggregation subsystem forgets to bump it on some mutation path \u2014 a description override, an alias edit \u2014 the cost dashboard silently serves stale numbers with no TTL to save it. Mitigation: the revision is asserted in the cost test, and the snapshot returns `revision` so the UI can show it; a TTL would paper over the bug rather than surface it."
+  ]
+}

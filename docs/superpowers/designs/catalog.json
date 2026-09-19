@@ -1,0 +1,342 @@
+{
+  "decisions": [
+    {
+      "id": "CAT-1",
+      "decision": "Ship exactly ONE catalog source: the official `registry.modelcontextprotocol.io/v0`, base URL overridable via `MCP_REGISTRY_URL` for teams running a private/mirrored registry. No bundled catalog file, no vendor cloud catalog.",
+      "rationale": "A bundled catalog is stale the day the image is built and costs 2.4 MB of image plus a parse on every request. The official registry is now the upstream that mcpm.sh and everyone else feeds from, supports `search`/`cursor`/`limit` server-side, so we never need local search over a mirror. The one env var exists because air-gapped and private-registry deployments are real for a self-host team; TTLs and byte caps are constants and get no env var.",
+      "mcphub_contrast": "mcphub carries three (bundled `servers.json` 2.4 MB / 300 entries re-read and RE-PARSED on every call, marketService.ts:12-34; a pass-through proxy to the registry, registryController.ts:12-58; and the `api.mcprouter.to` cloud catalog, cloudService.ts:13,51-131). Three code paths, three UI tabs (MarketPage `?tab=cloud|local|registry`), one useful source. The cloud tab is a vendor channel that a self-host team gets nothing from.",
+      "cost": "~130 LOC (registry.ts), \u22122.4 MB image, \u22122 UI tabs"
+    },
+    {
+      "id": "CAT-2",
+      "decision": "Cache every registry response in Postgres keyed by `path?sortedQuery`, 15-minute freshness, and serve STALE up to 30 days when upstream fails, flagging `stale:true` + `fetchedAt` in the payload so the UI shows a 'cached' badge. Prune rows older than 30 days in the same statement that writes.",
+      "rationale": "One table, one upsert, one select \u2014 it buys caching, pagination-safe caching (cursor is part of the key), and the entire offline story in the same 40 lines. Postgres over an in-memory LRU because the cache must survive the restart that happens right when the network is down, and we already have exactly one Postgres.",
+      "mcphub_contrast": "mcphub caches NOTHING: registryController.ts:12-58 is a bare pass-through with cursor pagination, and marketService.ts:12-34 re-parses the 2.4 MB bundled file on every single call. Registry down = marketplace empty with no explanation.",
+      "cost": "~45 LOC of the 130 in registry.ts, + a 15-LOC Drizzle table"
+    },
+    {
+      "id": "INS-1",
+      "decision": "The registry entry IS the install form schema. `planInstall(entry, variantKey?)` compiles the entry's `packages[].environmentVariables/packageArguments/runtimeArguments` and `remotes[].headers` into a flat `InstallInput[]` (name, description, required, secret, default, choices, target) that the UI renders generically. Plan and render are STATELESS \u2014 no plan token, no server-side wizard state; the client re-sends `{registryId, version, variantKey, values}` to dry-run and to install and the server re-reads the entry from cache.",
+      "rationale": "The registry already declares which variables exist, which are required and which are secret. Compiling that to a form is ~90 LOC and works for every server ever published; hand-writing install UX per server works for zero. Statelessness deletes a table, a TTL, and a whole class of 'your install session expired'.",
+      "mcphub_contrast": "mcphub's `/install` (:51-72) does not install anything \u2014 it returns a paste-ready `mcpServers` JSON snippet the operator copies by hand. Actual configuration is then done in ServerForm.tsx, a 2300-line hand-rolled modal with env/header var rows and a `${VAR}`-detection confirm step. We generate what they hand-wrote.",
+      "cost": "~190 LOC (install.ts)"
+    },
+    {
+      "id": "INS-2",
+      "decision": "Variant preference order: `remote` (streamable-http, then sse) > `npm` > `pypi` > `oci` > `nuget`. An explicitly requested variant is NEVER substituted \u2014 if it is unsupported we return the reason and refuse, we do not silently fall back. The exact version from the registry entry is pinned into the package spec (`npx -y pkg@1.2.3`), never `@latest`. `runtimeHint` is checked against an allowlist {npx, uvx, docker, dnx, node, python, python3} and anything else makes the variant unsupported.",
+      "rationale": "A remote server needs no runtime inside our container, no child process, no PATH archaeology \u2014 it is strictly the safest and most operable variant for a shared gateway, so it goes first. Pinning is one line and stops a third party changing what runs inside our container between restarts. The allowlist is a trust boundary: `runtimeHint` is a third-party-supplied executable name and without it a registry entry can name `/bin/sh`.",
+      "mcphub_contrast": "mcphub picks npm > uvx > pip > docker > binary with no remote option (its catalog has none) and no version pinning. Its no-substitution rule (:51-72) is correct and we copy it verbatim. It has no runtimeHint allowlist because the mcpm.sh schema does not carry one \u2014 the official registry does, which is exactly why we can afford the check.",
+      "cost": "~35 LOC inside install.ts"
+    },
+    {
+      "id": "INS-3",
+      "decision": "One `probe(config)` in core serves THREE features: catalog dry-run, OpenAPI pre-save preview, and the Servers page 'test connection'. It builds the transport, connects a disposable Client with a 20 s timeout, lists tools/prompts/resources, runs them through the context-cost counter, disconnects, and returns `{ok, error?, tools[], totalTokens, skipped[]}`. Nothing is persisted, and on failure no secret the caller submitted is written anywhere.",
+      "rationale": "Three features, one function, 70 LOC. It is also the gate that makes 'validate BEFORE persisting' real: install never writes a server row until a probe with the caller's actual values has returned ok. A half-configured server that fails to connect on first boot is the #1 support ticket in this category.",
+      "mcphub_contrast": "mcphub has a bespoke throwaway OpenAPI client behind `POST /api/servers/openapi/tool-stats` for preview, and nothing equivalent for stdio/http servers \u2014 those are created first and debugged afterwards from the global log firehose. Two mechanisms where one generalises.",
+      "cost": "~70 LOC (core/probe.ts), deletes mcphub's whole tool-stats endpoint"
+    },
+    {
+      "id": "INS-4",
+      "decision": "Secrets from the install form go straight to the secrets subsystem via `putSecret()`; the persisted `ServerConfig` carries only `${secret:<ref>}` references, resolved at connect time. A missing REQUIRED secret is a hard 400 listing every missing name, before any row is written and before any connect is attempted. Optional missing values are a warning in the dry-run result, not a block.",
+      "rationale": "Non-negotiable trust-boundary handling: secrets never land in the config blob, never in a log line, and are never echoed back to the client. Failing closed before persistence means there is no such thing as a saved-but-broken server holding a placeholder credential.",
+      "mcphub_contrast": "mcphub stores `env`/`headers` PLAINTEXT in mcp_settings.json or JSON columns (config/index.ts:150-252) and upstream OAuth tokens plaintext too (oauthSettingsStore.ts:107-129); only per-user credential bindings are encrypted (credentialBindingService.ts:18-118). Its ServerForm turns detected `${VAR}` placeholders into a confirm step \u2014 a nudge, not a gate.",
+      "cost": "~25 LOC in install.ts + the route"
+    },
+    {
+      "id": "API-1",
+      "decision": "The OpenAPI bridge is a REAL in-process MCP server. `createOpenApiTransport(cfg)` builds a low-level SDK `Server` with `tools/list` + `tools/call` handlers, wires `InMemoryTransport.createLinkedPair()`, and returns the client half as a plain `Transport`. Core's transport factory gains ONE branch (`type:'openapi'` \u2192 this) and otherwise knows nothing about OpenAPI. Low-level `Server`, not `McpServer`, because `registerTool` wants a Zod raw shape and our schemas are already JSON Schema \u2014 passing them through verbatim beats a JSON-Schema\u2192Zod converter.",
+      "rationale": "This is the single idea that makes the subsystem lean. Everything downstream \u2014 namespacing, per-tool enable/disable at call time, group allowlists, cost accounting, activity logging, keepalive \u2014 applies to an OpenAPI server for free because it is indistinguishable from any other client. The bridge is also unit-testable by connecting a stock `Client` to it with zero mocks.",
+      "mcphub_contrast": "mcphub made `OpenAPIClient` a thing that merely quacks like an MCP client (clients/openapi.ts:103, wired in at mcpService.ts:1819-1931), which is why it ends up with TWO near-identical ~150-line call blocks (mcpService.ts:3741 and :3944) that must be kept in sync forever. Their heaviest test concentration \u2014 15 OpenAPI-client files \u2014 is the maintenance bill for that shape.",
+      "cost": "~110 LOC (bridge.ts) + 1 branch in core's factory"
+    },
+    {
+      "id": "API-2",
+      "decision": "Do NOT dereference the spec. Keep `$ref` in place, rewrite `#/components/schemas/X` \u2192 `#/$defs/X`, and attach to each tool's inputSchema ONLY the `$defs` transitively reachable from that operation. Consequence: no `@apidevtools/swagger-parser`, no external-$ref resolution, no circular-ref handling code. The only new dependency in this subsystem is `yaml` (default schema, no custom tags, 5 MB input cap).",
+      "rationale": "MCP inputSchema is JSON Schema 2020-12, which has `$defs`/`$ref` natively. Dereferencing a recursive `Node{children:Node[]}` either loops or truncates, and it duplicates the same sub-schema into every tool that touches it \u2014 directly inflating the Context Cost number we are selling. A reachability walk is ~35 LOC, is smaller than the dereferencer, and produces a cheaper schema. Dropping external-ref resolution simultaneously closes an SSRF hole for free.",
+      "mcphub_contrast": "mcphub runs `SwaggerParser.dereference` and then needs a dedicated test for external `$ref` resolution (one of the 15 files at clients/openapi.ts:442-521 territory) because dereference reaches out over the network by default. We deleted the feature that created the test.",
+      "cost": "~35 LOC for the walk, \u22121 heavy dependency tree"
+    },
+    {
+      "id": "API-3",
+      "decision": "Two SSRF boundaries, both explicit. (1) Spec fetch: `safeFetch` + `redirect:'manual'`, assertSafeUrl on each Location, max 3 hops, 5 MB cap. (2) EVERY upstream call: percent-encode every path param, then assert `new URL(final).origin === new URL(baseUrl).origin` before the fetch, and re-validate every redirect Location the same way. Private-network access is a per-server `allowPrivateNetwork` boolean settable only by an admin \u2014 not an implicit bypass.",
+      "rationale": "The origin assert is the one-line fix for the real attack: a spec with `/proxy/{target}` plus a path param of `http://169.254.169.254/...`. A self-host team gateway genuinely needs to call `http://internal-svc:8080`, so a flag must exist \u2014 it just has to be a deliberate per-server admin decision with an audit trail, not a property of who happens to own the row.",
+      "mcphub_contrast": "mcphub does validate the spec fetch and each redirect (clients/openapi.ts:442-521) \u2014 correct, we reproduce it. But its transport-level SSRF guard is BYPASSED for admin-owned servers (mcpService.ts:1382-1396), which makes 'admin created it' equal 'no guard' forever. Ours is one explicit flag per server.",
+      "cost": "~20 LOC, spread across request.ts and spec.ts"
+    },
+    {
+      "id": "API-4",
+      "decision": "Security schemes: support `apiKey` (header/query/cookie as a static value), `http` (bearer, basic), and `oauth2` clientCredentials with an in-memory token cache refreshed at expiry\u221260 s and one retry on 401. Values come from the secrets store by ref. NOT supported in v1: cookie jars / Set-Cookie replay, `multipart/form-data` bodies, `openIdConnect`, and oauth2 authorizationCode.",
+      "rationale": "apiKey + bearer + basic covers essentially every internal API a team will import. A stateful cookie jar shared across a multi-user gateway is a cross-user session-bleed hazard, not a feature \u2014 if it is ever needed it must be per-principal first. Dropping multipart removes base64 blob plumbing nobody asked for.",
+      "mcphub_contrast": "mcphub implements security-scheme mapping/prefill including OAuth2 and cookie JARS, plus multipart and form-urlencoded bodies (clients/openapi.ts:53-70) \u2014 and those are precisely where its 15 test files cluster, i.e. where the bugs were. We ship the subset that carries the load and skip the subset that generated the bug reports.",
+      "cost": "~90 LOC (security.ts)"
+    },
+    {
+      "id": "API-5",
+      "decision": "Operations that use an unsupported feature (deepObject/spaceDelimited/pipeDelimited/matrix/label param styles, multipart-only bodies, unresolvable external `$ref`) are SKIPPED with a machine-readable reason and shown in the pre-save preview as a `skipped[]` list alongside the tool count and token cost. Tool names are deterministic: `operationId` sanitised to `[A-Za-z0-9_]`, capped at 60 chars (core prefixes `<server><sep><tool>` and the ceiling is 64), falling back to `${method}_${path}`, with `_2` suffixing on collision. The `toolName \u2192 {operationId, method, path}` map is stored in the server's config blob so a spec re-import that would rename a tool surfaces as a diff needing confirmation.",
+      "rationale": "Skipping loudly beats generating a wrong URL silently \u2014 and the skip list is the telemetry that tells us which param style to implement next. Name stability is a correctness requirement, not cosmetics: group allowlists and per-tool disable flags are keyed by name, so a silent rename can move a tool from 'disabled' to 'allowed'.",
+      "mcphub_contrast": "mcphub implements the param styles (clients/openapi.ts:53-70) rather than skipping, and only WARNS about ambiguous server names (mcpService.ts:1710) so two names differing by separator chars can alias. It has no re-import diff \u2014 a changed operationId just quietly produces a differently-named tool.",
+      "cost": "~190 LOC (operations.ts) including naming + $defs walk"
+    },
+    {
+      "id": "EXP-1",
+      "decision": "OpenAPI EXPORT ships, but as a thin projection only: `GET /api/mcp/:scope/openapi.json` emits OpenAPI **3.1** with each tool as `POST /tools/{name}` whose `requestBody` schema is the tool's inputSchema VERBATIM, and `POST /api/mcp/:scope/tools/:tool` executes through the same core `callTool(scope, principal, name, args)`. Same auth middleware as the MCP endpoint \u2014 no unauthenticated variant. No CORS header at all unless the origin is listed in `CORS_ORIGINS`. Unknown tool and disabled tool both return 404 with one identical constant body.",
+      "rationale": "It is worth v1 only because it is nearly free: OpenAPI 3.1 accepts JSON Schema 2020-12 unchanged, so the spec is a 40-line `Object.fromEntries`, and the execution route is 30 lines of envelope over a function that must exist anyway (it is also how you curl-debug a tool). The moment either grows past ~150 LOC the trade stops working \u2014 this is the first thing I cut. Going through `callTool` and not a parallel path is what keeps the call-time enable/disable enforcement (mcphub's CVE fix afcc72f) applying here too; the identical 404 keeps the REST surface from becoming an enumeration oracle for disabled tools.",
+      "mcphub_contrast": "mcphub's openApiGeneratorService.ts:41-80 flattens operations with \u226410 simple properties into query params and the rest into bodies \u2014 a schema-gymnastics branch that buys nothing and can only be wrong. openApiController.ts:28 hardcodes CORS `*` on spec responses, publishing the full tool inventory to any origin. And its execution surface lives at routes/index.ts:488-499, a path separate from the MCP call path, so every filter fix has to be applied twice.",
+      "cost": "~130 LOC (openapi-export.ts)"
+    },
+    {
+      "id": "CUT-1",
+      "decision": "Do not ship .mcpb package upload in v1, and do not ship `/.well-known/mcp-marketplace` at all. The only unauthenticated surfaces in this subsystem are none \u2014 `/health` and `/.well-known/oauth-protected-resource` belong to other subsystems and are spec-required.",
+      "rationale": "An upload endpoint that accepts a 500 MB opaque ZIP and then runs a child process from it inside the gateway container is the highest-risk, lowest-demand feature here; for a team the real need ('run our internal server') is already a normal stdio config pointing at a path or a private npm tarball. A public marketplace surface advertises an inventory to nobody on a VPN while leaking exactly the inventory an attacker wants \u2014 mcphub's unprobeable-404 is good mitigation for a feature we simply do not run.",
+      "mcphub_contrast": "mcphub ships MCPB upload (mcpbController.ts:30-42,97-166) with a 500 MB ZIP limit, temp extraction and atomic rename \u2014 and its own `DxtUploadForm.tsx` is imported NOWHERE in the frontend, which is the strongest available evidence the flow is dead weight. Its discovery surface (discoveryController.ts:23-31) returns 404 rather than 401 when disabled, which is the right call for a feature whose default should have been 'absent'.",
+      "cost": "0 LOC; avoids ~250 LOC and two attack surfaces"
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "RegistryServer (trust-boundary zod)",
+      "kind": "type",
+      "sketch": "// packages/server/src/catalog/registry.ts \u2014 parse at the edge, tolerate drift\nexport const zPackage = z.object({\n  registryType: z.enum(['npm','pypi','oci','nuget','mcpb']),\n  identifier: z.string().min(1),\n  version: z.string().min(1),\n  runtimeHint: z.string().optional(),\n  transport: z.object({ type: z.enum(['stdio','streamable-http','sse']), url: z.string().url().optional() }),\n  runtimeArguments: z.array(zArgument).default([]),\n  packageArguments: z.array(zArgument).default([]),\n  environmentVariables: z.array(zVariable).default([]),\n}).loose();\n\nexport const zRemote = z.object({\n  type: z.enum(['streamable-http','sse']),\n  url: z.string().url(),\n  headers: z.array(zVariable).default([]),\n}).loose();\n\nexport const zVariable = z.object({\n  name: z.string().min(1).max(128),\n  description: z.string().max(2000).optional(),\n  isRequired: z.boolean().default(false),\n  isSecret: z.boolean().default(false),\n  default: z.string().optional(),\n  choices: z.array(z.string()).optional(),\n  format: z.enum(['string','number','boolean','filepath']).default('string'),\n}).loose();\n\nexport const zRegistryServer = z.object({\n  name: z.string().min(1),            // reverse-DNS, e.g. io.github.owner/repo\n  description: z.string().default(''),\n  version: z.string().default('0.0.0'),\n  repository: z.object({ url: z.string().url(), source: z.string() }).loose().optional(),\n  packages: z.array(zPackage).default([]),\n  remotes: z.array(zRemote).default([]),\n}).loose();",
+      "notes": "`.loose()` everywhere: the registry API is pre-1.0. An entry that fails parse is dropped from the page with a logged reason, never 500s the listing. Unknown `registryType` values simply produce an unsupported variant."
+    },
+    {
+      "name": "listCatalog / getCatalogServer",
+      "kind": "type",
+      "sketch": "// packages/server/src/catalog/registry.ts\nexport interface CatalogPage {\n  servers: RegistryServer[];\n  nextCursor?: string;\n  stale: boolean;        // true => served from cache after an upstream failure\n  fetchedAt: string;     // ISO\n}\nexport function listCatalog(q: { search?: string; cursor?: string; limit?: number }): Promise<CatalogPage>;\nexport function getCatalogServer(id: string, version?: string):\n  Promise<{ server: RegistryServer; stale: boolean; fetchedAt: string }>;\n\n// cache key = `${path}?${new URLSearchParams(sortedEntries)}`\n// fresh  < 15 min  -> return cached, no network\n// stale  >= 15 min -> fetch; on any error/timeout(5s) return cached with stale:true if < 30d\n// miss + error     -> throw CatalogUnavailableError (UI: \"registry unreachable, add manually\")",
+      "notes": "Freshness and the 30-day stale ceiling are constants, not env vars \u2014 they never vary per deployment."
+    },
+    {
+      "name": "catalog_cache",
+      "kind": "table",
+      "sketch": "// packages/server/src/db/schema/catalog.ts\nexport const catalogCache = pgTable('catalog_cache', {\n  key: text('key').primaryKey(),\n  payload: jsonb('payload').notNull(),\n  fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),\n});\n\n// write path, one statement, prune included:\n// INSERT ... ON CONFLICT (key) DO UPDATE SET payload=excluded.payload, fetched_at=now();\n// DELETE FROM catalog_cache WHERE fetched_at < now() - interval '30 days';",
+      "notes": "The only table this subsystem adds. The toolName\u2194operationId map lives in the server row's config blob, not a table."
+    },
+    {
+      "name": "planInstall / renderConfig",
+      "kind": "type",
+      "sketch": "// packages/server/src/catalog/install.ts\nexport type InstallVariant = {\n  key: string;                 // 'remote:0' | 'npm:@scope/pkg' | 'oci:ghcr.io/x'\n  kind: 'remote'|'npm'|'pypi'|'oci'|'nuget'|'mcpb';\n  transport: 'stdio'|'streamable-http'|'sse';\n  label: string;\n  supported: boolean;\n  unsupportedReason?: string;  // 'mcpb packages are not installable in v1' | 'runtimeHint \"sh\" not allowed'\n};\nexport type InstallInput = {\n  name: string; description?: string; required: boolean; secret: boolean;\n  default?: string; choices?: string[]; format: 'string'|'number'|'boolean'|'filepath';\n  target: 'env'|'arg'|'header'|'url';\n};\n\nexport function planInstall(entry: RegistryServer, variantKey?: string):\n  { variant: InstallVariant; variants: InstallVariant[]; inputs: InstallInput[] };\n\n/** Throws InstallValidationError{ missing: string[] } before touching anything. */\nexport function renderConfig(entry: RegistryServer, variantKey: string, values: Record<string,string>):\n  { config: ServerConfig; secrets: Record<string,string> };\n\nconst VARIANT_ORDER = ['remote','npm','pypi','oci','nuget','mcpb'] as const;\nconst RUNTIME_ALLOWLIST = new Set(['npx','uvx','docker','dnx','node','python','python3']);",
+      "notes": "`renderConfig` returns secrets SEPARATE from config. The route calls `putSecret()` per entry and substitutes `${secret:<ref>}` into the config before persisting. `config.args` is always a string[]; nothing is ever joined into a shell string, and execa/StdioClientTransport run with shell:false."
+    },
+    {
+      "name": "probe",
+      "kind": "type",
+      "sketch": "// packages/core/src/probe.ts \u2014 the ONE preview primitive\nexport interface ProbeResult {\n  ok: boolean;\n  error?: { code: 'connect_failed'|'timeout'|'spec_invalid'|'auth_required'; message: string };\n  tools: { name: string; description?: string; tokens: number }[];\n  prompts: { name: string; tokens: number }[];\n  resources: { uri: string; tokens: number }[];\n  totalTokens: number;\n  skipped: { id: string; reason: string }[];   // openapi only\n}\nexport async function probe(config: ServerConfig, opts?: { timeoutMs?: number }): Promise<ProbeResult>;\n// createTransport(config) -> new Client().connect() -> listTools/listPrompts/listResources\n// -> countTool/countPrompt/countResource -> client.close() in a finally. Default timeout 20s.",
+      "notes": "Used by: catalog dry-run, OpenAPI pre-save preview, servers-page test connection. Never persists. Secrets passed in for a probe are held for the request only."
+    },
+    {
+      "name": "OpenApiServerConfig",
+      "kind": "type",
+      "sketch": "// packages/core/src/types.ts \u2014 one new branch on the ServerConfig union\nexport type OpenApiServerConfig = {\n  type: 'openapi';\n  spec: { url: string } | { inline: string };      // inline = JSON or YAML text, <= 5 MB\n  baseUrl?: string;                                 // overrides spec.servers[0].url\n  allowPrivateNetwork?: boolean;                    // admin-settable only\n  auth?: Record<string, { schemeType: 'apiKey'|'http'|'oauth2'; ref: string }>; // keyed by securityScheme name\n  toolMap?: Record<string, { operationId?: string; method: string; path: string }>; // written on import, diffed on re-import\n};",
+      "notes": "No `include`/`exclude` list: core's per-server `tools[name].enabled` already covers selection, and duplicating it would create a second place to get filtering wrong."
+    },
+    {
+      "name": "createOpenApiTransport",
+      "kind": "class",
+      "sketch": "// packages/core/src/openapi/bridge.ts\nimport { Server } from '@modelcontextprotocol/sdk/server/index.js';\nimport { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';\nimport { ListToolsRequestSchema, CallToolRequestSchema, McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';\n\nexport async function createOpenApiTransport(\n  cfg: OpenApiServerConfig,\n  deps: { getSecret(ref: string): Promise<string>; safeFetch: SafeFetch },\n): Promise<Transport> {\n  const doc  = await loadSpec(cfg, deps.safeFetch);          // spec.ts\n  const { ops, skipped } = buildOperations(doc, cfg);        // operations.ts\n  const byName = new Map(ops.map(o => [o.name, o]));\n\n  const server = new Server({ name: 'openapi', version: doc.info.version ?? '0.0.0' },\n                            { capabilities: { tools: {} } });\n  server.setRequestHandler(ListToolsRequestSchema, async () => ({\n    tools: ops.map(o => ({ name: o.name, description: o.description, inputSchema: o.inputSchema })),\n  }));\n  server.setRequestHandler(CallToolRequestSchema, async (req) => {\n    const op = byName.get(req.params.name);\n    if (!op) throw new McpError(ErrorCode.InvalidParams, TOOL_UNAVAILABLE_MESSAGE); // same text core uses\n    return callOperation(op, req.params.arguments ?? {}, cfg, deps);               // request.ts\n  });\n\n  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();\n  await server.connect(serverSide);\n  return clientSide;   // core connects a normal Client to this, identical to stdio/http\n}",
+      "notes": "Low-level `Server`, NOT `McpServer` \u2014 registerTool() takes a ZodRawShape and our schemas are already JSON Schema; the raw handlers pass them through with zero conversion. `skipped` is surfaced through probe(), not through tools/list."
+    },
+    {
+      "name": "buildOperations + $defs reachability",
+      "kind": "type",
+      "sketch": "// packages/core/src/openapi/operations.ts\nexport interface OperationSpec {\n  name: string; description?: string; method: string; path: string;\n  params: { name: string; in: 'path'|'query'|'header'|'cookie'; required: boolean; style?: string; explode?: boolean }[];\n  bodyContentType?: 'application/json'|'application/x-www-form-urlencoded';\n  inputSchema: JsonSchema;   // { type:'object', properties, required, $defs? }\n  security?: SecurityRequirement[];   // op-level overrides root\n}\nexport function buildOperations(doc: OpenApiDoc, cfg: OpenApiServerConfig):\n  { ops: OperationSpec[]; skipped: { id: string; reason: string }[] };\n\nfunction toolNameFor(op: {operationId?: string; method: string; path: string}, taken: Set<string>): string {\n  const base = (op.operationId ?? `${op.method}_${op.path}`)\n    .replace(/\\{([^}]+)\\}/g, '$1')\n    .replace(/[^A-Za-z0-9_]+/g, '_')\n    .replace(/^_+|_+$/g, '').slice(0, 60) || 'op';\n  let n = 2, name = base;\n  while (taken.has(name)) name = `${base}_${n++}`;\n  taken.add(name); return name;\n}\n\n/** Walk $refs from `schema`, pull ONLY reachable component schemas into $defs. */\nfunction attachDefs(schema: JsonSchema, components: Record<string, JsonSchema>): JsonSchema {\n  const want = new Set<string>(); const queue = [schema];\n  while (queue.length) for (const r of refsIn(queue.pop()!)) {\n    const n = r.replace('#/$defs/', '');\n    if (!want.has(n) && components[n]) { want.add(n); queue.push(components[n]); }\n  }\n  return want.size ? { ...schema, $defs: Object.fromEntries([...want].map(n => [n, components[n]])) } : schema;\n}",
+      "notes": "60-char cap because core prefixes `<server><sep><tool>` and 64 is the ceiling. `#/components/schemas/` is rewritten to `#/$defs/` in one pass before the walk. Circular schemas need no special case \u2014 refs stay refs."
+    },
+    {
+      "name": "callOperation (URL + SSRF + response caps)",
+      "kind": "type",
+      "sketch": "// packages/core/src/openapi/request.ts\nexport async function callOperation(op: OperationSpec, args: Record<string, unknown>,\n                                    cfg: OpenApiServerConfig, deps: Deps): Promise<CallToolResult> {\n  const base = new URL(cfg.baseUrl ?? op.defaultBaseUrl);\n  let path = op.path;\n  for (const p of op.params) if (p.in === 'path')\n    path = path.replace(`{${p.name}}`, encodeURIComponent(String(args[p.name] ?? '')));\n  const url = new URL(base.pathname.replace(/\\/$/, '') + path, base);\n  if (url.origin !== base.origin)                       // path-param escape guard\n    throw new McpError(ErrorCode.InvalidParams, 'resolved URL left the configured origin');\n\n  for (const p of op.params) if (p.in === 'query') appendQuery(url, p, args[p.name]); // style:form only\n  const headers = new Headers(); const init: RequestInit = { method: op.method, headers,\n    redirect: 'manual', signal: AbortSignal.timeout(30_000) };\n  applySecurity(op, cfg, headers, url, deps);                                  // security.ts\n  if (op.bodyContentType) setBody(init, headers, op, args.body);\n\n  const res = await followSafe(url, init, deps, /*maxHops*/ 3); // assertSafeUrl + same-origin per hop\n  const text = await readCapped(res, 256 * 1024);               // aborts the stream at the cap\n  return res.ok\n    ? { content: [{ type: 'text', text: pretty(text, res.headers.get('content-type')) }] }\n    : { isError: true, content: [{ type: 'text', text: `HTTP ${res.status} ${res.statusText}\\n${text}` }] };\n}",
+      "notes": "`readCapped` appends `[mcprouter:truncated after 256KB]`. Reserved/hop-by-hop headers (host, content-length, connection, authorization unless it IS the scheme) are stripped from header params. Unsupported styles never reach here \u2014 those ops were skipped at build time."
+    },
+    {
+      "name": "HTTP routes",
+      "kind": "route",
+      "sketch": "GET  /api/catalog/servers?search=&cursor=&limit=   member          -> CatalogPage\nGET  /api/catalog/servers/:id?version=             member          -> { server, stale, fetchedAt }\nPOST /api/catalog/install/plan                     server:create   -> { variant, variants, inputs }\n     body { registryId, version?, variantKey? }\nPOST /api/servers/probe                            server:create   -> ProbeResult\n     body ServerConfig | { registryId, version?, variantKey, values }\n     rate-limited 20/min per principal; allowPrivateNetwork:true requires admin\nPOST /api/catalog/install                          server:create   -> { serverId }\n     body { registryId, version?, variantKey, values, name?, visibility? }\n     409 { suggestedName } on name collision; 400 { missing:[...] } on required-secret gap\nGET  /api/mcp/:scope/openapi.json                  same auth as the MCP endpoint for :scope\nPOST /api/mcp/:scope/tools/:tool                   same auth as the MCP endpoint for :scope\n     body = the tool arguments object -> { content, isError }\n     404 + one constant body for BOTH unknown and disabled tools",
+      "notes": "There is NO /api/openapi/preview and NO /api/servers/openapi/tool-stats \u2014 both are `POST /api/servers/probe` with an openapi config. There is NO /.well-known/mcp-marketplace and NO unauthenticated route in this subsystem."
+    },
+    {
+      "name": "Export projection",
+      "kind": "route",
+      "sketch": "// packages/server/src/routes/openapi-export.ts \u2014 the whole generator\nconst doc = {\n  openapi: '3.1.0',\n  info: { title: `MCPRouter \u00b7 ${scope}`, version: '1' },\n  servers: [{ url: `${publicUrl}/api/mcp/${scope}` }],\n  paths: Object.fromEntries(tools.map(t => [`/tools/${t.name}`, { post: {\n    operationId: t.name,\n    summary: t.description?.slice(0, 120),\n    requestBody: { required: true, content: { 'application/json': { schema: t.inputSchema } } },\n    responses: { '200': { description: 'Tool result',\n      content: { 'application/json': { schema: { type: 'object',\n        properties: { content: { type: 'array' }, isError: { type: 'boolean' } } } } } } },\n    security: [{ bearerAuth: [] }],\n  }}])),\n  components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } },\n};",
+      "notes": "OpenAPI 3.1 specifically, because it accepts JSON Schema 2020-12 verbatim \u2014 that is the entire reason this feature is cheap. No query-param flattening, ever. `t.inputSchema` already carries `$defs` where needed and 3.1 handles that."
+    },
+    {
+      "name": "Env",
+      "kind": "env",
+      "sketch": "MCP_REGISTRY_URL=https://registry.modelcontextprotocol.io/v0   # private/mirrored registry\nCORS_ORIGINS=                                                   # comma list; empty = no CORS header. NEVER '*'",
+      "notes": "Two variables, both genuinely deployment-varying. Freshness TTL (15 min), stale ceiling (30 d), response cap (256 KB), spec cap (5 MB), probe timeout (20 s) and call timeout (30 s) are constants in code."
+    },
+    {
+      "name": "Metrics",
+      "kind": "metric",
+      "sketch": "catalog_fetch_total{result=\"hit|miss|stale|error\"}                       Counter\ncatalog_fetch_seconds                                                    Histogram\nopenapi_upstream_seconds{server,operation,status_class}                  Histogram\nopenapi_ops_skipped{server,reason}                                       Gauge (set at import)\ninstall_total{result=\"ok|probe_failed|missing_secret|collision\"}         Counter",
+      "notes": "prom-client 15.1.3 is already a dependency of the observability subsystem; this subsystem only registers metrics, it does not own the /metrics route."
+    },
+    {
+      "name": "InstallDrawer",
+      "kind": "component",
+      "sketch": "// packages/web/src/components/install-drawer.tsx\n<InstallDrawer registryId={id} onInstalled={(serverId) => \u2026} />\n// step 1 variant: radio list from plan.variants, unsupported rows disabled + reason in mono\n// step 2 inputs:  generated from plan.inputs \u2014 <input type=password> when secret,\n//                 <select> when choices, required marked with aria-required\n// step 3 dry-run: POST /api/servers/probe -> tool table (name \u00b7 tokens), totalTokens,\n//                 skipped[] in a collapsed <details>; Install button DISABLED until ok\n// step 4 install: POST /api/catalog/install; 409 offers suggestedName inline",
+      "notes": "The form is fully generated \u2014 there is no per-server UI code anywhere. Focus trap + Esc + aria-labelledby come from the web subsystem's Dialog primitive; secret fields are never re-rendered with a value after save."
+    }
+  ],
+  "files": [
+    {
+      "path": "packages/core/src/openapi/spec.ts",
+      "purpose": "Load a spec (safeFetch for URL / inline text), YAML or JSON with a 5 MB cap, reject Swagger 2.0 with the conversion one-liner in the message, zod-validate the subset we use, rewrite #/components/schemas \u2192 #/$defs.",
+      "loc": 150
+    },
+    {
+      "path": "packages/core/src/openapi/operations.ts",
+      "purpose": "paths \u2192 OperationSpec[]: deterministic tool naming with collision suffixes, inputSchema assembly from path/query/header params + requestBody, $defs reachability walk, and the skipped[] list with reasons.",
+      "loc": 190
+    },
+    {
+      "path": "packages/core/src/openapi/request.ts",
+      "purpose": "OperationSpec + args \u2192 HTTP request: path-param encoding, same-origin assert, form-style query, JSON/urlencoded bodies, manual redirects with per-hop SSRF validation, 256 KB capped response read, result shaping.",
+      "loc": 170
+    },
+    {
+      "path": "packages/core/src/openapi/security.ts",
+      "purpose": "securityScheme \u2192 request mutation for apiKey (header/query/cookie), http bearer/basic, and oauth2 clientCredentials with an in-memory token cache (refresh at exp\u221260s, one 401 retry).",
+      "loc": 90
+    },
+    {
+      "path": "packages/core/src/openapi/bridge.ts",
+      "purpose": "Build a low-level SDK Server with tools/list + tools/call handlers over InMemoryTransport.createLinkedPair(); returns the client-side Transport for core's factory branch.",
+      "loc": 110
+    },
+    {
+      "path": "packages/core/src/probe.ts",
+      "purpose": "Disposable connect \u2192 listTools/listPrompts/listResources \u2192 context-cost counting \u2192 close, with timeout and normalised error codes. Shared by catalog dry-run, OpenAPI preview and test-connection.",
+      "loc": 70
+    },
+    {
+      "path": "packages/server/src/catalog/registry.ts",
+      "purpose": "Registry HTTP client with zod-at-the-edge entry parsing, Postgres response cache keyed by path+sorted query, 15-min freshness, stale-on-error up to 30 days, prune-on-write.",
+      "loc": 130
+    },
+    {
+      "path": "packages/server/src/catalog/install.ts",
+      "purpose": "Variant enumeration and preference ordering, runtimeHint allowlist, registry variables \u2192 InstallInput[], render to ServerConfig with version pinning and argv arrays, secret/config split, required-secret validation.",
+      "loc": 190
+    },
+    {
+      "path": "packages/server/src/routes/catalog.ts",
+      "purpose": "The five catalog/install/probe routes, permission checks, probe rate limiting, name-collision 409 with suggestion, putSecret wiring, createServer handoff.",
+      "loc": 150
+    },
+    {
+      "path": "packages/server/src/routes/openapi-export.ts",
+      "purpose": "OpenAPI 3.1 projection of a scope's tools and the single POST execution route, both behind the MCP scope auth middleware, with the identical-404 rule and origin-allowlisted CORS.",
+      "loc": 130
+    },
+    {
+      "path": "packages/server/src/db/schema/catalog.ts",
+      "purpose": "Drizzle definition of the one table this subsystem adds: catalog_cache(key, payload, fetched_at).",
+      "loc": 15
+    },
+    {
+      "path": "packages/server/drizzle/0004_catalog_cache.sql",
+      "purpose": "Migration creating catalog_cache and its primary key.",
+      "loc": 12
+    },
+    {
+      "path": "packages/web/src/pages/catalog.tsx",
+      "purpose": "Registry browse: cmdk-driven search, cursor pagination, stale/cached badge with fetchedAt, entry detail with packages/remotes, Install button, empty-state that links to manual add when the registry is unreachable.",
+      "loc": 170
+    },
+    {
+      "path": "packages/web/src/components/install-drawer.tsx",
+      "purpose": "Four-step install: variant radio list with disabled+reason rows, generated input form, dry-run tool/token table with skipped details, install with collision handling.",
+      "loc": 200
+    },
+    {
+      "path": "packages/web/src/components/openapi-import.tsx",
+      "purpose": "Spec URL or paste, base-URL override, per-scheme credential fields, preview table (tool \u00b7 method \u00b7 path \u00b7 tokens), skipped list, total token cost, save.",
+      "loc": 160
+    },
+    {
+      "path": "packages/core/src/openapi/openapi.test.ts",
+      "purpose": "Vitest: tool-name determinism and collision suffixing, $defs reachability on a circular schema, path-param escape blocked by the origin assert, cross-origin redirect refused, each skip reason fires, 256 KB truncation marker.",
+      "loc": 220
+    },
+    {
+      "path": "packages/server/src/catalog/install.test.ts",
+      "purpose": "Vitest: variant preference order, explicit variant never substituted, runtimeHint allowlist rejection, version pinning, argv stays an array, required-secret gap throws before any write.",
+      "loc": 140
+    }
+  ],
+  "security": [
+    "Registry HTTP response \u2192 untrusted third-party JSON. Control: zod `.loose()` parse per entry at the edge; an entry that fails parse is dropped from the page with a logged reason rather than 500ing the listing; no URL from an entry is ever fetched except through core's `safeFetch`; identifiers and versions are only ever placed into an argv array, never into a string that a shell sees.",
+    "Registry `runtimeHint` / `packageArguments` \u2192 child-process execution. Control: runtimeHint must be in {npx, uvx, docker, dnx, node, python, python3} or the variant is marked unsupported; the version from the entry is pinned into the package spec so a later upstream publish cannot change what runs; StdioClientTransport/execa run with shell:false and a string[] argv, so `{var}` substitution into an argument position cannot become command injection.",
+    "Install form values \u2192 secrets at rest. Control: fields with `isSecret` go to `putSecret()` and the persisted config holds only `${secret:<ref>}`; secret values are never echoed back in a response, never written to a log line, and are discarded when a dry-run fails. A missing required secret returns 400 `{missing:[...]}` BEFORE any row is written and before any connect \u2014 fail closed, never a saved-but-broken server. (Contrast mcphub: env/headers plaintext at config/index.ts:150-252, upstream OAuth tokens plaintext at oauthSettingsStore.ts:107-129.)",
+    "Spec URL and spec text \u2192 SSRF and parser resource exhaustion. Control: spec fetch goes through `safeFetch` with `redirect:'manual'`, assertSafeUrl on every Location, max 3 hops, 5 MB body cap and a 10 s timeout; YAML is parsed with the default schema only (no custom tags); external `$ref` resolution is DISABLED outright \u2014 unresolvable external refs make the operation `skipped`, they never trigger a network fetch.",
+    "Every OpenAPI upstream call URL \u2192 SSRF via attacker-shaped path or query params. Control: every path param is `encodeURIComponent`'d, then `new URL(final).origin === new URL(baseUrl).origin` is asserted before the fetch \u2014 this is the one-line defence against a spec like `/proxy/{target}` with `target=http://169.254.169.254/...`; each redirect Location is re-validated the same way with at most 3 hops; reserved and hop-by-hop headers (host, content-length, connection, and authorization unless it is the configured scheme) are stripped from header params.",
+    "Private-network access. Control: a per-server `allowPrivateNetwork` boolean that only an admin can set and that is recorded in the audit trail, rather than an implicit 'the owner is an admin so skip the guard' bypass (contrast mcphub mcpService.ts:1382-1396, where admin ownership permanently disables assertSafeUrl).",
+    "Upstream response \u2192 gateway memory. Control: the response body is read through a byte-counting reader that aborts the stream at 256 KB and appends `[mcprouter:truncated after 256KB]`; every call carries `AbortSignal.timeout(30_000)`; non-JSON content types are returned as truncated text rather than buffered and transformed.",
+    "`POST /api/servers/probe` \u2192 SSRF-by-proxy and port-scan oracle. Control: requires the `server:create` permission, so it grants no reachability the caller could not already obtain by creating the server and reading its connect log; `allowPrivateNetwork:true` in a probe body is rejected for non-admins; a per-principal in-memory token bucket caps it at 20/min. (ponytail: in-memory bucket, single process \u2014 move to Postgres or better-auth's apiKey rate limiter if we ever run more than one replica.)",
+    "REST execution surface \u2192 authorization bypass and disabled-tool enumeration. Control: `POST /api/mcp/:scope/tools/:tool` calls the SAME core `callTool(scope, principal, name, args)` as the MCP endpoint, so the call-time enable/disable enforcement (mcphub's CVE fix afcc72f) applies without being reimplemented; unknown AND disabled tools both return 404 with one identical constant body, reproducing mcphub's ToolUnavailableError property (mcpService.ts:2654) on the REST path too \u2014 mcphub's own REST facade is a separate path at routes/index.ts:488-499.",
+    "Exported spec document \u2192 inventory disclosure. Control: `GET /api/mcp/:scope/openapi.json` sits behind the same auth middleware as the MCP endpoint for that scope; there is no unauthenticated variant and no `Access-Control-Allow-Origin` header unless the request origin appears in `CORS_ORIGINS` \u2014 never `*` (contrast openApiController.ts:28, which hardcodes `*`).",
+    "Tool-name drift on spec re-import \u2192 fail-open authorization. Control: names are deterministic and the `toolName \u2192 {operationId, method, path}` map is stored in the server's config; a re-import whose mapping differs is presented as a diff the operator must confirm, because group allowlists and per-tool disable flags are keyed by NAME and a reused name would silently inherit another operation's permissions.",
+    "No unauthenticated surface. Control: this subsystem publishes zero public routes \u2014 `/.well-known/mcp-marketplace` is not implemented, and `/health` plus `/.well-known/oauth-protected-resource` belong to other subsystems where they are spec-required."
+  ],
+  "deferred": [
+    {
+      "item": ".mcpb package upload (ZIP \u2192 extracted local stdio server)",
+      "add_when": "A team needs to run an internal server that is published to no registry AND a pasted stdio config pointing at a path or a private npm tarball cannot express it. Build it then as: registry-supplied `fileSha256` verified before extraction; zip-slip guard by resolving each entry and asserting the `startsWith(destDir + sep)` prefix; per-entry AND total uncompressed size caps (zip-bomb); extract to `${DATA_DIR}/packages/<uuid>` \u2014 a UUID, never a name-derived path \u2014 then atomic `rename` over the previous version; ~120 LOC. mcphub's version is mcpbController.ts:30-42,97-166."
+    },
+    {
+      "item": "Full registry mirror into Postgres with pgvector semantic catalog search",
+      "add_when": "More than one team asks for 'find me a server that does X' over the catalog rather than keyword search, or a genuinely air-gapped install is required. The response cache and the registry's own `search=` cover everything short of that; a mirror adds a sync job, a cron and drift."
+    },
+    {
+      "item": "Swagger 2.0 import",
+      "add_when": "The first user hits the rejection message. It is a 3-line upgrade: `if (doc.swagger) doc = (await convertObj(doc, {})).openapi` with `swagger2openapi`. Rejecting today costs us one error message and saves a dependency plus a second set of shape-mapping branches (`in:body`, `definitions`, `securityDefinitions`, `basePath`, `consumes/produces`)."
+    },
+    {
+      "item": "multipart/form-data bodies and file parameters in OpenAPI import",
+      "add_when": "A needed internal API is upload-only. Today those operations appear in the `skipped[]` list with the reason, so demand is visible before we write code. mcphub supports it and pays for it in one of its 15 OpenAPI test files."
+    },
+    {
+      "item": "Cookie jar / Set-Cookie session replay for imported specs",
+      "add_when": "An API genuinely cannot be driven with a static token. It must be built per-principal from day one \u2014 a jar shared across a multi-user gateway is cross-user session bleed, not a feature. Static `apiKey in: cookie` values already work."
+    },
+    {
+      "item": "deepObject, spaceDelimited, pipeDelimited, matrix and label parameter styles",
+      "add_when": "The `openapi_ops_skipped{reason}` gauge shows a spec in actual use losing operations to it. Each style is ~15 LOC in `appendQuery`/path rendering; we implement them one at a time, driven by the metric."
+    },
+    {
+      "item": "oauth2 authorizationCode and openIdConnect for imported specs",
+      "add_when": "Someone imports a user-delegated API. It is not new code here \u2014 it is a handoff to the upstream-OAuth subsystem's provider plus a `ref` that resolves to a per-principal token, so it should not be built until that subsystem's per-principal token storage exists."
+    },
+    {
+      "item": "`/.well-known/mcp-marketplace` public discovery surface",
+      "add_when": "MCPRouter is deployed as a public or community hub rather than a team gateway. Copy mcphub's behaviour exactly when we do: disabled returns 404 not 401, so the surface is unprobeable (discoveryController.ts:23-31)."
+    },
+    {
+      "item": "Publishing locally-built servers TO the official registry from the UI",
+      "add_when": "A team wants to share internally-built servers across orgs. Until then `git push` plus `mcp-publisher` is the flow and we add nothing."
+    },
+    {
+      "item": "Catalog 'update available' badges and version-drift detection across installed servers",
+      "add_when": "An install has more than ~20 servers, where manually noticing a new version stops being realistic. Cheap once the cache exists: compare installed pinned version against the cached entry's latest on the servers list."
+    },
+    {
+      "item": "`dereferenceSchemas: true` per-server escape hatch (inline non-circular $refs)",
+      "add_when": "A real MCP client is observed mishandling `$defs`/`$ref` in a tool inputSchema. ~20 LOC, non-circular schemas only, and it costs tokens \u2014 which is exactly why it is opt-in per server rather than the default."
+    }
+  ],
+  "risks": [
+    "The official registry API is pre-1.0 and its response shape can change. Mitigation: zod `.loose()` at the edge plus the stale cache means a breaking upstream change degrades to 'catalog unavailable, manual add still works' rather than a broken gateway \u2014 but it does mean the catalog page can go empty on a bad registry deploy, and we will not find out until someone opens it. Accepted; `catalog_fetch_total{result=\"error\"}` is the alert.",
+    "Tool inputSchemas carrying `$ref` + `$defs` may confuse an MCP client that naively flattens JSON Schema before handing it to a model. This is the single biggest bet in the design. Mitigation is the deferred `dereferenceSchemas: true` per-server flag (~20 LOC); the risk is that we discover it from a user report rather than in testing, because we cannot test every client.",
+    "No bundled catalog means a genuinely air-gapped first run shows an empty marketplace with no servers ever cached. The fallback is manual add plus `MCP_REGISTRY_URL` pointed at an internal mirror. Accepted deliberately \u2014 2.4 MB of stale JSON in the image is a worse trade than a good empty state.",
+    "Installing a registry entry runs a third party's code inside our container. We pin the version and allowlist the runtime, but we do NOT sandbox. Ceiling: the container is the sandbox. Per-server seccomp profiles, user namespaces or a separate runner pod are out of scope and should be the platform subsystem's problem if it ever matters.",
+    "A spec that leans on deepObject or multipart will import mostly empty. This fails loudly in the pre-save preview rather than silently at runtime, which is the right failure \u2014 but it will read as 'MCPRouter does not support OpenAPI' to a user who does not read the skip reasons. The import UI must put the skipped count next to the tool count, not behind a disclosure.",
+    "The export surface has no first-party consumer on a team that uses Claude Code and Cursor. It is 130 LOC of code with a real chance of zero users. Mitigation: it is explicitly the first thing to cut, and if no request hits `POST /api/mcp/:scope/tools/:tool` in three months we delete it rather than maintain it.",
+    "`POST /api/servers/probe` is an outbound HTTP primitive exposed to anyone with `server:create`. The argument that it grants nothing beyond creating the server holds only as long as `server:create` is not handed to near-anonymous users. If the auth subsystem ever adds a low-trust role with that permission, this route needs re-examining.",
+    "The oauth2 clientCredentials token cache is a process-local Map (ponytail: in-memory, single process). Correct for the one-process deployment we committed to; it silently becomes a per-replica cache the day someone runs two, causing extra token requests rather than incorrect behaviour. Upgrade path: move it into the secrets subsystem's store."
+  ],
+  "phase": "Phase 2. Hard dependencies that must land in Phase 1: core's `ServerConfig` discriminated union and `createTransport` factory (needs the one `type:'openapi'` branch); core's `safeFetch` SSRF helper with per-redirect validation; core's `callTool(scope, principal, name, args)` with call-time enable/disable enforcement and the exported `TOOL_UNAVAILABLE_MESSAGE` constant; the secrets store's `putSecret`/`resolveSecret` and `${secret:<ref>}` resolution at connect time; the auth subsystem's `requirePermission('server:create')` middleware and the MCP scope-auth middleware (reused verbatim on the two export routes); the servers CRUD `createServer(config, {owner, visibility})`. Soft dependency: the context-cost subsystem's `countTool/countPrompt/countResource` \u2014 `probe()` can ship returning `tokens: 0` and gain real numbers the day that lands. Internal ordering within the phase: `packages/core/src/openapi/*` and `probe.ts` can start the moment the transport factory branch exists and are independently testable against a stock SDK `Client`; `catalog/registry.ts` needs only the DB migration; `routes/catalog.ts` needs secrets + servers CRUD; the three `packages/web` files need the web subsystem's Dialog, DataTable and token set, so they trail by one phase-slice and the API is usable from the CLI in the meantime. `openapi-export.ts` is last and is the designated cut line if the phase runs over.",
+  "subsystem": "Marketplace, install flow, and the OpenAPI bridge",
+  "summary": "This subsystem turns \"find a server\" and \"point at a REST API\" into two flows that both end in a validated, connectable server row. One catalog source (the official MCP registry) with a Postgres response cache that doubles as the offline story; one install path where the registry entry's own variable metadata IS the generated form; one `probe()` primitive that powers dry-run, OpenAPI preview and test-connection alike. The single idea that makes it leaner than mcphub: the OpenAPI bridge is a REAL in-process MCP server over `InMemoryTransport`, so core's engine cannot tell it apart from a stdio or HTTP server \u2014 which means namespacing, call-time tool filtering, cost accounting and audit logging all apply for free, and mcphub's two duplicated ~150-line OpenAPI/MCP call blocks (mcpService.ts:3741, :3944) never come into existence. The second-biggest lever is refusing to dereference specs: keep `$ref`, attach only the reachable `$defs`, which deletes a heavy dependency, handles circular schemas for free, cuts token cost, and closes an external-$ref SSRF hole in the same stroke. Three of mcphub's features are deliberately not built at all \u2014 the bundled 2.4 MB catalog, .mcpb upload, and the public `/.well-known/mcp-marketplace` \u2014 and the LOC saved pays for real SSRF and secret-handling controls on the paths that remain.",
+  "total_loc_estimate": 2297
+}

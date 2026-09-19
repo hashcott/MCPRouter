@@ -1,0 +1,264 @@
+{
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "v1 is STATELESS downstream. We serve legacy-era 2025-11-25 Streamable HTTP, but `initialize` returns NO `Mcp-Session-Id`; an inbound `Mcp-Session-Id` is ignored (never consulted, never echoed, never an error). SDK server transport constructed per request with `sessionIdGenerator: undefined`. There is no session map, no session table, no restart survival problem, no session\u2192route mismatch check.",
+      "rationale": "The 2025-03-26+ spec explicitly permits a stateless server, and the 2026-07-28 spec deletes sessions outright. Building sessions in v1 is building the thing the spec is deleting. Everything mcphub bolted on to make sessions safe (re-injecting the group from the session before scope checks, sseService.ts:166,705,855) is obtained here by deletion: scope is recomputed from URL+credential on every single POST, so re-verification is not a feature, it is the only code path.",
+      "mcphub_contrast": "mcphub keeps an in-memory `transports` map (sseService.ts:41) binding session\u2192group, then adds `enableSessionRebuild` to rehydrate private SDK internals across restarts (sseService.ts:105). That is brittle across SDK versions and it is transitional debt the spec is itself removing. We inherit none of it. This one is not a close call \u2014 theirs is a 2024 design.",
+      "cost": "negative: removes ~400 LOC of session plumbing"
+    },
+    {
+      "id": "D2",
+      "decision": "Unambiguous route namespace. Target kind is encoded in a literal path segment, never inferred: `/mcp` (all), `/mcp/g/:group`, `/mcp/s/:server`, `/mcp/smart`, `/mcp/smart/g/:group`. Slugs validated by zod `^[a-z0-9][a-z0-9-]{0,63}$` \u2014 no `(.*)` wildcard, no UUID fallback, no `$` sigil.",
+      "rationale": "A server named `github` and a group named `github` must not shadow each other, and the resolution order must not be a security-relevant surprise. A literal discriminator segment makes the URL self-describing and makes the route table exhaustively testable. Group/server slugs carry a DB unique constraint (contract from the catalog subsystem), so no UUID escape hatch is needed.",
+      "mcphub_contrast": "mcphub overloads one `:group(.*)` slot resolved group-name \u2192 group-UUID \u2192 server-name \u2192 empty (mcpService.ts:4811), plus `$smart`/`$smart/<group>` which is exactly why the `(.*)` wildcard exists (smartRoutingService.ts:676). Renaming a group can silently repoint a client at a same-named server. Ours is better and cheaper.",
+      "cost": "~30 LOC of route defs"
+    },
+    {
+      "id": "D3",
+      "decision": "Drop the `/:user/mcp/...` variant entirely. Identity comes from the credential, never from the URL.",
+      "rationale": "This is a team self-host install. A username in the path is an identity claim the server must ignore anyway (or it is an impersonation vector), so it is pure ambiguity plus a second route table to keep in sync. Per-user upstream credentials are resolved from `principal.userId` by the upstream-runtime subsystem.",
+      "mcphub_contrast": "mcphub mirrors every MCP route under `/:user` (server.ts:141-168) and binds `kind='user'` bearer keys to the path segment (sseService.ts:319-339) \u2014 a scope check that only works because a second check re-derives the owner. Deleting the path segment deletes the class.",
+      "cost": "negative: removes a mirrored route table"
+    },
+    {
+      "id": "D4",
+      "decision": "`GET` and `DELETE` on any `/mcp*` path return `405` with `Allow: POST`. No standalone SSE stream, no session termination endpoint.",
+      "rationale": "The legacy spec explicitly allows 405 on the GET stream and the SDK client tolerates it (`StreamableHTTPClientTransport` catches 405 and continues without the stream). The modern spec removes both verbs. Corner-cut ceiling: downstream clients will not receive `notifications/tools/list_changed` and so may hold a stale tool list until their next `tools/list`. Upgrade path is `subscriptions/listen` (a POST whose own response stream stays open) when the SDK ships the modern era \u2014 NOT the legacy GET stream, which is being deleted.",
+      "mcphub_contrast": "mcphub implements `GET|DELETE /mcp/:group` (sseService.ts:849,1025) plus the whole deprecated `/sse` + `/messages` two-endpoint transport (sseService.ts:626,695). We ship neither downstream. Upstream we still keep an SSE *client*, because old remote servers use it.",
+      "cost": "~8 LOC"
+    },
+    {
+      "id": "D5",
+      "decision": "The era adapter is exactly one file, `packages/server/src/mcp/legacy.ts`. Everything era-specific lives there: the `initialize` reply, `notifications/initialized` \u2192 202, protocol-version negotiation against the SDK's `SUPPORTED_PROTOCOL_VERSIONS`, and the decision not to mint a session id. Core is called as `gateway.listTools(scope)` / `gateway.callTool(scope, name, args, opts)` where `scope` is a resolved value object. The string 'session' does not appear in `packages/core`.",
+      "rationale": "Stated cost of adding the modern era later, by file: NEW `packages/server/src/mcp/modern.ts` (~180 LOC: `_meta` protocol fields, `InputRequiredResult` passthrough, `server/discover`), NEW `packages/server/src/mcp/headers.ts` (~90 LOC: `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name`/`Mcp-Param-*` vs body comparison, `=?base64?...?=` decode, `-32020 HeaderMismatch`, `-32022 UnsupportedProtocolVersionError`), and ~20 changed lines in `routes.ts` to branch per request (`_meta.io.modelcontextprotocol/*` present \u2192 modern; `initialize` method \u2192 legacy). ZERO files change in `packages/core`, zero in `auth.ts`, zero in `grant.ts`.",
+      "mcphub_contrast": "mcphub's era handling is smeared through a 5006-line `mcpService.ts` and a 1000+ line `sseService.ts` that both know about sessions, groups and transports at once. There is no seam at which a new era could be added as a file.",
+      "cost": "~150 LOC now, ~290 LOC to add the modern era later"
+    },
+    {
+      "id": "D6",
+      "decision": "Use the SDK's Web-Standard server transport (`server/webStandardStreamableHttp.js`) with a fresh low-level `Server` per request, `sessionIdGenerator: undefined`, `enableJsonResponse: false` (per-request SSE), and `X-Accel-Buffering: no`. We write zero transport code.",
+      "rationale": "Rung 3 of the ladder: the SDK already does Streamable HTTP framing. Hono is Fetch-API native, so the Web-Standard variant avoids a node req/res shim. Per-request SSE (rather than buffered JSON) lets upstream progress/log notifications reach the client inside the request's own stream \u2014 which is exactly the shape the modern spec mandates, so the streaming code survives the era change. Constructing a `Server` per request is ~6 `setRequestHandler` calls; no upstream connection is involved (those are long-lived in core).",
+      "mcphub_contrast": "mcphub also uses the SDK transports but keeps them alive in a map and then reaches into their private internals to rebuild them (sseService.ts:105). Per-request construction means we only ever use the public API.",
+      "cost": "~60 LOC inside legacy.ts"
+    },
+    {
+      "id": "D7",
+      "decision": "Authentication is one middleware over `/mcp*`. `Authorization: Bearer <t>` only \u2014 never a `?token=` query parameter. `mcpr_`-prefixed \u2192 better-auth `apiKey` plugin `verifyApiKey`; anything else \u2192 better-auth `mcp` plugin OAuth verification. The credential yields a `Grant` (`all | groups[] | servers[]`) read from the key's `metadata.grant` or from OAuth scopes. Missing/invalid credential \u2192 `401` with `WWW-Authenticate: Bearer resource_metadata=\"\u2026\", scope=\"mcp\"`.",
+      "rationale": "better-auth 1.7.5 already gives hashed key storage with indexed lookup, `prefix`, `expiresIn` with expiry cleanup, `metadata`, and `rateLimitEnabled/Max/TimeWindow`. Writing a key table is rung-5 violation. The query-string token is dropped because it lands in access logs, proxy logs and browser history.",
+      "mcphub_contrast": "mcphub stores bearer keys PLAINTEXT (db/entities/BearerKey.ts:21) and validates by loading ALL enabled keys and doing a linear `safeCompare` (auth.ts:37-56), and accepts JWTs from `?token=` (auth.ts:178-180). Both go away for free by using the plugin.",
+      "cost": "~140 LOC (auth.ts), 0 LOC of key storage"
+    },
+    {
+      "id": "D8",
+      "decision": "Check order is fixed and testable: authenticate \u2192 `gateway.resolveTarget(principal, target)` (null \u2192 `404 {\"error\":\"not_found\"}`) \u2192 `checkGrant(grant, scope)` (fail \u2192 `403` + `WWW-Authenticate: Bearer error=\"insufficient_scope\"`) \u2192 handle. A group that does not exist and a group the principal cannot see return byte-identical 404 responses.",
+      "rationale": "Visibility is 'what this human may see'; grant is 'what this credential may use'. Resolving visibility first means the route table is not an enumeration oracle for a stolen key \u2014 403 can only ever reveal the existence of something the key's own owner could already list. This is the route-level application of mcphub's `ToolUnavailableError` doctrine (mcpService.ts:2654), which we also require at tool level.",
+      "mcphub_contrast": "mcphub has two DIVERGENT authz paths that disagree (dataService.ts:6-28 vs DaoConfigService.filterSettingsForUser:171, where `owner === undefined` is visible to everyone) and `group.visibility == null` opens a route to any authenticated caller (utils/groupAccess.ts:6). One ordered chain in one file, with one table-driven test, is the whole improvement.",
+      "cost": "~25 LOC"
+    },
+    {
+      "id": "D9",
+      "decision": "The full-containment rule is a pure function `checkGrant(grant, scope): 'ok' | 'insufficient'` in `grant.ts`, with no I/O and an exhaustive truth-table test. A server-scoped grant hitting a group route passes only if EVERY `scope.serverIds` member is in the grant. A group-scoped grant hitting a server route passes only if that server is a member of a granted group. `smart` routes reuse the `all`/`group` rules.",
+      "rationale": "This is the one piece of authorization logic with real combinatorics, so it is the one piece that must be I/O-free and exhaustively tested. Partial containment would let a key scoped to one server call a group route and reach the other members.",
+      "mcphub_contrast": "mcphub reached the same containment rule but only after GHSA-454m-4vm6-842f, and it lives inline in the transport layer across ~70 lines of `sseService.ts:228-302` mixed with session and route handling, so it cannot be unit-tested without a server. Their rule is right; their placement is not. We copy the rule, not the placement.",
+      "cost": "~70 LOC + ~80 LOC of tests"
+    },
+    {
+      "id": "D10",
+      "decision": "Limits, all at the HTTP edge: Hono `bodyLimit` 4 MB; per-principal concurrency semaphore (`Map<string, number>`, default 8, `429` + `Retry-After: 1`); per-call deadline via `AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(MCP_CALL_TIMEOUT_MS)])` passed into `gateway.callTool`; hard result ceiling of 1 MB serialized with an explicit `[mcprouter:truncated N bytes]` marker. Rate limiting per API key is the better-auth apiKey plugin's, not ours.",
+      "rationale": "Client disconnect and timeout collapse into ONE mechanism \u2014 an AbortSignal \u2014 which core must honour by cancelling the upstream call. That is precisely the modern spec's HTTP cancellation semantics ('the client closes the response stream'), obtained in the legacy era for free. `AbortSignal.any` is Node stdlib; no library. Corner-cut ceiling: the semaphore is per-process, correct only because we are ONE process by design; upgrade path if we ever run replicas is a Postgres advisory lock keyed by principal.",
+      "mcphub_contrast": "mcphub has no downstream concurrency cap or request deadline; an upstream hang ties up the caller until the SDK's own timeout, and it retries once by rebuilding the transport (callToolWithReconnect, mcpService.ts:1532) which can double the hang. Result-size control lives in a separate compression service (toolResultCompressionService.ts:444) with no hard ceiling. We keep their explicit-marker doctrine and add the ceiling.",
+      "cost": "~80 LOC"
+    },
+    {
+      "id": "D11",
+      "decision": "ONE OAuth resource identifier for the whole gateway: `${PUBLIC_URL}/mcp`. Tokens are audience-validated against it; per-route authorization is the `Grant` check, not the audience. better-auth's `mcp` plugin owns `/api/auth/mcp/authorize|token|userinfo`, PKCE, DPoP, RFC 8414 metadata and CIMD. We own only: the `/.well-known/oauth-protected-resource/mcp/*` wildcard (same document, so a client probing the path-specific URL succeeds), the 401 challenge header, and the OAuth-scope \u2192 `Grant` mapping. RFC 7591 DCR stays OFF, asserted by a test.",
+      "rationale": "Per-route resource identifiers would multiply consent screens and token audiences for zero security gain, since one human principal already backs all of them. Before committing to the plugin we verify exactly four things, each with a named ~10-30 LOC fallback: (a) the root `.well-known/oauth-protected-resource` is served at app root not under `/api/auth` \u2014 else we proxy it; (b) the token endpoint validates RFC 8707 `resource` and stamps `aud` \u2014 else we validate `aud` in `auth.ts`; (c) `verifyApiKey` is an indexed hash lookup, not a scan \u2014 else we add our own index; (d) `POST /api/auth/mcp/register` is not reachable with DCR off.",
+      "mcphub_contrast": "mcphub hand-builds an AS on `@node-oauth/oauth2-server` (oauthServerService.ts), stores issued tokens PLAINTEXT, keeps DCR registration tokens IN MEMORY (models/OAuth.ts:15,104), ships defaults of open DCR with `requireClientSecret:false` and `requireState:false`, and carries a second legacy `ProxyOAuthServerProvider` whose `verifyAccessToken` returns SUCCESS for any token when no introspection endpoint is configured (oauthService.ts:67-73). Every one of those is a plugin we do not write.",
+      "cost": "~50 LOC (wellKnown.ts) + ~25 LOC of scope mapping"
+    },
+    {
+      "id": "D12",
+      "decision": "Hedge for D1: if compatibility testing shows a real client hard-requires `Mcp-Session-Id`, we mint a DECORATIVE one \u2014 a random id echoed on `initialize` and accepted on every subsequent POST without ever being looked up. Guarded by `MCP_EMIT_SESSION_ID=true`, off by default.",
+      "rationale": "It keeps the stateless bet cheap to lose: ~10 LOC and still zero server state, so the era adapter stays thin and core stays session-free either way. Marked as a corner-cut with a ceiling: a decorative id gives no resumability and no session-scoped isolation; if a client ever needs real per-session upstream isolation (mcphub's `perSessionClient`), that is a core-level runtime key, not an HTTP session.",
+      "mcphub_contrast": "mcphub's session ids are load-bearing, which is why losing one on restart required `enableSessionRebuild`. Ours would be inert by construction.",
+      "cost": "~10 LOC, only if needed"
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "Downstream route table (complete)",
+      "kind": "route",
+      "sketch": "# All paths are relative to the path component of PUBLIC_URL (e.g. https://hub.acme.dev/mcprouter).\n# Slugs: ^[a-z0-9][a-z0-9-]{0,63}$ (zod). No wildcards, no UUIDs, no '$' sigils, no /:user prefix.\n\nMETHOD  PATH                                           TARGET                          AUTH\nPOST    /mcp                                           {kind:'all'}                    bearer\nPOST    /mcp/g/:group                                  {kind:'group', slug}            bearer\nPOST    /mcp/s/:server                                 {kind:'server', slug}           bearer\nPOST    /mcp/smart                                     {kind:'smart'}                  bearer\nPOST    /mcp/smart/g/:group                            {kind:'smart', groupSlug}       bearer\nGET     /mcp, /mcp/*                                   \u2014   405 + Allow: POST           bearer\nDELETE  /mcp, /mcp/*                                   \u2014   405 + Allow: POST           bearer\nALL     /mcp/* (no match above)                        \u2014   404 {\"error\":\"not_found\"}    bearer\n\nGET     /.well-known/oauth-protected-resource          RFC 9728 PRM doc                public\nGET     /.well-known/oauth-protected-resource/mcp/*    same PRM doc (path-inserted)    public\nGET     /.well-known/oauth-authorization-server        better-auth (RFC 8414)          public\nALL     /api/auth/*                                    better-auth handler             public\n\n# Not mine, listed so nobody double-mounts: /api/* REST admin API, /health, / (SPA).\n# Explicitly NOT served: /sse, /messages (deprecated 2024-11-05 two-endpoint transport),\n#                        /:user/mcp/**, /api/tools/:server/:tool (no REST tool-exec facade in v1).",
+      "notes": "This table is the artifact. Implementers must be able to generate the route test file from it verbatim: 5 POST routes, 2 rejection rules, 4 public endpoints."
+    },
+    {
+      "name": "Target / Principal / Grant",
+      "kind": "type",
+      "sketch": "// packages/server/src/mcp/grant.ts \u2014 no I/O, no imports from core.\nexport type Target =\n  | { kind: 'all' }\n  | { kind: 'group';  slug: string }\n  | { kind: 'server'; slug: string }\n  | { kind: 'smart';  groupSlug?: string };\n\nexport type Grant =\n  | { kind: 'all' }\n  | { kind: 'groups';  ids: readonly string[] }\n  | { kind: 'servers'; ids: readonly string[] };\n\nexport interface Principal {\n  readonly userId: string;\n  readonly isAdmin: boolean;\n  readonly credential: { type: 'apikey' | 'oauth'; id: string };\n  readonly grant: Grant;\n}\n\n/** Full-containment rule. Pure. mcphub sseService.ts:228-302, lifted out of the transport. */\nexport function checkGrant(grant: Grant, scope: ResolvedScope): 'ok' | 'insufficient' {\n  if (grant.kind === 'all') return 'ok';\n  if (grant.kind === 'groups')\n    return scope.groupIds.some(g => grant.ids.includes(g)) ? 'ok' : 'insufficient';\n  // server-scoped key on a group/all route: EVERY member must be granted.\n  return scope.serverIds.every(s => grant.ids.includes(s)) ? 'ok' : 'insufficient';\n}",
+      "notes": "`scope.groupIds` is [] for a server target and [groupId] for a group target, so the group-grant branch covers both the group route and the 'server is a member of a granted group' case without a second rule."
+    },
+    {
+      "name": "Gateway \u2014 the contract I need from packages/core",
+      "kind": "type",
+      "sketch": "// packages/core/src/gateway.ts \u2014 owned by the engine subsystem. NO session concept, no HTTP.\nexport interface ResolvedScope {\n  readonly targetKind: 'all' | 'group' | 'server' | 'smart';\n  readonly serverIds: readonly string[];   // fully expanded, post-visibility\n  readonly groupIds: readonly string[];    // [] unless the target is a group\n}\n\nexport interface CallOpts {\n  readonly signal: AbortSignal;                       // timeout OR client disconnect\n  readonly onProgress?: (n: ProgressNotification) => void;\n  readonly requestId: string;                         // for logs/traces/activity\n}\n\nexport interface Gateway {\n  /** null = the principal may not see this target. Server MUST render null as 404 not_found. */\n  resolveTarget(p: Principal, t: Target): Promise<ResolvedScope | null>;\n\n  listTools(s: ResolvedScope): Promise<Tool[]>;\n  /** MUST re-resolve `name` against the same projection listTools uses, and MUST throw\n   *  ToolUnavailableError with IDENTICAL text for a disabled tool and a nonexistent one.\n   *  (mcphub CVE fix afcc72f; mcpService.ts:2654, :3388.) The server never pre-resolves. */\n  callTool(s: ResolvedScope, name: string, args: unknown, o: CallOpts): Promise<CallToolResult>;\n\n  listPrompts(s): Promise<Prompt[]>;\n  getPrompt(s, name: string, args: unknown, o: CallOpts): Promise<GetPromptResult>;\n  listResources(s): Promise<Resource[]>;\n  listResourceTemplates(s): Promise<ResourceTemplate[]>;\n  readResource(s, uri: string, o: CallOpts): Promise<ReadResourceResult>;\n}",
+      "notes": "Also required of core: upstream clients advertise `capabilities: {}` (no sampling/elicitation/roots), because a stateless downstream cannot relay server\u2192client requests. And: core MUST NOT receive the downstream Authorization header \u2014 header passthrough upstream is an allowlist owned by the upstream subsystem and must exclude Authorization/Cookie."
+    },
+    {
+      "name": "Legacy era handler",
+      "kind": "component",
+      "sketch": "// packages/server/src/mcp/legacy.ts\nimport { Server } from '@modelcontextprotocol/sdk/server/index.js';\nimport { WebStandardStreamableHTTPServerTransport as Transport }\n  from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';\n\nexport async function handleLegacy(c: Context, scope: ResolvedScope, gw: Gateway) {\n  const server = new Server(\n    { name: 'mcprouter', version: VERSION },\n    { capabilities: { tools: {}, prompts: {}, resources: {} } },   // no sampling/elicitation\n  );\n  server.setRequestHandler(ListToolsRequestSchema, () => gw.listTools(scope).then(tools => ({ tools })));\n  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {\n    const release = await acquire(c.get('principal'));                 // limits.ts, may throw Busy\n    try {\n      return cap(await gw.callTool(scope, req.params.name, req.params.arguments, {\n        signal: deadline(c),                                           // AbortSignal.any([...])\n        onProgress: n => extra.sendNotification(n),\n        requestId: c.get('requestId'),\n      }));\n    } finally { release(); }\n  });\n  // \u2026prompts/get, resources/read, and the three list handlers, same shape.\n\n  const transport = new Transport({ sessionIdGenerator: undefined });  // \u2190 statelessness, one line\n  await server.connect(transport);\n  const res = await transport.handleRequest(c.req.raw);\n  res.headers.set('X-Accel-Buffering', 'no');\n  return res;\n}",
+      "notes": "`initialize` and `notifications/initialized` are handled by the SDK Server/transport; with sessionIdGenerator undefined no Mcp-Session-Id is emitted. We never read c.req.header('Mcp-Session-Id')."
+    },
+    {
+      "name": "Route wiring + check order",
+      "kind": "component",
+      "sketch": "// packages/server/src/mcp/routes.ts\nconst mcp = new Hono<Env>();\nmcp.use('*', requestId, bodyLimit({ maxSize: 4 * 1024 * 1024 }), mcpAuth);   // mcpAuth \u2192 401 challenge\nmcp.on(['GET', 'DELETE'], '/*', c => c.body(null, 405, { Allow: 'POST' }));\n\nconst post = (path: string, target: (c: Context) => Target) =>\n  mcp.post(path, async c => {\n    const p = c.get('principal');\n    const scope = await gw.resolveTarget(p, target(c));\n    if (!scope) return notFound(c);                                   // identical text, always\n    if (checkGrant(p.grant, scope) !== 'ok') return insufficientScope(c);\n    return handleLegacy(c, scope, gw);\n  });\n\npost('/',             ()  => ({ kind: 'all' }));\npost('/g/:group',     (c) => ({ kind: 'group',  slug: slug(c, 'group') }));\npost('/s/:server',    (c) => ({ kind: 'server', slug: slug(c, 'server') }));\npost('/smart',        ()  => ({ kind: 'smart' }));\npost('/smart/g/:group', (c)=> ({ kind: 'smart',  groupSlug: slug(c, 'group') }));\nmcp.all('/*', c => notFound(c));\n\n// slug() = SLUG.parse(c.req.param(k)) with zod; a parse failure is a 404, never a 400,\n// so a malformed slug is indistinguishable from an invisible one.",
+      "notes": "Adding the modern era is one `if` inside `post()`: peek the parsed body once, branch to handleModern when `_meta['io.modelcontextprotocol/protocol-version']` is present. Nothing above the branch changes."
+    },
+    {
+      "name": "Auth middleware",
+      "kind": "component",
+      "sketch": "// packages/server/src/mcp/auth.ts\nexport const mcpAuth: MiddlewareHandler<Env> = async (c, next) => {\n  const t = c.req.header('authorization')?.match(/^Bearer (.+)$/i)?.[1];   // header ONLY\n  if (!t) return challenge(c);                                            // 401 + WWW-Authenticate\n\n  let p: Principal | null;\n  if (t.startsWith('mcpr_')) {\n    const { valid, key } = await auth.api.verifyApiKey({ body: { key: t } });\n    p = valid && key ? { userId: key.userId, isAdmin: false,\n                         credential: { type: 'apikey', id: key.id },\n                         grant: parseGrant(key.metadata) } : null;        // rate limit: plugin's\n  } else {\n    const s = await auth.api.getMcpSession({ headers: c.req.raw.headers });\n    p = s && s.audience === RESOURCE ? { userId: s.userId, isAdmin: false,\n                         credential: { type: 'oauth', id: s.tokenId },\n                         grant: scopesToGrant(s.scopes) } : null;         // RFC 8707 aud check\n  }\n  if (!p) return challenge(c);\n  c.set('principal', p);\n  await next();\n};\n\nconst RESOURCE = `${PUBLIC_URL}/mcp`;\nconst challenge = (c: Context) => c.json({ error: 'unauthorized' }, 401, {\n  'WWW-Authenticate':\n    `Bearer resource_metadata=\"${PUBLIC_URL}/.well-known/oauth-protected-resource\", scope=\"mcp\"`,\n});\nconst insufficientScope = (c: Context) => c.json({ error: 'forbidden' }, 403, {\n  'WWW-Authenticate': `Bearer error=\"insufficient_scope\", scope=\"mcp\"`,\n});",
+      "notes": "parseGrant defaults to {kind:'servers', ids:[]} (deny-all) on a malformed/absent metadata.grant \u2014 fail CLOSED. mcphub's `credentialEligible:false` is fail-open-by-omission (credentialBindingService.ts); we invert the default."
+    },
+    {
+      "name": "Protected resource metadata",
+      "kind": "route",
+      "sketch": "// packages/server/src/mcp/wellKnown.ts \u2014 one document, served at the root path and under /mcp/*.\nconst PRM = {\n  resource: `${PUBLIC_URL}/mcp`,\n  authorization_servers: [PUBLIC_URL],\n  bearer_methods_supported: ['header'],\n  scopes_supported: ['mcp'],\n  resource_documentation: `${PUBLIC_URL}/docs/mcp`,\n};\napp.get('/.well-known/oauth-protected-resource',        c => c.json(PRM));\napp.get('/.well-known/oauth-protected-resource/mcp/*',  c => c.json(PRM));",
+      "notes": "RFC 9728 path insertion means a client probing /.well-known/oauth-protected-resource/mcp/g/acme must succeed; the wildcard covers it without minting per-route audiences. Verify item (b): if better-auth already mounts the root path, drop our first line and keep the wildcard."
+    },
+    {
+      "name": "Limits",
+      "kind": "component",
+      "sketch": "// packages/server/src/mcp/limits.ts\nconst inflight = new Map<string, number>();   // ponytail: per-process; ONE process by design.\n                                              // upgrade: pg advisory lock keyed by principal if we replicate.\nexport async function acquire(p: Principal) {\n  const k = p.credential.id;\n  const n = inflight.get(k) ?? 0;\n  if (n >= MCP_MAX_CONCURRENT) throw new HTTPException(429, { res: busy() });  // Retry-After: 1\n  inflight.set(k, n + 1);\n  return () => { const m = (inflight.get(k) ?? 1) - 1; m ? inflight.set(k, m) : inflight.delete(k); };\n}\n\nexport const deadline = (c: Context) =>\n  AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(MCP_CALL_TIMEOUT_MS)]);\n\nexport function cap(r: CallToolResult): CallToolResult {\n  const s = JSON.stringify(r);\n  if (s.length <= MCP_MAX_RESULT_BYTES) return r;\n  return { isError: r.isError, content: [{ type: 'text',\n    text: `[mcprouter:truncated ${s.length} bytes, limit ${MCP_MAX_RESULT_BYTES}]` }] };\n}",
+      "notes": "Upstream hang: AbortSignal.timeout fires \u2192 core cancels the upstream call \u2192 SDK surfaces ErrorCode.RequestTimeout (-32001) to the client inside its own SSE stream. Client disconnect: c.req.raw.signal fires \u2192 identical path. One mechanism, two causes, and it is already the modern spec's cancellation semantics."
+    },
+    {
+      "name": "Environment",
+      "kind": "env",
+      "sketch": "PUBLIC_URL             # REQUIRED, absolute, no trailing slash. Derives base path, OAuth issuer,\n                       # RFC 9728 `resource` and the 401 challenge. Startup fails if unset/relative.\nMCP_CALL_TIMEOUT_MS    # default 120000\nMCP_MAX_CONCURRENT     # default 8, per credential\nMCP_MAX_RESULT_BYTES   # default 1048576\nMCP_EMIT_SESSION_ID    # default false \u2014 decorative Mcp-Session-Id hedge (D12)",
+      "notes": "Five vars, four with defaults. No MCP_BASE_PATH: it is the path component of PUBLIC_URL, which we need for OAuth anyway. No JWT_SECRET (better-auth owns secrets) \u2014 mcphub generates one per process when unset (config/jwt.ts:4-14), which breaks silently across replicas."
+    },
+    {
+      "name": "Metrics emitted by this subsystem",
+      "kind": "metric",
+      "sketch": "mcp_requests_total{route,method,status}                 counter\nmcp_tool_calls_total{target_kind,server,tool,outcome}   counter  # outcome: ok|error|timeout|denied\nmcp_tool_call_duration_seconds{server,tool}             histogram\nmcp_inflight{credential_kind}                           gauge\nmcp_rejected_total{reason}                              counter  # busy|body_limit|unauth|forbidden|not_found\nmcp_result_truncated_total{server,tool}                 counter",
+      "notes": "Registered with the observability subsystem's prom-client registry; I only emit. Label cardinality: `tool` is bounded by the installed catalog, `credential_kind` is 2 values \u2014 no user/key ids as labels."
+    }
+  ],
+  "files": [
+    {
+      "path": "packages/server/src/mcp/routes.ts",
+      "purpose": "The route table: 5 POST targets, 405 on GET/DELETE, 404 catch-all, middleware wiring, fixed check order (resolve \u2192 grant \u2192 handle).",
+      "loc": 110
+    },
+    {
+      "path": "packages/server/src/mcp/auth.ts",
+      "purpose": "Bearer extraction (header only), better-auth apiKey and mcp verification, audience check, Grant parsing with fail-closed default, 401/403 challenge headers.",
+      "loc": 140
+    },
+    {
+      "path": "packages/server/src/mcp/grant.ts",
+      "purpose": "Target/Principal/Grant types plus the pure full-containment checkGrant(). No I/O, no imports.",
+      "loc": 70
+    },
+    {
+      "path": "packages/server/src/mcp/legacy.ts",
+      "purpose": "The era adapter: per-request SDK Server + Web-Standard transport with sessionIdGenerator undefined, six request handlers delegating to Gateway, progress forwarding.",
+      "loc": 150
+    },
+    {
+      "path": "packages/server/src/mcp/limits.ts",
+      "purpose": "Per-credential concurrency semaphore, AbortSignal.any deadline, result byte cap with explicit truncation marker.",
+      "loc": 80
+    },
+    {
+      "path": "packages/server/src/mcp/wellKnown.ts",
+      "purpose": "RFC 9728 protected-resource metadata at the root and under /mcp/*, and the single PRM document shared by both.",
+      "loc": 50
+    },
+    {
+      "path": "packages/server/src/mcp/errors.ts",
+      "purpose": "JSON-RPC and HTTP error mapping: identical not_found body, insufficient_scope, 405, 429, ToolUnavailableError passthrough with unchanged text.",
+      "loc": 45
+    },
+    {
+      "path": "packages/server/src/mcp/__tests__/grant.test.ts",
+      "purpose": "Exhaustive truth table for checkGrant across 3 grant kinds x 4 target kinds, including the partial-containment denial.",
+      "loc": 90
+    },
+    {
+      "path": "packages/server/src/mcp/__tests__/routes.test.ts",
+      "purpose": "Route table conformance: every row, 405 Allow header, 401 challenge shape, 403-vs-404 ordering, byte-identical not_found for missing vs invisible, body limit, DCR endpoint unreachable.",
+      "loc": 170
+    },
+    {
+      "path": "packages/server/src/mcp/__tests__/legacy.test.ts",
+      "purpose": "Era adapter: initialize emits no Mcp-Session-Id, an inbound one is ignored and not echoed, notification returns 202, timeout yields -32001, client abort cancels.",
+      "loc": 110
+    }
+  ],
+  "security": [
+    "Anonymous HTTP \u2192 gateway. Control: bearer credential required on every /mcp* request including GET/DELETE (so a probe cannot map routes unauthenticated); Authorization header only, never ?token= (mcphub auth.ts:178-180); 401 carries the spec-mandated WWW-Authenticate with resource_metadata so a compliant client can discover the AS.",
+    "Credential \u2192 identity. Control: better-auth apiKey plugin does hashed, indexed lookup and expiry \u2014 no plaintext key column and no O(n) safeCompare scan (mcphub db/entities/BearerKey.ts:21, auth.ts:37-56). OAuth tokens are audience-checked against ${PUBLIC_URL}/mcp per RFC 8707 before a principal is constructed. Verify item: if better-auth does not stamp/validate aud, we validate it in auth.ts (~10 LOC) before shipping.",
+    "Credential \u2192 authority. Control: Grant is parsed from key metadata with a fail-CLOSED default ({servers, ids:[]}) on absent or malformed data; a key can never exceed its owner because resolveTarget applies user visibility first and the grant check only narrows further. No credential ever grants isAdmin on the MCP path (mcphub's dashboard keys grant isAdmin:true, auth.ts:61-66).",
+    "URL path \u2192 target. Control: literal discriminator segments plus zod slug ^[a-z0-9][a-z0-9-]{0,63}$; no (.*) wildcard, so the `$smart/<group>` slash-carrying pattern and its traversal class do not exist. A malformed slug returns 404, not 400, so it is indistinguishable from an invisible target.",
+    "Target existence \u2192 information disclosure. Control: gateway.resolveTarget returning null and a nonexistent slug produce the byte-identical 404 body. 403 insufficient_scope is only reachable after visibility has already been proven, so it can only reveal what the credential's own owner could list.",
+    "Tool name \u2192 execution. Control: enforcement at CALL time, not only list time (mcphub CVE fix afcc72f). The server passes the client-supplied name straight to gateway.callTool and never pre-resolves; core re-resolves against the same projection listTools used and raises ToolUnavailableError with text identical for disabled and nonexistent (mcpService.ts:2654, :3388). Contract, asserted by a core-side test I depend on.",
+    "Request body \u2192 resources. Control: Hono bodyLimit 4 MB, per-credential concurrency cap of 8 with 429 + Retry-After, per-call deadline via AbortSignal.any (timeout OR client disconnect), 1 MB result ceiling with an explicit [mcprouter:truncated N bytes] marker so a truncated result can never be mistaken for a complete one.",
+    "Downstream headers \u2192 upstream. Control: this layer forwards NOTHING. The downstream Authorization and Cookie headers must never reach an upstream server; header passthrough upstream is an explicit allowlist owned by the upstream subsystem, and I require Authorization/Cookie be excluded from it unconditionally (not merely stripped when a credential binding exists, as in mcphub credentialBindingService.ts:225-238).",
+    "OAuth AS surface. Control: RFC 7591 DCR stays off (better-auth never enables it implicitly) and a test asserts POST /api/auth/mcp/register is unreachable; PKCE mandatory; CIMD is the client-identity mechanism; one resource identifier so consent and audience stay singular. No second, legacy provider path exists (mcphub's ProxyOAuthServerProvider returns SUCCESS for any token when introspection is unconfigured, oauthService.ts:67-73).",
+    "Session identity. Control: none exists. We never mint, read, echo or persist Mcp-Session-Id, so session fixation, session-scope confusion and cross-restart rehydration of private SDK internals (mcphub sseService.ts:105) are all out of scope by construction. Scope is recomputed from URL + credential on every request."
+  ],
+  "deferred": [
+    {
+      "item": "Modern era (2026-07-28) handler: _meta protocol fields, header/body mismatch validation (-32020), -32022 unsupported-version, server/discover, MRTR InputRequiredResult.",
+      "add_when": "@modelcontextprotocol/sdk ships a LATEST_PROTOCOL_VERSION of 2026-07-28 or later. Cost is already scoped: modern.ts + headers.ts + a 20-line branch in routes.ts, zero core changes."
+    },
+    {
+      "item": "Long-lived change notifications to downstream clients (subscriptions/listen with a held-open response stream, periodic ':\\r\\n' keep-alive).",
+      "add_when": "The SDK ships the modern era AND a user reports a stale tool list after installing/removing a server. Never build the legacy GET stream to solve this."
+    },
+    {
+      "item": "Server\u2192client requests: sampling, elicitation, roots.",
+      "add_when": "MRTR (SEP-2322) lands in the SDK \u2014 it is stateless and fits this design. Until then we advertise no such capability downstream and require core to advertise none upstream, so no upstream server can send us something we cannot relay."
+    },
+    {
+      "item": "Decorative Mcp-Session-Id (MCP_EMIT_SESSION_ID).",
+      "add_when": "The client compatibility matrix shows a real client (Claude Desktop/Code, Cursor, Continue, VS Code) refusing to continue without one. ~10 LOC, still zero server state."
+    },
+    {
+      "item": "Group/server rename redirects (301 from the old slug).",
+      "add_when": "The first support ticket about a renamed group breaking someone's client config. Until then the UI warns on rename that endpoint URLs change."
+    },
+    {
+      "item": "Rate limiting for OAuth-token principals (API keys already have the better-auth plugin's).",
+      "add_when": "A human-driven client is observed exceeding the concurrency cap persistently, i.e. mcp_rejected_total{reason=\"busy\"} is non-trivial for credential_kind=oauth."
+    },
+    {
+      "item": "Distributed concurrency/rate state (Postgres advisory locks or Redis).",
+      "add_when": "We ever run more than one process. The whole v1 is explicitly ONE process; the semaphore comment names this ceiling."
+    },
+    {
+      "item": "REST/OpenAPI tool-execution facade (mcphub routes/index.ts:488-499, GET|POST /api/tools/:server/:tool).",
+      "add_when": "Someone actually needs OpenWebUI. It is a second execution path that must duplicate every check in this document \u2014 the reason mcphub has two near-identical ~150-line call blocks (mcpService.ts:3741, :3944)."
+    },
+    {
+      "item": "Per-downstream-client isolated upstream runtimes (mcphub perSessionClient, mcpService.ts:465).",
+      "add_when": "Two clients sharing one credential need isolated upstream state. It is a core runtime-key concern, not an HTTP session concern; do not reintroduce sessions for it."
+    }
+  ],
+  "risks": [
+    "The stateless bet. If a real client hard-requires Mcp-Session-Id or the standalone GET stream, we look broken. Mitigation: a compatibility matrix test against Claude Desktop, Claude Code, Cursor and the SDK's own client run BEFORE phase 1 closes; the decorative-session hedge (D12) costs 10 LOC and preserves statelessness. Probability judged low \u2014 the SDK client tolerates 405 on GET and stateless servers are explicitly permitted.",
+    "@modelcontextprotocol/sdk 1.30.0's server/webStandardStreamableHttp.js is the newest of the three server transports and may not honour sessionIdGenerator: undefined the way the node transport does. Verify in the first hour; fallback is the node StreamableHTTPServerTransport behind Hono's node adapter (~20 LOC of shim), not hand-written framing.",
+    "better-auth plugin gaps. Four specific unknowns (PRM mount path, RFC 8707 audience stamping/validation, verifyApiKey being an indexed hash lookup rather than a scan, DCR provably off). Each has a named fallback of 10-30 LOC, so the worst case is bounded \u2014 but if THREE of the four fail, reassess whether the mcp plugin is load-bearing or we should write the AS against a smaller OAuth library.",
+    "Per-request Server construction under load. Six setRequestHandler calls and one transport per POST. Expected negligible, but unmeasured. Mitigation: a benchmark of tools/list throughput in phase 1; if it matters, memoise the handler set per ResolvedScope shape \u2014 still no session, still no shared mutable state.",
+    "No downstream listChanged means a client can hold a stale tool list indefinitely. Real user-visible symptom: 'I installed a server and my client does not see it.' Mitigation: document 'reconnect your client' in the install UI, and prioritise subscriptions/listen the moment the SDK allows it.",
+    "checkGrant depends on ResolvedScope.serverIds being FULLY expanded by core. If core ever returns a lazy or partial server list for a group, the full-containment rule silently weakens into partial containment \u2014 the exact GHSA-454m-4vm6-842f class. Mitigation: ResolvedScope.serverIds documented as complete-or-throw, plus a core test asserting expansion."
+  ],
+  "phase": "Phase 1 (MVP core path), built in parallel with the engine but merged after it. Hard dependencies before this subsystem can be tested end to end: (1) packages/core exports the Gateway interface with resolveTarget/listTools/callTool and enforces tool enable/disable at call time with identical error text; (2) the identity subsystem exports a configured better-auth instance with the apiKey plugin (prefix 'mcpr_', metadata.grant, rate limiting on) and the mcp plugin (DCR off, CIMD on, PKCE mandatory); (3) Drizzle migrations for better-auth's own tables plus the servers/groups slug unique constraints; (4) PUBLIC_URL validated at startup. Soft dependency: the observability subsystem's prom-client registry and requestId middleware \u2014 I emit metrics into it but can ship without. grant.ts and its truth-table test have NO dependencies and can land first, on day one.",
+  "subsystem": "Downstream MCP surface \u2014 routing, era adapter, authorization (packages/server)",
+  "summary": "This is the client-facing edge: the URL scheme MCP clients point at, the protocol-era adapter that speaks legacy-era (2025-11-25) Streamable HTTP, and the authorization chain from bearer credential to resolved scope. The single idea that makes it leaner than mcphub is that v1 is STATELESS downstream \u2014 `initialize` returns no `Mcp-Session-Id`, GET and DELETE answer 405, and scope is recomputed from URL plus credential on every POST. That one decision deletes the session map, the session\u2192group binding, the restart-survival problem, `enableSessionRebuild`'s rehydration of private SDK internals, and the session/route mismatch check, and it turns mcphub's hard-won scope re-verification fix into the only code path there is. It is also forward-compatible by accident: the 2026-07-28 spec removes sessions entirely, so adding the modern era later is a new file plus a twenty-line branch, with zero changes in `packages/core`. The route table encodes target kind in a literal path segment (`/mcp/g/`, `/mcp/s/`, `/mcp/smart`) instead of overloading one slot, so a server can never silently shadow a group. Everything else \u2014 key storage, OAuth AS, PKCE, rate limiting \u2014 is better-auth's, behind four named verification items each with a bounded fallback.",
+  "total_loc_estimate": 1015
+}

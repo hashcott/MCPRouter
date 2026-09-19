@@ -1,0 +1,342 @@
+{
+  "subsystem": "packages/core \u2014 MCP engine (upstream lifecycle + tool aggregation)",
+  "summary": "packages/core owns exactly one thing: a set of live upstream MCP connections and the aggregated tool/prompt/resource catalog projected out of them. It has no HTTP, no sessions, no authz and no config storage. The single idea that makes it leaner than mcphub is that **scope is a parameter, never state**: every public method is `(ResolvedScope, Principal, \u2026) => result`, so there is no session\u2192group map to re-inject before a scope check (mcphub sseService.ts:166,705,855), no `enableSessionRebuild` rehydrating private SDK internals (sseService.ts:105), and no module-global mutable `serverInfos` array (mcpService.ts:733). The second lever is that **one predicate answers both \"is it listed\" and \"is it callable\"**, which makes mcphub's CVE fix (afcc72f, two separate gates at :2620 and :3388) structurally impossible to regress. The third is an **injectable `TransportFactory`**, which is simultaneously the test seam (a real in-process `McpServer` over `InMemoryTransport` \u2014 no child processes, no ports) and the door for OpenAPI-as-MCP later, deleting mcphub's two duplicated ~150-line call blocks (:3741, :3944) before they are ever written. Roughly 1,770 lines of source replace `mcpService.ts`'s 5,006.",
+  "phase": "Phase 1 \u2014 foundation. Depends on: the pinned `@modelcontextprotocol/sdk@1.30.0` and the `ServerConfig` zod schema owned by the persistence subsystem (core imports the type, not the DB). Blocks: packages/server (HTTP + MCP endpoints), smart routing / vector search, context cost, observability, CLI. Nothing else can be built until `Engine`'s surface is frozen, so this ships first and its signatures are a hard contract from day one.",
+  "total_loc_estimate": 2380,
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "Every public core method takes `(scope: ResolvedScope, principal: Principal)`. Core never resolves a group name, never parses a URL path, never sees a session id, never makes an authz decision. `ResolvedScope` arrives already-authorized as an explicit list of `{serverName, alias?, tools, prompts, resources}`.",
+      "rationale": "This is the whole 'era must be a thin adapter at the HTTP edge' mandate made mechanical. When the SDK ships 2026-07-28, packages/server adds a second handler that builds the same `ResolvedScope` from `_meta` instead of from a session \u2014 core does not change by one line. It also deletes an entire bug class: you cannot forget to re-check scope after re-injecting it, because nothing is ever injected.",
+      "mcphub_contrast": "mcphub binds session\u2192group in an in-memory `transports` map (sseService.ts:41) and must re-inject the group from the session BEFORE bearer-scope checks on `/messages` and session-continuation POSTs (sseService.ts:166,705,855). That re-injection is load-bearing security glue for a mechanism the 2026-07-28 spec deletes outright. We never build it.",
+      "cost": "0 LOC \u2014 it is a constraint on signatures, not code"
+    },
+    {
+      "id": "D2",
+      "decision": "One `UpstreamServer` object per (server, credential fingerprint), held in a `ServerRegistry` Map. No module-level mutable array, no `serverInfos[]`, no index-based lookup.",
+      "rationale": "Connection state, transport handle, catalog cache, retry timer, stderr ring and in-flight call semaphore are one lifetime. Making them one object means removal is `map.delete(name)` plus `server.stop()` and every guard against a stale write becomes 'is this still the object in the map'.",
+      "mcphub_contrast": "mcphub keeps `serverInfos: ServerInfo[]` at module scope (mcpService.ts:733), rebuilt wholesale by `initializeClientsFromSettings` (:1684), which forces `liveServerInfo()` / `connectStillWanted()` lookups (:2025,:2035) on every async continuation to check whether the array entry it started with still exists. Ours cannot be stale because there is no array to be stale relative to.",
+      "cost": "~330 LOC (upstream-server.ts)"
+    },
+    {
+      "id": "D3",
+      "decision": "The connection lifecycle is a pure transition table (`next(state, event): State | undefined`) in its own file with zero I/O. An unlisted `(state, event)` pair is DROPPED with a debug log \u2014 never throws, never falls through to a default. Layered on top: a per-server `epoch` counter incremented on every `start()`, checked by each async continuation before it touches instance state.",
+      "rationale": "Two guards, two distinct races, both ~3 LOC. The table catches 'this event is no longer meaningful in this state' (a superseded `connectOk` landing on `closed`). The epoch catches 'this closure belongs to a previous attempt' and closes its orphan transport so a stdio child is never stranded. Because the table is pure, the entire lifecycle is one table-driven unit test with no mocks.",
+      "mcphub_contrast": "mcphub has one global generation counter (mcpService.ts:832) doing both jobs plus two bespoke helper guards (`liveServerInfo()` :2025, `connectStillWanted()` :2035) that every call site must remember to call. We took their lesson (generation + identity guard) and made it structural rather than a convention.",
+      "cost": "~110 LOC (state.ts) + ~90 LOC test"
+    },
+    {
+      "id": "D4",
+      "decision": "v1 core ships three transports: stdio, streamable-http, and legacy sse (upstream only \u2014 old remote servers still speak it). `createTransport` is exposed through an injectable `TransportFactory` on `EngineOptions`, defaulting to the real one.",
+      "rationale": "One mechanism does three jobs: production wiring, the test seam, and the extension point. No factory-for-one-product violation, because there are genuinely three products and a fourth (fakes) in tests.",
+      "mcphub_contrast": "Same three transports (`createTransportFromConfig` mcpService.ts:1367), but mcphub's factory is hard-wired and untestable without real processes, which is why their stdio paths are only exercised end-to-end.",
+      "cost": "~190 LOC (transport.ts)"
+    },
+    {
+      "id": "D5",
+      "decision": "OpenAPI-as-MCP is NOT a transport type in core and NOT in v1. When it lands it is an in-process `McpServer` built from the dereferenced spec, connected over `InMemoryTransport.createLinkedPair()`, handed to core by the injected `TransportFactory`. Core requires zero changes.",
+      "rationale": "An OpenAPI-backed server is an MCP server; there is no reason for the engine to know it is not talking to a subprocess. The moment you model it as a parallel client type you fork every call path.",
+      "mcphub_contrast": "mcphub makes `type:'openapi'` return an `OPENAPIClient` instead of a transport (mcpService.ts:1819-1931, clients/openapi.ts:103), which forks the call path and produces two near-identical ~150-line OpenAPI/MCP call blocks at mcpService.ts:3741 and :3944. That duplication is the single largest avoidable cost in their engine, and we delete it by construction rather than by refactoring.",
+      "cost": "0 LOC in v1 core; ~350 LOC in packages/server when it lands"
+    },
+    {
+      "id": "D6",
+      "decision": "Tool namespacing separator is a hard constant `SEP = '__'`, applied at cache time as `<server>__<tool>`. Server names are validated at config-write time against `/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$/` AND rejected if they contain `__`. No config knob.",
+      "rationale": "Doctrine: no config for a value that never changes. mcphub only needs the knob because they picked `-`, which appears in nearly every real tool name and makes reverse resolution ambiguous. Pick a separator that cannot occur in a valid server name and the knob evaporates. `__` is inside every known client's tool-name regex `^[a-zA-Z0-9_-]{1,128}$`.",
+      "mcphub_contrast": "mcphub's `getNameSeparator()` defaults to `-` (config/index.ts:256) and server names are only WARNED about, never rejected (mcpService.ts:1710) \u2014 so two server names differing only by separator chars can alias each other's tools. We reject at the write boundary instead of warning at the read boundary.",
+      "cost": "~5 LOC in core (a const + a guard); regex lives in the persistence subsystem's zod schema"
+    },
+    {
+      "id": "D7",
+      "decision": "Exactly one predicate `isExposed(scope, serverName, kind, bareName)` and exactly one resolver `resolveTool(scope, downstreamName)`. `listTools` is `filter(isExposed).map(project)`; `callTool` is `resolveTool` then dispatch. Both hit the same predicate. `resolveTool` throws `ToolUnavailableError` with the single message `Tool not found: ${name}`, constructed in exactly one place, for missing / disabled / out-of-group / server-down alike.",
+      "rationale": "This is mcphub's CVE fix (afcc72f) turned from a patch into an invariant. Enforcement at call time is not a second gate you remember to add \u2014 it is the same gate. Identical error text for hidden and nonexistent is free when there is only one throw site, and a unit test asserts the string is not reachable from any other constructor.",
+      "mcphub_contrast": "mcphub applies the filter in `filterToolsByConfig` (mcpService.ts:2620) and then AGAIN in an execution-time gate inside `findToolOnServer` (:3388) \u2014 two implementations of one rule, which is exactly how the original CVE happened. Their `ToolUnavailableError` (:2654) is the right idea; we keep it and remove the possibility of drift.",
+      "cost": "~230 LOC (catalog.ts) covering projection, aliasing, flatten and the memo"
+    },
+    {
+      "id": "D8",
+      "decision": "Per-tool overrides are stored keyed by the BARE upstream tool name, normalized at write time by the persistence layer; core does exactly one Map lookup. Core rejects any override key containing `SEP` at config-apply time.",
+      "rationale": "Storage normalization is a one-line constraint at the write boundary that removes a dual-lookup from the hottest path.",
+      "mcphub_contrast": "mcphub stores disable keys unnormalized, so `findToolOnServer` must check both bare AND prefixed keys on every call (mcpService.ts:3388). Two lookups forever because the write path was never fixed.",
+      "cost": "~3 LOC (a guard) \u2014 the saving is the code we never write"
+    },
+    {
+      "id": "D9",
+      "decision": "Per-user credentials in v1 cover REMOTE servers only (streamable-http / sse), as a per-`(serverName, principal.id)` `UpstreamServer` instance keyed `name#userId`, lazily started on first call and idle-evicted after 10 minutes. The CATALOG is always discovered with the admin-configured credentials \u2014 per-user credentials affect execution, not the tool list. Core never decrypts anything: it calls `principal.credentials.resolveHeaders(serverName)`. A server with `credentialMode:'per-user'` and `principal.credentials === undefined` FAILS the call \u2014 it does not fall back to shared credentials.",
+      "rationale": "This is the cheap 80%: 'each user calls GitHub as themselves' works, with no per-user discovery storm, no per-user embedding sets, and no process-per-user. Fail-closed is the important half \u2014 the fallback direction is the whole vulnerability.",
+      "mcphub_contrast": "mcphub spawns whole isolated runtimes per principal via `withPrincipalServers` (mcpService.ts:4529,:4632) with child processes cached by [server,username] (principalRuntimeService.ts:41-137) \u2014 correct but expensive, and it makes `credentialEligible:false` the ONLY thing keeping per-user secrets out of API-key sessions (credentialBindingService.ts), i.e. fail-OPEN by omission for any new auth path. We invert the default.",
+      "cost": "~60 LOC in registry.ts (keying + eviction)"
+    },
+    {
+      "id": "D10",
+      "decision": "One typed `EventEmitter` bus on the `Engine` (not one per server), ~45 LOC of declaration-merged typing. Events carry `serverName` as data. Subscribers MUST NOT perform I/O synchronously \u2014 the HTTP layer buffers into its own bounded ring. Call payloads (`args`, `result`) are passed by reference with a documented no-retain/no-mutate contract.",
+      "rationale": "Node's EventEmitter is already there (ladder rung 3). Per-server emitters would mean N\u00d7M listener registrations and `MaxListenersExceeded` at 50 servers. Nothing in the requirements needs replay, backpressure signalling or multicast beyond this, so eventemitter3 / rxjs / a custom pub-sub are all unjustified.",
+      "mcphub_contrast": "mcphub broadcasts listChanged per capability per server (mcpService.ts:2081-2147) unconditionally. We add a `changed: boolean` to `server:catalog` computed from a cheap hash of the projected names, so a refresh that found nothing new does not trigger a downstream listChanged storm across every connected client.",
+      "cost": "~45 LOC (bus.ts)"
+    },
+    {
+      "id": "D11",
+      "decision": "A failed tool call is retried exactly once, and ONLY when we can prove the request never reached the upstream (transport closed / not connected / socket error before any response bytes). A delivered call that returned an error \u2014 any HTTP status with a response, any JSON-RPC error, any `isError:true` result \u2014 is NEVER retried.",
+      "rationale": "Retrying a side-effecting tool call that already executed is a data-corruption bug, not a resilience feature. 'Did the request arrive' is knowable from the transport, so we gate on that rather than on the status code.",
+      "mcphub_contrast": "`callToolWithReconnect` retries once on HTTP 4xx or SSE failure by rebuilding the transport (mcpService.ts:1532). A 4xx is a RESPONSE \u2014 the tool already ran. Their retry can double-execute a write. We keep the reconnect-and-retry shape and fix the trigger condition.",
+      "cost": "~170 LOC (call.ts) including progress/abort plumbing"
+    },
+    {
+      "id": "D12",
+      "decision": "SSRF validation runs on the configured URL at connect time AND on every redirect hop, via a `guardedFetch` (`redirect:'manual'`, max 5 hops, re-validate each `Location`) injected into both HTTP transports. There is NO owner-based bypass. The escape hatch is an explicit per-server `allowPrivateNetwork: true`, surfaced in the UI and logged on every connect.",
+      "rationale": "An implicit bypass keyed on who created the record means every admin-created server is silently unguarded forever. An explicit per-server flag is the same escape hatch with an audit trail and a visible blast radius.",
+      "mcphub_contrast": "mcphub's `assertSafeUrl` + per-redirect validation is right (mcpService.ts:1382-1396) \u2014 we copy it \u2014 but it is bypassed wholesale for admin-owned servers. In a team self-host every server is admin-owned, so their guard is effectively off.",
+      "cost": "~120 LOC (ssrf.ts)"
+    },
+    {
+      "id": "D13",
+      "decision": "stdio children are spawned with `shell:false` and `detached:true`; teardown is `process.kill(-pid,'SIGTERM')` then `SIGKILL` after 5s. No `tree-kill`, no `procps` in the image. `${VAR}` expansion happens in env values and argv elements only, and an UNRESOLVED `${VAR}` fails the server into `failed` with a named error rather than expanding to empty string.",
+      "rationale": "Negative-pid process-group kill is stdlib (ladder rung 3) and deletes both a dependency and a Dockerfile package. Expansion in argv is safe precisely because `shell:false` means an expanded `; rm -rf /` is one inert argv element. Failing closed on an unresolved variable prevents the classic 'server connected, but unauthenticated' silent degradation.",
+      "mcphub_contrast": "mcphub needs `procps` in the image specifically because `tree-kill` shells out (Dockerfile:7-14), and expands `${VAR}`/`$VAR` from process.env at connect time (config/index.ts:150-252). We keep the expansion, drop the dependency and the image package, and make the missing-variable case loud.",
+      "cost": "included in transport.ts"
+    },
+    {
+      "id": "D14",
+      "decision": "Core serves immediately. There is no boot gate: `listTools` returns whatever is `ready` and reports the rest in `status()`; a call against a server still `connecting`/`retrying` awaits `ensureReady(deadlineMs)` instead of failing. A `ready` server whose transport drops keeps serving its cached catalog marked `stale:true` while it reconnects; the cache is dropped only on `failed`/`disabled`/`closed` or replaced on successful rediscovery.",
+      "rationale": "A 2-second reconnect blip should not blank every connected client's tool list and fire a listChanged storm. And gating route registration on full startup makes a 30-server hub return 404 for a minute after every deploy, which reads as an outage.",
+      "mcphub_contrast": "mcphub registers MCP routes only AFTER `initUpstreamServers()` resolves (server.ts:106-168) \u2014 before that every MCP endpoint 404s. Doing less work here is both less code and better behaviour.",
+      "cost": "~25 LOC (`ensureReady` + a `stale` flag)"
+    },
+    {
+      "id": "D15",
+      "decision": "On-demand / sleeping stdio servers are DEFERRED, but the state machine ships the `idle` state and the public API ships `ensureReady()` regardless, because both are needed for boot races and reconnects anyway.",
+      "rationale": "The genuinely expensive part of on-demand is not waking \u2014 it is persisting a catalog so a sleeping server can still be LISTED, which drags the engine into storage. Team self-host with Postgres implies a real box; 30 idle Node children is ~600 MB, annoying but not a blocker. Everything except catalog persistence and one idle timer is already in v1 by accident.",
+      "mcphub_contrast": "mcphub primes `startOnDemand` stdio servers once for discovery then sleeps them, wakes via `ensureServerReady`, and shuts down on idle (mcpService.ts:2867,:2917,:3053) \u2014 three code paths plus a discovery-priming dance. We take the shape (`ensureReady`) and skip the machinery until it is measurably needed.",
+      "cost": "0 LOC now; ~80 LOC + a catalog table when triggered"
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "Connection state machine",
+      "kind": "table",
+      "sketch": "// packages/core/src/state.ts \u2014 PURE. No I/O, no timers, no instance access.\nexport type State =\n  | 'disabled' | 'idle' | 'connecting' | 'discovering' | 'ready'\n  | 'retrying' | 'authRequired' | 'failed' | 'stopping' | 'closed';\n\nexport type Ev =\n  | { t: 'start' }\n  | { t: 'connectOk' }\n  | { t: 'connectFail';  err: Error; permanent: boolean }\n  | { t: 'discoverOk';   catalog: ServerCatalog }\n  | { t: 'discoverFail'; err: Error; permanent: boolean }\n  | { t: 'authChallenge'; authorizationUrl?: string }\n  | { t: 'authResolved' }\n  | { t: 'transportClose'; err?: Error }\n  | { t: 'backoffElapsed' }\n  | { t: 'giveUp' }\n  | { t: 'refresh' }\n  | { t: 'enable' }\n  | { t: 'disable' }\n  | { t: 'stop'; intent: 'closed' | 'disabled' | 'idle' }\n  | { t: 'stopped' };\n\nconst FAIL = '@fail' as const;            // -> ev.permanent ? 'failed' : 'retrying'\nconst INTENT = '@intent' as const;        // -> the intent captured at `stop`\n\nexport const TABLE: Record<State, Partial<Record<Ev['t'], State | '@fail' | '@intent'>>> = {\n  //  state          legal events -> next\n  disabled:     { enable: 'idle', stop: 'closed' },\n  idle:         { start: 'connecting', disable: 'disabled', stop: 'closed' },\n  connecting:   { connectOk: 'discovering', connectFail: FAIL,\n                  transportClose: 'retrying', authChallenge: 'authRequired',\n                  stop: 'stopping', disable: 'stopping' },\n  discovering:  { discoverOk: 'ready', discoverFail: FAIL,\n                  transportClose: 'retrying', authChallenge: 'authRequired',\n                  stop: 'stopping', disable: 'stopping' },\n  ready:        { refresh: 'ready', transportClose: 'retrying',\n                  authChallenge: 'authRequired',\n                  stop: 'stopping', disable: 'stopping' },\n  retrying:     { backoffElapsed: 'connecting', giveUp: 'failed',\n                  stop: 'closed', disable: 'disabled' },\n  authRequired: { authResolved: 'connecting', start: 'connecting',\n                  stop: 'closed', disable: 'disabled' },\n  failed:       { start: 'connecting', stop: 'closed', disable: 'disabled' },\n  stopping:     { stopped: INTENT },       // every other event is dropped\n  closed:       { },                       // TERMINAL: absorbs everything\n};\n\n/** undefined => illegal pair => DROP (debug log). Never throws. */\nexport function next(s: State, ev: Ev, intent: State): State | undefined {\n  const to = TABLE[s][ev.t];\n  if (!to) return undefined;\n  if (to === FAIL)   return (ev as { permanent: boolean }).permanent ? 'failed' : 'retrying';\n  if (to === INTENT) return intent;\n  return to;\n}",
+      "notes": "Terminal: `closed` only. Quiescent-but-re-enterable: `disabled` (needs `enable`), `failed` (needs `start` = operator reload or a config change), `authRequired` (needs `authResolved` from the OAuth callback). Side effects, keyed by the transition, all live in UpstreamServer.dispatch(): \u2192connecting = epoch++, acquire connect semaphore, build transport, client.connect (permanent errors: ENOENT/EACCES on spawn, DNS NXDOMAIN, SSRF rejection, unresolved ${VAR}, 401 with no authProvider, 404 on the MCP endpoint; everything else transient). \u2192discovering = release semaphore, list tools/prompts/resources/resourceTemplates per advertised capability. \u2192ready = swap the immutable catalog snapshot in one assignment (single-threaded Node: atomic, no lock), clear `stale`, emit server:catalog{changed}. \u2192retrying = keep the existing catalog and set stale=true, schedule full-jitter backoff min(1000*2^attempt, 30000). \u2192failed/disabled/closed = drop the catalog. \u2192stopping = abort the connect AbortController, client.close(), kill(-pid) then SIGKILL at 5s. `refresh` is a ready\u2192ready self-transition guarded by an in-flight flag so concurrent upstream listChanged notifications coalesce; a refresh that fails does NOT leave `ready` unless the transport actually died."
+    },
+    {
+      "name": "Engine",
+      "kind": "class",
+      "sketch": "// packages/core/src/index.ts \u2014 the ONLY object packages/server holds.\nexport class Engine {\n  constructor(opts: EngineOptions);\n  readonly events: Bus<EngineEvents>;\n\n  /** Idempotent full-state diff. The only mutator. Safe to call on every config write. */\n  applyConfig(configs: ServerConfig[]): Promise<void>;\n\n  listTools(scope: ResolvedScope, principal: Principal): Promise<Tool[]>;\n  listPrompts(scope: ResolvedScope, principal: Principal): Promise<Prompt[]>;\n  listResources(scope: ResolvedScope, principal: Principal): Promise<Resource[]>;\n  listResourceTemplates(scope: ResolvedScope, principal: Principal): Promise<ResourceTemplate[]>;\n\n  callTool(req: CallToolReq): Promise<CallToolResult>;\n  getPrompt(req: GetPromptReq): Promise<GetPromptResult>;\n  readResource(req: ReadResourceReq): Promise<ReadResourceResult>;\n\n  /** Everything the dashboard needs. Cheap, synchronous, no upstream I/O. */\n  status(): ServerStatus[];\n  /** Raw per-server catalog for context-cost + embedding sync. Descriptions already overridden. */\n  catalog(serverName: string): ServerCatalog | undefined;\n  /** Operator action: force reconnect of one server (resets the attempt counter). */\n  reload(serverName: string): Promise<void>;\n  shutdown(): Promise<void>;\n}\n\nexport type EngineOptions = {\n  logger: Logger;                                   // pino child, injected\n  connect?: TransportFactory;                       // default: the real one. TEST SEAM.\n  authProviderFor?: (c: ServerConfig) => OAuthClientProvider | undefined;\n  connectConcurrency?: number;                      // default 8\n  defaults?: { connectMs?: number; requestMs?: number; maxConcurrentCalls?: number };\n};\n\nexport type CallToolReq = {\n  scope: ResolvedScope;\n  principal: Principal;\n  name: string;                                     // downstream name, prefixed/aliased/flattened\n  args: Record<string, unknown>;\n  signal?: AbortSignal;                             // client disconnect === cancellation\n  onProgress?: (p: { progress: number; total?: number; message?: string }) => void;\n  deadlineMs?: number;                              // default 60_000\n};",
+      "notes": "`Tool`/`Prompt`/`Resource`/`CallToolResult` are the SDK's own types re-exported verbatim \u2014 no bespoke DTO layer. The only mutation on the way out is the `name` field (namespaced/aliased) and `description` (override applied). packages/server returns them straight into the JSON-RPC result. `signal` is the cancellation primitive because the 2026-07-28 spec makes closing the response stream the only HTTP cancellation mechanism; the SDK's `RequestOptions.signal` maps 1:1 today, so we are already future-shaped for free. `resetTimeoutOnProgress: true` is passed to every call so long-running tools that report progress are not killed by the request timeout."
+    },
+    {
+      "name": "ResolvedScope / Principal",
+      "kind": "type",
+      "sketch": "// packages/core/src/types.ts \u2014 the contract packages/server must satisfy.\nexport type ServerSelection = {\n  serverName: string;\n  alias?: string;                       // renames the server on this route only\n  tools:     'all' | string[];          // BARE upstream names\n  prompts:   'all' | string[];\n  resources: 'all' | string[];\n};\n\nexport type ResolvedScope = {\n  /** Stable memo key. MUST be a pure function of the fields below. server package computes it. */\n  key: string;\n  /** Already authorized. Core does NO authz. An empty array means an empty catalog, never 'all'. */\n  servers: ServerSelection[];\n  /** Single-server route: strip the `<server>__` prefix. Set only when servers.length === 1. */\n  flatten: boolean;\n};\n\nexport type Principal = {\n  id: string;                           // user id, or the api-key owner's user id\n  isAdmin: boolean;\n  /** Present ONLY when this auth path is permitted to use per-user secrets. */\n  credentials?: CredentialResolver;\n};\n\nexport interface CredentialResolver {\n  /** Returns {} when this principal has no binding for this server. Never throws for 'missing'. */\n  resolveHeaders(serverName: string): Promise<Record<string, string>>;\n  /** Opaque, changes when the underlying binding changes. Used as the connection key suffix. */\n  revision(serverName: string): string;\n}",
+      "notes": "Hard rules: (1) core NEVER sees a session id, a cookie, an Authorization header, a URL path or a group name; (2) `servers: []` means an empty catalog \u2014 there is no 'undefined means everything' anywhere, which is the shape of mcphub's `owner === undefined` visible-to-everyone divergence (dataService.ts:6-28 vs DaoConfigService.filterSettingsForUser:171) and of `group.visibility == null` opening the route to any authenticated caller (utils/groupAccess.ts:6); (3) a `credentialMode:'per-user'` server with `principal.credentials === undefined` FAILS the call with `CredentialsRequiredError` \u2014 it never falls back to shared credentials. The `key` is the memo key for the projected catalog and MUST include the alias and allowlist contents, not just the group id, or an allowlist edit will serve a stale tool list."
+    },
+    {
+      "name": "ServerConfig",
+      "kind": "type",
+      "sketch": "// Owned by the persistence subsystem's zod schema; core imports the type only.\nexport type ServerConfig = {\n  name: string;            // ^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$  AND  !name.includes(SEP)\n  enabled: boolean;\n  credentialMode: 'shared' | 'per-user';\n  /** Keys are BARE upstream tool names, normalized at write time. Core rejects any key with SEP. */\n  tools?: Record<string, { enabled?: boolean; description?: string }>;\n  timeouts?: { connectMs?: number; requestMs?: number };\n  maxConcurrentCalls?: number;                                  // default 64\n} & (\n  | { type: 'stdio'; command: string; args?: string[];\n      env?: Record<string, string>; cwd?: string }\n  | { type: 'streamable-http' | 'sse'; url: string;\n      headers?: Record<string, string>;\n      /** Explicit, audited SSRF escape hatch. There is NO owner-based bypass. */\n      allowPrivateNetwork?: boolean }\n);\n\nexport const SEP = '__';   // not configurable. See D6.",
+      "notes": "Note the absence of `type:'openapi'` (D5), of a `startOnDemand` flag (deferred, D15), and of any OAuth token fields \u2014 upstream OAuth tokens are the auth subsystem's problem and reach core only through `EngineOptions.authProviderFor`. mcphub persists upstream access tokens, refresh tokens, client secrets and the PKCE codeVerifier in PLAINTEXT inside the server config blob (oauthSettingsStore.ts:107-129, :107-168); by keeping them out of `ServerConfig` entirely the encryption decision is made once, by the subsystem that owns encryption, and core has nothing to leak."
+    },
+    {
+      "name": "UpstreamServer",
+      "kind": "class",
+      "sketch": "// packages/core/src/upstream-server.ts \u2014 one per (serverName, credential fingerprint).\nexport class UpstreamServer {\n  readonly key: string;           // `${name}` | `${name}#${principalId}:${credRevision}`\n  readonly name: string;\n  readonly configHash: string;    // sha256 of the normalized config; drives the applyConfig diff\n  get state(): State;\n  get catalog(): ServerCatalog | undefined;   // immutable snapshot, swapped atomically\n  get stale(): boolean;           // ready-cache being served while reconnecting (D14)\n  get stderrTail(): readonly string[];        // bounded ring, 200 lines\n\n  start(): void;                                       // fire-and-forget; state -> connecting\n  /** ready -> resolve; failed|disabled|closed -> throw; idle -> start() then wait. */\n  ensureReady(deadlineMs?: number): Promise<void>;\n  stop(intent: 'closed' | 'disabled' | 'idle'): Promise<void>;\n  refresh(): void;                                     // upstream listChanged -> recache\n\n  callTool(bare: string, args: unknown, o: CallOpts): Promise<CallToolResult>;\n  getPrompt(bare: string, args: unknown, o: CallOpts): Promise<GetPromptResult>;\n  readResource(uri: string, o: CallOpts): Promise<ReadResourceResult>;\n\n  /** THE only mutator of `state`. Table-driven, drops illegal pairs, checks epoch. */\n  private dispatch(ev: Ev): void;\n  private epoch = 0;              // identity guard for async continuations (D3)\n}\n\nexport type ServerCatalog = {\n  tools: ReadonlyMap<string, Tool>;               // keyed by BARE name, description already overridden\n  prompts: ReadonlyMap<string, Prompt>;\n  resources: readonly Resource[];\n  resourceTemplates: readonly ResourceTemplate[];\n  capabilities: ServerCapabilities;\n  instructions?: string;\n  fetchedAt: number;\n  namesHash: string;                              // drives server:catalog{changed}\n};",
+      "notes": "stderr capture: `StdioClientTransport({ stderr: 'pipe' })`, piped through `readline.createInterface`, each line emitted as `upstream:log` and appended to a 200-line ring. Bounded on purpose \u2014 mcphub's LogViewer renders an unbounded array. Schema DoS guard: any tool whose `JSON.stringify(inputSchema)` exceeds 256 KB, or whose projected name exceeds 128 chars, is DROPPED at cache time with a `upstream:log` warning surfaced in the UI \u2014 never truncated, because a truncated name collides. Keepalive is ONE shared 30s ticker in the registry pinging every `ready` remote server, not N per-server timers; a failed ping dispatches `transportClose`. mcphub's equivalent is a whole opt-in `keepAliveService` (keepAliveService.ts:17)."
+    },
+    {
+      "name": "ServerRegistry",
+      "kind": "class",
+      "sketch": "// packages/core/src/registry.ts\nexport class ServerRegistry {\n  readonly generation: number;        // ++ per applyConfig\n  readonly catalogVersion: number;    // ++ per applyConfig OR any server:catalog emit\n\n  /** Diff by name + configHash. Unchanged servers are NOT touched. */\n  async applyConfig(configs: ServerConfig[]): Promise<void> {\n    // added    -> new UpstreamServer(...).start()\n    // changed  -> old.stop('closed'); new UpstreamServer(...).start()\n    // removed  -> old.stop('closed'); map.delete()\n    // toggled  -> dispatch({t:'enable'|'disable'})\n    // per-user children of a changed/removed parent are stopped with it\n  }\n\n  /** Lazily materializes the per-user instance for credentialMode:'per-user' servers. */\n  async lease(name: string, principal: Principal): Promise<UpstreamServer>;\n  shared(name: string): UpstreamServer | undefined;   // catalog/discovery always uses this one\n  list(): UpstreamServer[];\n  shutdown(): Promise<void>;\n}\n\n// packages/core/src/semaphore.ts \u2014 40 LOC, gates BOTH startup connects and per-server calls.\nexport class Semaphore {\n  constructor(private n: number);\n  async run<T>(fn: () => Promise<T>, deadlineMs?: number): Promise<T>;  // try/finally release\n}",
+      "notes": "Two counters, two jobs, deliberately not conflated: `generation` invalidates nothing on its own and exists for log correlation and the applyConfig diff; `catalogVersion` is the projected-catalog memo key, bumped by any catalog change including a refresh that did not change the config. mcphub uses one global counter (mcpService.ts:832) for both, which is precisely why they then need `connectStillWanted()` (:2035). Startup concurrency is the Semaphore at size 8 acquired INSIDE `start()` (so boot is non-blocking, like mcphub's startup gate at :786) and released the moment `client.connect` resolves, before discovery \u2014 discovery is cheap and should not hold a connect slot. Hand-rolled at 40 LOC rather than adding `p-limit`; swap it in if we ever need queue priorities. Per-user instances are idle-evicted after 10 min by the same 30s ticker that does keepalive."
+    },
+    {
+      "name": "Catalog projection + resolution",
+      "kind": "type",
+      "sketch": "// packages/core/src/catalog.ts \u2014 the ONLY place a name is built or taken apart.\nexport function label(sel: ServerSelection): string { return sel.alias ?? sel.serverName; }\n\nexport function project(sel: ServerSelection, bare: string, flatten: boolean): string {\n  return flatten ? bare : `${label(sel)}${SEP}${bare}`;\n}\n\n/** THE predicate. Three layers, one function, called by BOTH list and call. */\nexport function isExposed(\n  srv: UpstreamServer,\n  cfg: ServerConfig,\n  sel: ServerSelection,\n  kind: 'tool' | 'prompt' | 'resource',\n  bare: string,\n): boolean {\n  if (!cfg.enabled) return false;                                   // layer 1: server\n  if (kind === 'tool' && cfg.tools?.[bare]?.enabled === false) return false; // layer 2: per-tool\n  const allow = sel[kind === 'tool' ? 'tools' : kind === 'prompt' ? 'prompts' : 'resources'];\n  if (allow !== 'all' && !allow.includes(bare)) return false;       // layer 3: scope allowlist\n  return srv.catalog?.[kind === 'tool' ? 'tools' : 'prompts'].has(bare) ?? false;\n}\n\n/** THE resolver. The ONLY construction site of ToolUnavailableError. */\nexport function resolveTool(\n  scope: ResolvedScope, reg: ServerRegistry, name: string,\n): { sel: ServerSelection; bare: string } {\n  for (const sel of scope.servers) {\n    const bare = scope.flatten\n      ? name\n      : name.startsWith(label(sel) + SEP) ? name.slice(label(sel).length + SEP.length) : null;\n    if (bare === null) continue;\n    const srv = reg.shared(sel.serverName);\n    if (srv && isExposed(srv, srv.config, sel, 'tool', bare)) return { sel, bare };\n  }\n  throw new ToolUnavailableError(name);            // identical text for hidden / missing / disabled\n}\n\n/** Memoized on `${scope.key}:${reg.catalogVersion}`; one Map, one entry per live scope. */\nexport function projectTools(scope: ResolvedScope, reg: ServerRegistry): Tool[];",
+      "notes": "`resolveTool` running the SAME `isExposed` as `projectTools` is the CVE fix (afcc72f) as an invariant rather than a patch \u2014 mcphub needs the filter at mcpService.ts:2620 AND the independent execution gate at :3388. Description overrides are applied once, at cache time inside `ServerCatalog`, so the projected list, the context-cost calculation and the embedding text all see the SAME effective description \u2014 mcphub applies them at list time (:3563) and their embeddings (vectorSearchService.ts:1272) therefore index the unedited upstream text. Because server names are rejected if they contain `__` (D6), the `startsWith(label+SEP)` scan is unambiguous even with aliases; mcphub's `-` separator plus warn-only name validation (:1710) is not. `flatten` is set only when `scope.servers.length === 1`, mirroring mcphub's single-server prefix-strip (:3496) but as an explicit field rather than an inferred branch."
+    },
+    {
+      "name": "EngineEvents",
+      "kind": "type",
+      "sketch": "// packages/core/src/bus.ts\nexport type EngineEvents = {\n  'server:state':   { name: string; key: string; from: State; to: State;\n                      attempt: number; error?: { code: string; message: string };\n                      authorizationUrl?: string };\n  'server:catalog': { name: string; changed: boolean; tools: number; prompts: number;\n                      resources: number; fetchedAt: number };\n  'call:start':     { callId: string; server: string; kind: 'tool'|'prompt'|'resource';\n                      target: string; principalId: string; scopeKey: string;\n                      args: unknown };                       // BY REFERENCE. Do not retain or mutate.\n  'call:end':       { callId: string; ok: boolean; isError: boolean; durationMs: number;\n                      errorCode?: string; result?: unknown };\n  'upstream:log':   { name: string; stream: 'stderr' | 'mcp'; level: string; message: string };\n  'config:applied': { generation: number; added: string[]; changed: string[]; removed: string[] };\n};\n\nexport class Bus<E extends Record<string, unknown>> {\n  on<K extends keyof E>(k: K, fn: (e: E[K]) => void): () => void;   // returns unsubscribe\n  emit<K extends keyof E>(k: K, e: E[K]): void;\n}",
+      "notes": "~45 LOC wrapping Node's EventEmitter with declaration merging. One bus on the Engine, never one per server (D10). Subscriber contract, stated once and enforced by review: handlers are synchronous and non-blocking \u2014 EventEmitter dispatch is synchronous, so a subscriber that awaits a DB write or a slow SSE socket stalls the call path. The observability subsystem writes into a bounded in-memory ring and flushes on its own timer; the HTTP push layer does the same. `args`/`result` travel by reference so the zero-subscriber and payload-logging-off paths cost nothing; the observability layer decides whether to serialize and truncate (mcphub stores payloads verbatim by design, activityLoggingService.ts:112-118, with a 100 KB truncation at :142 \u2014 that policy is theirs to keep, ours to locate outside the engine). `changed` on `server:catalog` is computed from `namesHash` so a no-op refresh does not cause a downstream listChanged storm."
+    },
+    {
+      "name": "Errors",
+      "kind": "class",
+      "sketch": "// packages/core/src/errors.ts \u2014 every error crossing the core boundary is one of these.\nexport class ToolUnavailableError extends Error {\n  readonly code = 'TOOL_UNAVAILABLE';\n  constructor(name: string) { super(`Tool not found: ${name}`); }   // ONE template string, ONE site\n}\nexport class UpstreamUnavailableError extends Error {   // server failed/disabled/deadline exceeded\n  readonly code = 'UPSTREAM_UNAVAILABLE';\n  constructor(readonly server: string, readonly state: State, cause?: Error);\n}\nexport class UpstreamAuthRequiredError extends Error {\n  readonly code = 'UPSTREAM_AUTH_REQUIRED';\n  constructor(readonly server: string, readonly authorizationUrl?: string);\n}\nexport class CredentialsRequiredError extends Error { readonly code = 'CREDENTIALS_REQUIRED'; }\nexport class UpstreamBusyError extends Error { readonly code = 'UPSTREAM_BUSY'; }\nexport class PayloadTooLargeError extends Error { readonly code = 'PAYLOAD_TOO_LARGE'; }\nexport class UnsafeUrlError extends Error { readonly code = 'UNSAFE_URL'; }\n\n/** Applied to EVERY error leaving core. Strips any resolved credential value verbatim. */\nexport function redact(err: Error, secrets: readonly string[]): Error;",
+      "notes": "Core throws typed errors with a string `code`; the JSON-RPC number mapping is packages/server's job \u2014 core has no opinion about -32602 vs -32000 because core has no protocol. `ToolUnavailableError`'s message is built from one template literal at one call site, and a unit test greps the built bundle to assert no other construction site exists, so 'hidden tool' and 'nonexistent tool' cannot diverge (mcphub's `ToolUnavailableError`, mcpService.ts:2654, has the right behaviour but is constructed from several places). `redact` runs on the way out of `callTool` against the exact strings returned by `CredentialResolver.resolveHeaders` for this call, so an upstream that echoes a bearer token in its error body does not leak it into the activity log."
+    },
+    {
+      "name": "TransportFactory",
+      "kind": "type",
+      "sketch": "// packages/core/src/transport.ts\nexport type TransportFactory = (\n  cfg: ServerConfig,\n  ctx: { headers: Record<string, string>;         // config headers + resolved per-user headers\n         authProvider?: OAuthClientProvider;\n         signal: AbortSignal;                     // aborted on stop() mid-connect\n         onStderr: (line: string) => void },\n) => Promise<Transport>;                          // SDK Transport, nothing narrower\n\nexport const createTransport: TransportFactory = async (cfg, ctx) => {\n  switch (cfg.type) {\n    case 'stdio':\n      return new StdioClientTransport({\n        command: cfg.command, args: expandAll(cfg.args ?? []),   // shell:false => expansion is inert\n        env: { ...augmentPath(getDefaultEnvironment()), ...expandEnv(cfg.env) },\n        cwd: cfg.cwd, stderr: 'pipe',\n      });                                          // + detached:true, kill(-pid) on teardown\n    case 'streamable-http':\n      await assertSafeUrl(cfg.url, cfg.allowPrivateNetwork);\n      return new StreamableHTTPClientTransport(new URL(cfg.url), {\n        requestInit: { headers: ctx.headers }, authProvider: ctx.authProvider,\n        fetch: guardedFetch(cfg.allowPrivateNetwork),            // validates EVERY redirect hop\n      });\n    case 'sse':\n      await assertSafeUrl(cfg.url, cfg.allowPrivateNetwork);\n      return new SSEClientTransport(new URL(cfg.url), {\n        requestInit: { headers: ctx.headers }, authProvider: ctx.authProvider,\n        fetch: guardedFetch(cfg.allowPrivateNetwork),\n      });\n  }\n};\n\n// packages/core/src/ssrf.ts\nexport async function assertSafeUrl(url: string, allowPrivate?: boolean): Promise<void>;\nexport function guardedFetch(allowPrivate?: boolean): typeof fetch;  // redirect:'manual', max 5 hops",
+      "notes": "Returning the SDK's own `Transport` (not a bespoke interface) is what makes OpenAPI-as-MCP a zero-core-change addition: packages/server composes `cfg.type === 'openapi' ? openapiTransport(cfg) : createTransport(cfg)` where `openapiTransport` builds an in-process `McpServer` from the dereferenced spec and returns one half of `InMemoryTransport.createLinkedPair()`. `assertSafeUrl` blocks loopback, link-local (169.254/16, fe80::/10), RFC1918, CGNAT 100.64/10, IPv4-mapped IPv6 and `.local`, resolving the hostname first via `dns.lookup` with `all:true`. ponytail: a DNS-rebinding TOCTOU window remains between validation and connect; upgrade path is pinning the validated IP through a custom `lookup` on an undici Agent \u2014 ~30 LOC, add when we accept untrusted (non-admin) server URLs. VERIFY BEFORE IMPLEMENTING: the `fetch` option on both HTTP client transports exists in SDK 1.30.0 (I could not reach npm from this sandbox). If it does not, the fallback is an undici Agent with `maxRedirections: 0` plus our own hop loop \u2014 same 120 LOC, different seam."
+    },
+    {
+      "name": "Test seam",
+      "kind": "component",
+      "sketch": "// packages/core/test/fake-upstream.ts \u2014 ~100 LOC. No child processes, no ports, no HTTP.\nimport { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';\nimport { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';\n\nexport function fakeUpstream(spec: {\n  tools?: Record<string, { description?: string; schema?: ZodRawShape;\n                           handler?: (a: unknown) => unknown }>;\n  delayConnectMs?: number;    // drives the generation/identity-guard test\n  failConnect?: 'permanent' | 'transient' | false;\n  authChallenge?: boolean;\n  closeAfterMs?: number;      // drives the reconnect/backoff test\n}): { factory: TransportFactory; server: McpServer;\n      emitListChanged(): void; drop(): void; connects: number };\n\n// Usage: a REAL SDK Client speaking REAL JSON-RPC to a REAL SDK Server, in-process, sub-ms.\nconst up = fakeUpstream({ tools: { search: {} }, delayConnectMs: 500 });\nconst engine = new Engine({ logger, connect: up.factory });\nawait engine.applyConfig([cfgA]);\nawait engine.applyConfig([{ ...cfgA, url: 'https://other' }]);   // supersede mid-connect\nvi.advanceTimersByTime(600);\nexpect(engine.status()[0].generation).toBe(2);\nexpect(up.connects).toBe(2);\nexpect(orphanTransportsClosed).toBe(1);        // epoch guard closed the superseded connect",
+      "notes": "Four seams, in descending order of how much they buy: (1) `EngineOptions.connect` injection over `InMemoryTransport.createLinkedPair()` \u2014 real protocol, real serialization, real capability negotiation, zero processes; this is the default for every engine test. (2) `state.ts` is pure, so the whole transition table is one table-driven test with no engine instance at all \u2014 every legal pair asserted, every illegal pair asserted to be dropped. (3) `vi.useFakeTimers()` for backoff and idle eviction; no injected Clock abstraction, because vitest already owns time. (4) ONE integration test spawns a real stdio child using `node -e` as the command, to cover PATH augmentation, stderr piping and process-group kill \u2014 the only place a real process appears, and it needs no testcontainers because Postgres is not core's concern. mcphub's engine has no equivalent seam, which is why their Postgres integration job is disabled and their stdio paths are only exercised end-to-end."
+    },
+    {
+      "name": "Core env vars",
+      "kind": "env",
+      "sketch": "MCPROUTER_CONNECT_CONCURRENCY=8        # startup + reconnect semaphore width\nMCPROUTER_CONNECT_TIMEOUT_MS=30000     # per attempt, overridable per server\nMCPROUTER_REQUEST_TIMEOUT_MS=60000     # per tools/call, resetTimeoutOnProgress=true\nMCPROUTER_RETRY_MAX_MS=30000           # backoff ceiling; base 1000, full jitter\nMCPROUTER_RETRY_MAX_ATTEMPTS=0         # 0 = never give up on transient errors\nMCPROUTER_MAX_CONCURRENT_CALLS=64      # per upstream server\nMCPROUTER_MAX_ARG_BYTES=1048576        # 1 MB inbound tool arguments\nMCPROUTER_MAX_SCHEMA_BYTES=262144      # 256 KB per tool inputSchema at cache time\nMCPROUTER_PER_USER_IDLE_MS=600000      # per-principal connection eviction\n# NOT configurable, deliberately: the namespace separator (D6).",
+      "notes": "No `MCPROUTER_NAME_SEPARATOR` (D6). No `enableSessionRebuild` equivalent \u2014 core has no sessions to rebuild (mcphub sseService.ts:105 rehydrates private SDK internals to survive restarts, which is brittle across SDK versions and is debt the 2026-07-28 spec is itself deleting). No SSRF bypass env var; the escape hatch is per-server and audited."
+    }
+  ],
+  "files": [
+    {
+      "path": "packages/core/src/types.ts",
+      "purpose": "ServerConfig, ResolvedScope, ServerSelection, Principal, CredentialResolver, ServerCatalog, ServerStatus, CallOpts, SEP. Re-exports the SDK's Tool/Prompt/Resource types so nothing downstream invents a DTO.",
+      "loc": 150
+    },
+    {
+      "path": "packages/core/src/errors.ts",
+      "purpose": "The seven typed errors that may cross the core boundary, plus redact(). ToolUnavailableError's message is built at exactly one site.",
+      "loc": 60
+    },
+    {
+      "path": "packages/core/src/bus.ts",
+      "purpose": "Typed facade over Node's EventEmitter: on() returns an unsubscribe closure, emit() is key-checked. One bus per Engine.",
+      "loc": 45
+    },
+    {
+      "path": "packages/core/src/state.ts",
+      "purpose": "The transition table and next(). Pure, no imports beyond types. The entire connection lifecycle, unit-testable without an engine.",
+      "loc": 110
+    },
+    {
+      "path": "packages/core/src/upstream-server.ts",
+      "purpose": "UpstreamServer: dispatch(), start/stop/ensureReady/refresh, epoch guard, transport wiring, discovery, catalog snapshot swap, backoff timer, stderr ring, per-server call semaphore.",
+      "loc": 330
+    },
+    {
+      "path": "packages/core/src/registry.ts",
+      "purpose": "ServerRegistry: applyConfig diff by configHash, generation + catalogVersion counters, per-principal lease()/eviction, the shared 30s keepalive+eviction ticker, shutdown.",
+      "loc": 210
+    },
+    {
+      "path": "packages/core/src/semaphore.ts",
+      "purpose": "40-line counting semaphore with try/finally release and an optional acquisition deadline. Used for startup concurrency and per-server call caps.",
+      "loc": 40
+    },
+    {
+      "path": "packages/core/src/transport.ts",
+      "purpose": "createTransport for stdio/streamable-http/sse, ${VAR} expansion (fail-closed), PATH augmentation, detached spawn + process-group kill, stderr line reader.",
+      "loc": 190
+    },
+    {
+      "path": "packages/core/src/ssrf.ts",
+      "purpose": "assertSafeUrl (DNS resolve + private/loopback/link-local/CGNAT/IPv4-mapped rejection) and guardedFetch (redirect:'manual', re-validate every hop, max 5).",
+      "loc": 120
+    },
+    {
+      "path": "packages/core/src/catalog.ts",
+      "purpose": "label/project/isExposed/resolveTool plus projectTools/Prompts/Resources and the scope memo keyed on scope.key + catalogVersion. The only place a name is built or parsed.",
+      "loc": 230
+    },
+    {
+      "path": "packages/core/src/call.ts",
+      "purpose": "callTool/getPrompt/readResource: resolve, ensureReady, credential resolution, arg size cap, concurrency semaphore, AbortSignal + onProgress passthrough, never-double-execute retry, call:start/end emission, redact on the way out.",
+      "loc": 170
+    },
+    {
+      "path": "packages/core/src/index.ts",
+      "purpose": "The Engine facade: composes registry + catalog + call, exposes applyConfig/list*/call*/status/catalog/reload/shutdown and re-exports the public types and errors.",
+      "loc": 115
+    },
+    {
+      "path": "packages/core/test/fake-upstream.ts",
+      "purpose": "InMemoryTransport-backed fake: a real McpServer with knobs for delayed connect, permanent/transient failure, auth challenge, mid-life close and listChanged.",
+      "loc": 100
+    },
+    {
+      "path": "packages/core/test/state.test.ts",
+      "purpose": "Table-driven: every legal (state,event) pair asserted, every illegal pair asserted dropped, terminal-state absorption, stopping\u2192intent landing.",
+      "loc": 90
+    },
+    {
+      "path": "packages/core/test/registry.test.ts",
+      "purpose": "applyConfig add/change/remove/toggle without restart, unchanged servers untouched, startup concurrency bound, superseded-connect epoch guard, backoff with fake timers, per-principal lease + eviction.",
+      "loc": 170
+    },
+    {
+      "path": "packages/core/test/catalog.test.ts",
+      "purpose": "Namespacing, alias substitution, flatten, reverse resolution, all three filter layers at list AND call, identical error text for hidden vs missing vs disabled, memo invalidation on refresh.",
+      "loc": 150
+    },
+    {
+      "path": "packages/core/test/call.test.ts",
+      "purpose": "Never-retry-a-delivered-call, retry-once-on-never-delivered, AbortSignal cancellation, arg size cap, concurrency cap, credential fail-closed, redaction of resolved secrets in errors.",
+      "loc": 130
+    },
+    {
+      "path": "packages/core/test/stdio.integration.test.ts",
+      "purpose": "The only real child process: node -e upstream covering PATH augmentation, stderr capture and process-group kill (assert no orphan after stop).",
+      "loc": 90
+    },
+    {
+      "path": "packages/core/package.json + tsconfig.json",
+      "purpose": "ESM, exports map, deps: @modelcontextprotocol/sdk 1.30.0 only. No runtime dep beyond the SDK and Node stdlib.",
+      "loc": 30
+    }
+  ],
+  "security": [
+    "Upstream URL (operator-supplied, but operators phish too and a marketplace install is semi-trusted) \u2192 assertSafeUrl at connect time AND guardedFetch re-validating every redirect hop, max 5. NO owner-based bypass; the escape hatch is an explicit per-server allowPrivateNetwork:true, logged on every connect and shown in the UI. Contrast mcphub mcpService.ts:1382-1396, where the guard is bypassed for admin-owned servers \u2014 which in a team self-host is every server.",
+    "Child process spawn (operator-supplied command/args) \u2192 spawn with shell:false, always, never a string-concatenated command line. ${VAR} expansion is therefore inert even if a variable contains shell metacharacters, because an expanded value is one argv element. An UNRESOLVED ${VAR} sends the server to `failed` with a named error instead of expanding to empty string \u2014 a server must never connect with a silently blank credential. Children are detached so teardown kills the whole process group.",
+    "Downstream tool/prompt/resource name (client-supplied, possibly from a compromised or curious client) \u2192 the single resolveTool() gate, running the same isExposed() as the list path. Enforcement at CALL time is not a second check, it is the same check (mcphub's CVE afcc72f). Identical `Tool not found: <name>` for hidden, disabled, out-of-group and nonexistent, constructed at one site, so the error text is not an enumeration oracle for a group's private servers. Names are never used to build a path, a SQL fragment or a shell argument.",
+    "Tool arguments (client-supplied) \u2192 size-capped at 1 MB before they reach the upstream (PayloadTooLargeError), and NOT logged by core. Core does not validate them against the tool schema \u2014 the upstream owns its schema and re-validating is duplicated truth \u2014 but the size cap and the per-server 64-call concurrency cap together stop one client from exhausting an upstream.",
+    "Upstream response content (tool results, tool names, descriptions, schemas \u2014 untrusted: a marketplace server is third-party code) \u2192 never eval'd, never interpolated into a command. inputSchema capped at 256 KB and the tool DROPPED (not truncated) above it, because a 10 MB schema is a DoS on every tools/list for every client. Projected names over 128 chars are dropped, not truncated, because truncation causes collisions. Descriptions are text: core states the contract that packages/web must render them escaped, since a description is a prompt-injection surface aimed at the operator's own LLM.",
+    "Per-user credentials \u2192 core never decrypts, never stores and never logs them; it calls CredentialResolver.resolveHeaders() and holds the values only for the lifetime of one connection. A credentialMode:'per-user' server with principal.credentials === undefined FAILS the call (CredentialsRequiredError) rather than falling back to the shared connection \u2014 fail-closed, inverting mcphub's credentialEligible:false being the only thing keeping per-user secrets out of API-key sessions (credentialBindingService.ts). Every error leaving callTool passes through redact() against that call's resolved secret values, so an upstream echoing a bearer token in an error body does not leak it into the activity log.",
+    "Config\u2192engine boundary \u2192 applyConfig() re-validates what it can cheaply prove even though persistence already ran zod: server name matches the regex and does not contain SEP, no tool-override key contains SEP, no duplicate names. Rejecting here means a direct DB write or a bad migration cannot smuggle an aliasing server name into the namespace (mcphub only WARNS on bad names, mcpService.ts:1710).",
+    "Event bus \u2192 payloads cross into observability by reference with a documented no-retain contract, and core emits no credential values, no Authorization headers and no raw env in any event. The decision to persist tool arguments and results is made entirely outside core, so turning payload logging on is one subsystem's explicit choice rather than an engine default."
+  ],
+  "deferred": [
+    {
+      "item": "On-demand / sleeping stdio servers with idle shutdown. The `idle` state and `ensureReady()` ship in v1 because reconnects and boot races need them anyway; what is deferred is the idle timer, the `startOnDemand` config flag, and \u2014 the actually expensive part \u2014 persisting a catalog so a sleeping server can still be LISTED without being connected.",
+      "add_when": "A deployment reports more than ~20 stdio servers, or idle child-process RSS exceeds 2 GB, or someone asks to run a 50-server catalog on a 4 GB box. Cost when it lands: ~80 LOC in upstream-server.ts plus one catalog table, and zero change to the state machine."
+    },
+    {
+      "item": "OpenAPI-as-MCP upstreams (`type:'openapi'`). Not in the MVP list (Context Cost, Observability, Smart Routing, Marketplace are), and it is the single largest surface in mcphub's engine.",
+      "add_when": "A user needs to expose a REST API as tools. Lands as an in-process McpServer over InMemoryTransport in packages/server \u2014 zero core changes, because the TransportFactory already returns an SDK Transport. Budget ~350 LOC for spec dereference, security-scheme mapping and SSRF'd fetch, all of it reusing core's guardedFetch."
+    },
+    {
+      "item": "Per-user credentials for stdio servers (a child process per principal). v1 does remote servers only.",
+      "add_when": "The first server that needs it lands \u2014 realistically github-mcp-server via npx with a per-user PAT. Ceiling today: a per-user stdio server will use the admin's credentials, so the config layer must REFUSE credentialMode:'per-user' on type:'stdio' until this ships, rather than silently doing the wrong thing. Cost: ~120 LOC of process-per-(server,principal) caching, i.e. a much smaller principalRuntimeService."
+    },
+    {
+      "item": "Per-user catalogs. Discovery always runs with the admin's credentials, so a server whose TOOL LIST (not just its data) varies by credential shows the admin's list to everyone.",
+      "add_when": "A real server is found whose tools/list depends on the caller's token. Until then this is a hypothetical, and per-user discovery would multiply both connection count and embedding sets."
+    },
+    {
+      "item": "Resource subscriptions (`resources/subscribe` passthrough to upstream, and `notifications/resources/updated` fan-out).",
+      "add_when": "A downstream client actually subscribes. The 2026-07-28 spec reshapes long-lived notifications into `subscriptions/listen`, so building the 2025-11-25 version now buys debt we would delete."
+    },
+    {
+      "item": "Upstream sampling / elicitation / roots (server\u2192client requests). The 2026-07-28 spec replaces these with MRTR (SEP-2322): the server returns an InputRequiredResult and the client retries with inputResponses.",
+      "add_when": "The SDK ships MRTR. Implementing the 2025-11-25 bidirectional form means core must know about a downstream client identity, which directly violates the no-sessions rule \u2014 so waiting is strictly cheaper than building and deleting."
+    },
+    {
+      "item": "proxychains4 wrapping of stdio children (mcphub mcpService.ts:263) and npm/uv registry injection beyond passing through existing env vars.",
+      "add_when": "Someone deploys behind an egress proxy that cannot be configured with HTTPS_PROXY. ~20 LOC."
+    },
+    {
+      "item": "Per-scope catalog memo eviction. v1 keeps one Map entry per live scope key, invalidated by catalogVersion.",
+      "add_when": "Scope keys become unbounded \u2014 i.e. when per-user scopes multiply past a few hundred. Today scopes are bounded by (groups \u00d7 users) in a single team, so a plain Map is correct and an LRU is speculative."
+    },
+    {
+      "item": "Prometheus histograms and OTel spans inside core. Core emits call:start/call:end and server:state; the observability subsystem owns prom-client and @opentelemetry/sdk-node.",
+      "add_when": "Never, in core. If a metric needs data core does not emit, add the field to the event \u2014 not the metric to the engine."
+    }
+  ],
+  "risks": [
+    "UNVERIFIED SDK ASSUMPTIONS \u2014 I could not reach npm from this sandbox and mcphub's node_modules is not installed, so three claims are from knowledge, not inspection: (a) `@modelcontextprotocol/sdk/inMemory.js` exports `InMemoryTransport.createLinkedPair()`; (b) `StreamableHTTPClientTransport`/`SSEClientTransport` options accept a `fetch` override; (c) `StdioClientTransport` accepts `stderr:'pipe'` and exports `getDefaultEnvironment()`. (a) is load-bearing for the entire test seam and for the OpenAPI plan; (b) is load-bearing for per-redirect SSRF validation. FIRST TASK of implementation is a 10-minute spike asserting all three against the installed 1.30.0. If (a) is wrong, fall back to a hand-written pair of linked Transports (~50 LOC, still no processes). If (b) is wrong, use an undici Agent with maxRedirections:0 plus our own hop loop \u2014 same 120 LOC in ssrf.ts, different injection point.",
+    "Serving a stale catalog during reconnect (D14) means a tool can be listed that no longer exists upstream, so the call fails with an upstream error rather than ToolUnavailableError. That is honest but it does change the error surface; the UI must show the amber `stale` state or operators will read it as a broken tool.",
+    "Per-user remote connections fan out: 20 users \u00d7 5 per-user servers = 100 upstream connections. The 10-minute idle eviction bounds it in practice, but a burst of first-time users all hitting the same server at once will queue behind the size-8 connect semaphore. Mitigation if it bites: a separate, wider semaphore for per-user leases than for startup.",
+    "EventEmitter dispatch is synchronous, so a subscriber that blocks stalls a tool call. This is a contract enforced by review, not by the type system. If it is violated in practice, the fix is one `queueMicrotask` in Bus.emit \u2014 but that reorders events relative to state changes, so do it deliberately, not reflexively.",
+    "The fixed `__` separator (D6) is a one-way door once clients have cached tool names. If a client is found whose tool-name regex rejects `__`, changing it is a const edit plus a rename that breaks every saved client config. The mitigation is cheap and should ship: a boot-time assertion that no server name contains `__`, with a clear refuse-to-start message naming the offender.",
+    "Dropping oversized tools (schema > 256 KB, projected name > 128 chars) is correct but silent to a client \u2014 the tool simply is not there. The `upstream:log` warning MUST be surfaced in the server detail panel, or an operator will debug a missing tool for an hour. This is a real dependency on the web subsystem, not a nice-to-have.",
+    "A DNS-rebinding TOCTOU window remains between assertSafeUrl and the actual connect (ponytail: documented ceiling). Acceptable while server URLs are admin-supplied; it must be closed before any non-admin or marketplace-driven URL reaches createTransport.",
+    "Splitting UpstreamServer per credential fingerprint keeps one state machine (good) but means `status()` must aggregate: the dashboard should show ONE row per configured server with a per-user connection count, not N rows. If that aggregation is skipped, a 20-user deployment renders 100 status rows and the operator UI \u2014 our main differentiator \u2014 looks worse than mcphub's."
+  ]
+}

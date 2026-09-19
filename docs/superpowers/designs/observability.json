@@ -1,0 +1,356 @@
+{
+  "decisions": [
+    {
+      "id": "OBS-1",
+      "decision": "There is exactly ONE correlation identifier, `requestId`, and it is a valid W3C trace-id (32 lowercase hex chars). When OTel is enabled the edge adopts `trace.getActiveSpan().spanContext().traceId` as the requestId; when OTel is off it is `randomBytes(16).toString('hex')`. The same 32 chars appear in every log line, the `x-request-id` response header, the metric exemplar `trace_id`, the `audit_event.request_id` column, the JSON-RPC `error.data.requestId` returned to the MCP client, and as a mono chip on every UI row.",
+      "rationale": "A separate requestId and traceId means every join is two-keyed and one of them is always missing. Making them the same value costs one conditional at the edge and deletes the whole class of 'I have the log line but not the trace' problems. Returning it in the JSON-RPC error means a user of Claude Code can paste an id at the operator, who pastes it into one search box.",
+      "cost": "~15 LOC in core/obs/context.ts",
+      "mcphub_contrast": "mcphub has neither. No request ID anywhere, no tracing, and the activity row cannot be joined to a log line because the logs are a console monkey-patch with no structured fields (logService.ts:70,115-153). Their docs punt to an external APM, which cannot correlate either because nothing emits an id."
+    },
+    {
+      "id": "OBS-2",
+      "decision": "Propagation is `AsyncLocalStorage` from `node:async_hooks`, owned by `packages/core/src/obs/context.ts`. `packages/server` calls `runWithContext(ctx, handler)` as the outermost middleware; core reads `currentContext()`. Only `.run()` is ever used \u2014 `.enterWith()` is banned by an eslint `no-restricted-properties` rule. The store object is mutable in place so the auth middleware can set `ctx.principal` after the run has begun, and there is exactly one writer per field.",
+      "rationale": "Rung 3 of the ladder: stdlib already does context propagation. The engine never imports the HTTP layer because the dependency arrow points the other way \u2014 core owns the ALS, server imports it. Core APIs stay 'given a resolved scope and principal, do X'; the context is ambient telemetry, never an argument the engine's signatures depend on.",
+      "cost": "~60 LOC",
+      "mcphub_contrast": "mcphub uses AsyncLocalStorage for the principal but ships an `enterWith` fallback (userContextService.ts:28,38) that can leak a principal across async boundaries \u2014 a cross-user authorization bug wearing a telemetry costume. Same primitive, one banned method, bug gone."
+    },
+    {
+      "id": "OBS-3",
+      "decision": "Correlation reaches log lines through pino's `mixin` option, not through `log.child()` plumbing. The root logger's mixin reads the ALS and injects `{req, usr, key, scope, srv}` into every line. No call site in core or server ever passes a correlation field by hand.",
+      "rationale": "One function on the logger config replaces threading a child logger through every engine signature. If the mixin is the only path, it cannot be forgotten, and engine code can keep calling the module-level `log` like it is 2015.",
+      "cost": "~8 LOC inside core/obs/log.ts",
+      "mcphub_contrast": "mcphub monkey-patches global `console.*` and scrapes the formatted string for a `[server]` prefix (logService.ts:115-153). Every log line is unstructured text, so the log view filters by substring and nothing can be grouped."
+    },
+    {
+      "id": "OBS-4",
+      "decision": "Secrets are kept out of logs by pino `serializers` on domain objects, not by regex scrubbing and not mainly by `redact` paths. `serializers.server = redactServerConfig` returns `{name,type,url,command,envKeys:string[],headerKeys:string[]}` \u2014 key names only, never values \u2014 so even a careless `log.info({server: cfg})` is safe. `redact` covers the fixed HTTP header paths (`*.authorization`, `*.cookie`, `*.[\"x-api-key\"]`, `*.accessToken`, `*.refreshToken`, `*.clientSecret`). Tool arguments and tool results are NEVER logged at any level \u2014 a log line gets `inBytes`, `outBytes` and `inHash` (sha256 first 16 hex).",
+      "rationale": "`redact` is path-based and silently misses a secret that arrives under an unexpected key. A serializer is type-directed: it is impossible to log the object without it running. And hashing arguments instead of logging them gives you 'these 400 failures are all the same call' without holding one byte of customer data.",
+      "cost": "~35 LOC (serializer + hash helper)",
+      "mcphub_contrast": "mcphub stores `env` and `headers` in plaintext in mcp_settings.json and JSON columns, and OAuth access/refresh tokens plaintext (oauthSettingsStore.ts:107-129). There is no log redaction at all; anything a `console.log` touches lands in the ring and streams to the browser."
+    },
+    {
+      "id": "OBS-5",
+      "decision": "The dashboard's live log view is fed by a SECOND pino destination: `pino.multistream([{stream: process.stdout}, {stream: ring, level: 'debug'}])`, where `ring` is a bounded 2000-entry array of parsed records with cursor-based subscribers. `GET /api/logs/stream` (Hono `streamSSE`) hands each subscriber a cursor into the ring; a slow client that falls behind the oldest entry gets one `{evt:'logs.dropped', n}` frame and jumps forward. There are no per-subscriber buffers and there is no monkey-patch.",
+      "rationale": "The ring IS the queue; subscriber backpressure is a cursor comparison, which is the entire slow-consumer story for free. Writing to a Writable is pino's documented extension point, so we get the identical JSON the operator sees in `docker logs`, not a parallel reality.",
+      "cost": "~95 LOC for ring.ts, ~95 for the route",
+      "mcphub_contrast": "mcphub monkey-patches `console.*` into a 1000-entry ring (logService.ts:70), streams it at `/api/logs/stream` with the JWT IN THE QUERY STRING (frontend services/logService.ts:82), has no server-side level filter, and LogViewer renders every entry from an unbounded array. We use the better-auth session cookie \u2014 EventSource sends cookies automatically, so the token never enters a URL, and we keep a hard cap of 20 concurrent subscribers."
+    },
+    {
+      "id": "OBS-6",
+      "decision": "Default log sink is stdout NDJSON and nothing else. `pino-roll` is wired only when `LOG_FILE` is set (bare-metal/systemd self-host): daily rotation, `size:'50m'`, `limit:{count:14}`, `mkdir:true`. Dev uses the `pino-pretty` transport target, a devDependency, selected by `NODE_ENV!=='production'`.",
+      "rationale": "Rung 1: does file rotation need to exist? In Docker and k8s, no \u2014 the json-file driver and the kubelet already rotate and retain. Shipping our own rotation by default would be re-implementing the platform. One env var covers the minority who run bare node.",
+      "cost": "~20 LOC",
+      "mcphub_contrast": "mcphub has no file sink, no rotation and no retention at all \u2014 logs exist only in the 1000-entry ring and vanish on restart. We keep the container path free and give the bare-metal path a real answer."
+    },
+    {
+      "id": "OBS-7",
+      "decision": "OpenTelemetry is OPT-IN, configured entirely by the standard `OTEL_*` env vars, enabled iff `OTEL_EXPORTER_OTLP_ENDPOINT` (or the traces-specific variant) is set. Bootstrap is an unconditional `node --import ./otel-bootstrap.mjs dist/index.js` whose first line is `if (!endpoint) return;`. We do NOT install `@opentelemetry/auto-instrumentations-node`. We install exactly three: `instrumentation-http`, `instrumentation-pg`, `instrumentation-undici`. Traces only \u2014 no OTel metrics pipeline, no OTel logs pipeline. `packages/core` depends on `@opentelemetry/api` ONLY (a no-op without an SDK); `@opentelemetry/sdk-node` is a `packages/server` dependency.",
+      "rationale": "auto-instrumentations-node pulls ~40 instrumentation packages to give us three things we actually want. Naming those three is a smaller dependency tree, a faster boot, and an audit surface a human can read. Everything MCP-specific \u2014 tool call, upstream connect, vector search \u2014 no instrumentation could ever know, so it is hand-written regardless. One signal per tool: Prometheus owns metrics, pino owns logs, OTel owns traces, and none of them half-owns another.",
+      "cost": "~45 LOC bootstrap, ~70 LOC withSpan helper + attribute constants",
+      "mcphub_contrast": "mcphub has no OpenTelemetry, no tracing and no request-ID correlation; their docs admit it and defer to an external APM that has nothing to consume. The contrast here is not 'we added OTel', it is 'we added the 5% of OTel that answers a question'."
+    },
+    {
+      "id": "OBS-8",
+      "decision": "Cardinality rule, enforced mechanically: never multiply two medium-cardinality dimensions inside one metric. `tool` appears as a label on COUNTERS only (`mcprouter_tool_calls_total{server,tool,outcome}`), never on a histogram. Caller identity appears in a SEPARATE counter (`mcprouter_client_calls_total{client,outcome}`, where `client` is the better-auth apiKey id \u2014 admin-created, bounded \u2014 never the client-supplied `clientInfo.name`). Per-(tool \u00d7 client \u00d7 latency) detail lives in Postgres. The `tool` label value is typed: `recordToolCall(ref: ResolvedTool | null, ...)` takes a branded resolved-tool object, and a `null` ref records `tool=\"__unknown__\"` \u2014 so a client hammering nonexistent tool names cannot mint series.",
+      "rationale": "The trap is not the tool label per se, it is (a) unbounded input reaching a label and (b) crossing tool \u00d7 client \u00d7 bucket. 1200 tools on a counter is 3600 series and fine; 1200 tools on a 13-bucket histogram is 45k and not. Types do the enforcing so nobody has to remember the rule.",
+      "cost": "~25 LOC of typing inside metrics.ts",
+      "mcphub_contrast": "mcphub has no /metrics endpoint at all, so it has no cardinality policy to get wrong \u2014 and no way to alert on anything. This is the differentiator: a metrics surface designed by someone who has been paged by a cardinality explosion."
+    },
+    {
+      "id": "OBS-9",
+      "decision": "Metric exemplars carry the trace id natively via prom-client 15's `enableExemplars`, on `mcprouter_tool_call_duration_seconds` and `mcprouter_tool_calls_total` only. `/metrics` negotiates: if the scrape `Accept` header contains `application/openmetrics-text`, the registry serializes with `Registry.OPENMETRICS_CONTENT_TYPE` and exemplars are included; otherwise plain Prometheus text.",
+      "rationale": "Rung 5 \u2014 the installed dependency already does exemplars, we just pass `exemplarLabels:{trace_id: ctx.requestId}` from the ALS. Content negotiation is four lines and means a scraper that does not understand OpenMetrics is not broken by us.",
+      "cost": "~12 LOC",
+      "mcphub_contrast": "N/A \u2014 mcphub emits no metrics. Worth stating because 'click the latency spike, land in the trace' is the single feature that makes a metrics page worth opening."
+    },
+    {
+      "id": "OBS-10",
+      "decision": "Audit payload policy has three modes \u2014 `off` | `metadata` (DEFAULT) | `full` \u2014 settable globally and overridable per server. `metadata` stores argument KEY NAMES (`input_keys text[]`), byte counts and hashes, never values. `full` stores input and output VERBATIM with no heuristic scrubbing (we AGREE with mcphub that a regex redactor is false confidence), capped at 64 KB each with a `{\"__truncated\":true,\"bytes\":N}` marker. We DISAGREE with mcphub on the default: verbatim-on-by-default turns the audit table into the highest-value target in the deployment. `full` is made survivable by three separate controls: payload columns are nulled at `AUDIT_PAYLOAD_RETENTION_DAYS` (default 7) while metadata rows live to `AUDIT_RETENTION_DAYS` (default 90); reading a payload requires the distinct `audit:payload:read` permission; and every payload read writes its own audit row (`evt:'audit.payload.read'`). Calls that used a per-user credential binding are metadata-only ALWAYS, with no override.",
+      "rationale": "mcphub's reasoning is right and their conclusion is wrong. Heuristic redaction does miss the secret in a field called `q` and does mangle real data \u2014 so do not redact. But 'therefore store everything forever by default' does not follow. Default to the mode that answers 95% of audit questions (who called what, how often, with which argument shape) at near-zero blast radius, and make the dangerous mode explicit, short-lived, separately permissioned and self-auditing.",
+      "cost": "~70 LOC of the audit module + 1 migration column",
+      "mcphub_contrast": "mcphub stores tool input and output VERBATIM by design, on by default, opt out via `activityLog.storeToolPayload`, 100 KB cap, retention is a MANUAL `DELETE /api/activities/cleanup?daysOld=` an operator must remember to call (activityLoggingService.ts:112-118,:142). We keep their no-heuristics principle, invert the default, split the retention clocks, and make cleanup automatic."
+    },
+    {
+      "id": "OBS-11",
+      "decision": "Audit writes are off the tool-call critical path: a bounded in-process queue (cap 10 000) flushed by one writer on a 250 ms tick or at 200 rows, using a single multi-row INSERT. If the flush fails, the batch is re-queued once; if the DB stays down and the queue fills, each evicted record is emitted to the LOG stream at `error` with `evt:'audit.spill'` and the full record as JSON, so it lands in stdout/Docker logs rather than vanishing. `mcprouter_audit_dropped_total` and `mcprouter_audit_write_failures_total` make it visible. SIGTERM triggers a synchronous flush with a 5 s budget.",
+      "rationale": "A synchronous insert per tool call puts Postgres on the latency path and turns a DB blip into a gateway outage. Spilling to stdout converts silent loss into recoverable loss for ~6 lines, which is the difference between an acceptable corner-cut and a compliance incident. Marked in-code: `ponytail: at-most-once audit under sustained DB failure; upgrade to an on-disk spool if at-least-once is required`.",
+      "cost": "~185 LOC total for audit.ts",
+      "mcphub_contrast": "mcphub's activity logging is DB-mode only (activityLoggingService.ts:38-40) and simply does not exist in JSON mode \u2014 a whole deployment mode with no audit trail. We have one storage mode, so audit is unconditional."
+    },
+    {
+      "id": "OBS-12",
+      "decision": "Three distinct health surfaces with three distinct contracts. `GET /healthz` (liveness, unauthenticated) returns 200 iff the event loop runs \u2014 it NEVER inspects a dependency, because killing the container will not fix Postgres. `GET /readyz` (readiness, unauthenticated) returns 200 only when migrations are applied, `SELECT 1` succeeds inside 2 s, the first upstream reconciliation pass has completed and the MCP routes are mounted; otherwise 503 with per-check booleans and NO server names or version strings. Upstream MCP server state is deliberately NOT part of readiness. `GET /api/health/fleet` (authenticated) always returns 200 and is a REPORT, not a probe: per-server state, since, lastError, lastSuccessAt, p95 and 5-minute error rate. The word 'degraded' exists only in the fleet report and never in a probe status code.",
+      "rationale": "The three questions are 'should I restart you', 'should I send you traffic' and 'is the fleet healthy'. Conflating the last two means one broken third-party MCP server pulls a working router out of the load balancer; conflating the first two means a Postgres hiccup starts a restart loop. Also: an unauthenticated probe that enumerates your upstream servers is free reconnaissance.",
+      "cost": "~85 LOC",
+      "mcphub_contrast": "mcphub has one `GET /health`, unauthenticated, 503 on DB failure and 200 'degraded' when upstreams are down (healthController.ts:32-46) \u2014 a naive probe passes a hub whose every upstream is dead, and the same endpoint leaks fleet state to anyone who can reach the port."
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "RequestContext + propagation",
+      "kind": "type",
+      "sketch": "// packages/core/src/obs/context.ts \u2014 owned by CORE. server imports this, never the reverse.\nimport { AsyncLocalStorage } from 'node:async_hooks';\nimport { randomBytes } from 'node:crypto';\nimport { trace } from '@opentelemetry/api';\n\nexport type ScopeKind = 'all' | 'group' | 'server' | 'smart';\nexport type Era = 'legacy' | 'modern';\n\n/** Mutable in place. Exactly one writer per field, all inside the same run(). */\nexport interface RequestContext {\n  /** 32 lowercase hex = a W3C trace-id. The ONLY correlation id in the system. */\n  readonly requestId: string;\n  readonly startedAt: number;          // performance.now()\n  readonly era: Era;\n  readonly protocolVersion: string;\n  readonly transport: 'streamable-http' | 'stdio' | 'internal';\n  /** set by the auth middleware, after run() has begun */\n  principal: Principal | null;         // contract: owned by the auth subsystem\n  scopeKind: ScopeKind;\n  scope: string | null;                // group or server name\n  /** UNTRUSTED, from _meta clientInfo. Capped 128, control chars stripped. */\n  clientName: string | null;\n  clientVersion: string | null;\n  sourceIp: string | null;\n  /** set by the engine when the call resolves to one upstream */\n  server: string | null;\n  upstreamMs: number | null;\n}\n\nconst als = new AsyncLocalStorage<RequestContext>();\n\nexport function currentContext(): RequestContext | undefined { return als.getStore(); }\nexport function runWithContext<T>(ctx: RequestContext, fn: () => T): T { return als.run(ctx, fn); }\n// .enterWith() is banned: eslint no-restricted-properties.\n\nconst TRACEPARENT = /^00-(?!0{32})([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$/;\n\n/** OTel on -> adopt the active span's traceId; else inbound traceparent if VALID; else fresh. */\nexport function newRequestId(inboundTraceparent?: string | null): string {\n  const active = trace.getActiveSpan()?.spanContext().traceId;\n  if (active && active !== '0'.repeat(32)) return active;\n  const m = inboundTraceparent ? TRACEPARENT.exec(inboundTraceparent) : null;\n  return m ? m[1] : randomBytes(16).toString('hex');\n}",
+      "notes": "This is the whole propagation story. The engine never imports the HTTP layer; it calls currentContext(). When OTel is disabled @opentelemetry/api returns undefined for getActiveSpan() and the fallback runs \u2014 no branch, no config."
+    },
+    {
+      "name": "Structured log shape + event vocabulary",
+      "kind": "type",
+      "sketch": "// packages/core/src/obs/log.ts\nimport pino from 'pino';\n\n/** Closed set. Every log line carries one. This replaces free-text console.log. */\nexport type Evt =\n  | 'boot.start' | 'boot.ready' | 'boot.shutdown'\n  | 'mcp.request'            // one line per completed downstream request (the access log)\n  | 'mcp.tool.call' | 'mcp.tool.denied' | 'mcp.tool.retry'\n  | 'upstream.connect' | 'upstream.connected' | 'upstream.failed'\n  | 'upstream.disconnected' | 'upstream.superseded' | 'upstream.stderr'\n  | 'upstream.sleep' | 'upstream.wake'\n  | 'auth.reject' | 'protocol.reject'\n  | 'search.vector' | 'embed.sync'\n  | 'audit.spill' | 'audit.payload.read'\n  | 'db.migrate' | 'logs.dropped';\n\n// A rendered line (NDJSON, one per line, stdout):\n// {\"level\":\"info\",\"time\":\"2026-09-18T10:04:11.882Z\",\"svc\":\"mcprouter\",\"ver\":\"1.0.0\",\n//  \"inst\":\"router-7c9\",\"req\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"usr\":\"u_31f\",\n//  \"key\":\"ak_9a2\",\"scope\":\"eng-tools\",\"srv\":\"github\",\"evt\":\"mcp.request\",\n//  \"method\":\"tools/call\",\"name\":\"create_issue\",\"outcome\":\"ok\",\"ms\":812,\"upstreamMs\":790,\n//  \"inBytes\":214,\"outBytes\":1880,\"inHash\":\"9f1c2a7b4e0d88a1\",\"msg\":\"tools/call ok\"}\n\nexport const log = pino({\n  level: process.env.LOG_LEVEL ?? 'info',\n  base: { svc: 'mcprouter', ver: VERSION, inst: process.env.HOSTNAME },\n  timestamp: pino.stdTimeFunctions.isoTime,\n  formatters: { level: (label) => ({ level: label }) },\n  // AUTOMATIC correlation. No child-logger plumbing anywhere in core.\n  mixin() {\n    const c = currentContext();\n    return c ? { req: c.requestId, usr: c.principal?.id, key: c.principal?.apiKeyId,\n                 scope: c.scope, srv: c.server } : {};\n  },\n  // Mechanism #1: type-directed. Impossible to log a server config with values.\n  serializers: {\n    server: (s: ServerConfig) => ({ name: s.name, type: s.type, url: s.url,\n      command: s.command, envKeys: Object.keys(s.env ?? {}), headerKeys: Object.keys(s.headers ?? {}) }),\n    err: pino.stdSerializers.err,\n  },\n  // Mechanism #2: path-based, for the fixed HTTP surface only.\n  redact: { censor: '[redacted]', paths: [\n    '*.authorization', '*.Authorization', '*.cookie', '*.[\"x-api-key\"]',\n    '*.accessToken', '*.refreshToken', '*.clientSecret', '*.codeVerifier', '*.password',\n  ]},\n}, destination());  // multistream: stdout + ring (+ pino-roll when LOG_FILE)\n\n// NEVER logged at any level: tool arguments, tool results, resource contents,\n// prompt bodies, embedding query text. Those get inBytes/outBytes/inHash only.",
+      "notes": "Levels: trace=off in prod; debug=per-request engine detail; info=lifecycle + one access line per request; warn=retry/degraded/upstream stderr; error=failed call, failed connect, audit spill; fatal=process exiting. `evt` is what the UI filters on and what an operator greps."
+    },
+    {
+      "name": "LogRing \u2014 bounded ring with cursor subscribers",
+      "kind": "class",
+      "sketch": "// packages/core/src/obs/ring.ts\nexport interface LogRecord { level: string; time: string; evt?: string; req?: string;\n  srv?: string; msg?: string; [k: string]: unknown }\nexport interface LogFilter { level?: number; evt?: string; srv?: string; req?: string; q?: string }\n\nexport class LogRing {\n  private buf: LogRecord[]; private head = 0; private seq = 0;\n  constructor(private cap = 2000) { this.buf = new Array(cap); }\n\n  /** pino multistream destination. ponytail: JSON.parse per line; if sustained rate\n   *  ever exceeds ~5k/s, store raw strings and prefilter with indexOf. */\n  write(line: string): void { /* parse, store at head, head=(head+1)%cap, seq++ */ }\n\n  /** Cursor-based read. A subscriber whose cursor fell off the end learns how many it missed. */\n  since(cursor: number, f?: LogFilter): { records: LogRecord[]; cursor: number; dropped: number }\n  query(f: LogFilter, limit = 500): LogRecord[]\n  get cursor(): number { return this.seq; }\n}\nexport const ring = new LogRing();",
+      "notes": "The ring is the queue. Subscribers hold an integer, not a buffer, so a stalled browser tab costs nothing and slow-consumer handling is one comparison. Cap is a constant, not config \u2014 upgrade path is to point the UI at Loki, not to grow the array."
+    },
+    {
+      "name": "Prometheus metric catalogue \u2014 every metric, type, labels, cardinality",
+      "kind": "metric",
+      "sketch": "// packages/core/src/obs/metrics.ts \u2014 registry `reg`, prefix mcprouter_\n// collectDefaultMetrics({ register: reg })  -> process_*, nodejs_* (event loop lag, GC, RSS)\n// BUCKETS_FAST = [.01,.05,.1,.25,.5,1,2.5,5,10,30,60]\n// BUCKETS_CONN = [.05,.1,.25,.5,1,2,5,10,30]\n// BUCKETS_BYTES = [256,1e3,4e3,16e3,64e3,256e3,1e6,4e6]\n//\n// NAME                                            TYPE       LABELS                              CARDINALITY RISK\n// mcprouter_build_info                            Gauge=1    version, commit, node_version        1. Static.\n// mcprouter_upstream_state                        Gauge 0/1  server, transport, state             servers x 3 x 6. state in\n//                                                                                                 {connected,connecting,disconnected,\n//                                                                                                  oauth_required,sleeping,failed}.\n//                                                                                                 server bounded by CONFIG. Safe.\n// mcprouter_upstream_connect_attempts_total       Counter    server, outcome                      servers x 5 {success,refused,timeout,auth,protocol}.\n// mcprouter_upstream_connect_duration_seconds     Histogram  server, outcome{success,failure}     servers x 2 x 9. Safe.\n// mcprouter_upstream_last_success_ts_seconds      Gauge      server                               = servers. Alert on staleness w/o rate().\n// mcprouter_upstream_tools_count                  Gauge      server                               = servers. Catches 'came back with 0 tools'.\n// mcprouter_tool_calls_total                      Counter    server, tool, outcome                servers x tools x 5. THE TRAP: `tool` only\n//                                                                                                 ever comes from a branded ResolvedTool;\n//                                                                                                 unresolved -> tool=\"__unknown__\" so client\n//                                                                                                 input cannot mint series. outcome in\n//                                                                                                 {ok,error,denied,unavailable,timeout}.\n//                                                                                                 Exemplar: trace_id.\n// mcprouter_client_calls_total                    Counter    client, outcome                      client = better-auth apiKey ID (admin-created,\n//                                                                                                 bounded ~100) or 'session'/'anon'. NEVER the\n//                                                                                                 client-supplied clientInfo.name. Kept SEPARATE\n//                                                                                                 from tool_calls_total so the two medium\n//                                                                                                 dimensions never multiply.\n// mcprouter_tool_call_duration_seconds            Histogram  server, phase, outcome               servers x 2 x 2 x 12. NO `tool` label \u2014 that is\n//                                                                                                 the 45k-series mistake. phase in {total,upstream};\n//                                                                                                 total-upstream = OUR overhead. Exemplar: trace_id.\n// mcprouter_tool_call_result_bytes                Histogram  server                               servers x 8. Finds the tool returning 3 MB.\n// mcprouter_tool_calls_inflight                   Gauge      server                               = servers. Climbing inflight + flat completion\n//                                                                                                 rate = hung upstream, visible in 5 seconds.\n// mcprouter_tool_denied_total                     Counter    server, reason                       servers x 3 {disabled,not_in_group,no_scope}.\n//                                                                                                 The CVE-class signal (mcphub afcc72f): a spike\n//                                                                                                 means a client is calling what it cannot see.\n// mcprouter_downstream_requests_total             Counter    route, method, code, era             ~8 routes x ~10 MCP methods x ~12 codes x 2.\n//                                                                                                 route is the TEMPLATE (/mcp/:scope), never the\n//                                                                                                 resolved path. ~2k worst case.\n// mcprouter_downstream_request_duration_seconds   Histogram  route, method                        8 x 10 x 12. Safe.\n// mcprouter_downstream_streams_active             Gauge      kind{request,listen}                 2. The modern-era replacement for sessions.\n// mcprouter_sessions_active                       Gauge      transport                            1. LEGACY-ERA ONLY. Deleted when the SDK ships\n//                                                                                                 2026-07-28 and Mcp-Session-Id is gone.\n// mcprouter_auth_failures_total                   Counter    reason, surface                      5 x 2 {no_credential,bad_key,expired,\n//                                                                                                 insufficient_scope,audience_mismatch} x {mcp,api}.\n// mcprouter_protocol_errors_total                 Counter    code, era                            ~6 x 2. code in {-32020 HeaderMismatch,\n//                                                                                                 -32022 UnsupportedProtocolVersion,-32600,-32601,\n//                                                                                                 -32602,-32603}.\n// mcprouter_context_tokens                        Gauge      scope_kind, scope, mode              (groups+servers+2) x 4 {gross,exposed,\n//                                                                                                 smart_pd,smart_nopd}. ~1000 series at 200 srv +\n//                                                                                                 50 groups. DELIBERATE: this is the Context Cost\n//                                                                                                 differentiator on a graph. Ceiling ~2k series;\n//                                                                                                 above that drop the `scope` label and keep SQL.\n// mcprouter_embedding_sync_pending                Gauge      -                                    1.\n// mcprouter_embedding_requests_total              Counter    provider, outcome                    4 x 2. provider from config.\n// mcprouter_vector_search_duration_seconds        Histogram  scope_kind                           4 x 12. NOT by scope \u2014 query volume is unbounded.\n// mcprouter_audit_queue_depth                     Gauge      -                                    1.\n// mcprouter_audit_dropped_total                   Counter    -                                    1. Any nonzero = audit is lying. Page on it.\n// mcprouter_audit_write_failures_total            Counter    -                                    1.\n// mcprouter_db_pool_connections                   Gauge      state{total,idle,waiting}            3. One collect() reading pg Pool counters.\n//                                                                                                 `waiting` rising = the #1 self-host outage.\n// mcprouter_log_events_total                      Counter    level                                6. rate(...{level=\"error\"}[5m]) gives error\n//                                                                                                 alerting with NO log pipeline installed.\n// mcprouter_log_stream_subscribers                Gauge      -                                    1. Hard cap 20.\n\n// Typed recording surface \u2014 the branded type IS the cardinality enforcement:\nexport type ResolvedTool = { readonly __brand: 'ResolvedTool'; server: string; tool: string };\nexport function recordToolCall(ref: ResolvedTool | null, o: {\n  outcome: 'ok'|'error'|'denied'|'unavailable'|'timeout';\n  totalMs: number; upstreamMs?: number; outBytes?: number;\n}): void;  // reads requestId from the ALS for the exemplar; ref===null => tool='__unknown__'",
+      "notes": "Rule stated once: never multiply two medium-cardinality dimensions in one metric \u2014 emit two metrics and join in Postgres. Prometheus answers 'what shape is the fleet'; the audit table answers 'who exactly'. Exemplars are on tool_calls_total and tool_call_duration_seconds only, via prom-client's enableExemplars + Registry.OPENMETRICS_CONTENT_TYPE when the scrape Accept header asks for it."
+    },
+    {
+      "name": "OTel spans and attributes",
+      "kind": "type",
+      "sketch": "// packages/core/src/obs/otel.ts \u2014 depends on @opentelemetry/api ONLY (no-op when no SDK).\nimport { trace, SpanStatusCode, SpanKind, type Attributes } from '@opentelemetry/api';\nconst tracer = trace.getTracer('mcprouter');\n\nexport function withSpan<T>(name: SpanName, kind: SpanKind, attrs: Attributes,\n                            fn: (setAttr: (a: Attributes) => void) => Promise<T>): Promise<T>;\n\nexport type SpanName =\n  | 'mcp.request'           // SERVER, packages/server middleware. THE downstream span.\n  | 'mcp.tool.call'         // INTERNAL, core. Resolve + filter + dispatch + retry.\n  | 'mcp.upstream.call'     // CLIENT, core. The raw SDK client.callTool \u2014 its duration IS upstream_ms.\n  | 'mcp.upstream.connect'  // CLIENT, core. Transport create + handshake.\n  | 'mcp.upstream.list'     // CLIENT, core. tools/prompts/resources listing after connect.\n  | 'mcp.search.vector'     // INTERNAL, core. pgvector cosine query.\n  | 'mcp.embed';            // CLIENT, core. Embedding provider call.\n\n// Attributes, by span. NEVER a tool argument, result, resource body or query text.\n// mcp.request:          mcp.method, mcp.name, mcp.scope.kind, mcp.scope, mcp.era,\n//                       mcp.protocol_version, mcprouter.principal.kind, mcprouter.api_key.id,\n//                       mcp.client.name, mcp.client.version, http.response.status_code\n// mcp.tool.call:        mcp.server, mcp.tool, mcp.tool.namespaced, mcp.outcome,\n//                       mcp.input.bytes, mcp.output.bytes, mcp.retried (bool)\n// mcp.upstream.call:    mcp.server, mcp.transport, server.address, mcp.outcome\n// mcp.upstream.connect: mcp.server, mcp.transport, mcp.protocol_version, mcp.outcome,\n//                       mcprouter.generation  <- the generation counter, so a superseded\n//                                                connect is VISIBLE in the trace rather than\n//                                                a mystery in the logs\n// mcp.upstream.list:    mcp.server, mcp.capability{tools|prompts|resources}, mcp.item_count\n// mcp.search.vector:    mcprouter.scope.kind, mcprouter.query.len, mcprouter.k,\n//                       mcprouter.threshold, mcprouter.hits\n// mcp.embed:            mcprouter.embed.provider, mcprouter.embed.model,\n//                       mcprouter.embed.batch, mcprouter.embed.dims\n// DB spans come free from @opentelemetry/instrumentation-pg. HTTP server/client spans come\n// free from instrumentation-http + instrumentation-undici.",
+      "notes": "Seven manual spans, three named instrumentations, zero auto-instrumentation meta-package. A tool call under load produces: http server span -> mcp.request -> mcp.tool.call -> mcp.upstream.call (-> undici span), plus any pg spans. That is the whole fan-out of a request on one screen."
+    },
+    {
+      "name": "audit_event (Drizzle + migration)",
+      "kind": "table",
+      "sketch": "// packages/core/src/db/schema/audit.ts\nimport { pgTable, bigserial, timestamp, text, integer, char, jsonb, inet, index } from 'drizzle-orm/pg-core';\nimport { sql } from 'drizzle-orm';\n\nexport const auditEvent = pgTable('audit_event', {\n  id:            bigserial('id', { mode: 'bigint' }).primaryKey(),\n  at:            timestamp('at', { withTimezone: true }).notNull().defaultNow(),\n  requestId:     char('request_id', { length: 32 }).notNull(),      // == trace id\n  principalKind: text('principal_kind').notNull(),                  // user|api_key|oauth_client|system\n  principalId:   text('principal_id'),\n  apiKeyId:      text('api_key_id'),\n  clientName:    text('client_name'),                              // UNTRUSTED, capped 128\n  clientVersion: text('client_version'),                           // UNTRUSTED, capped 64\n  sourceIp:      inet('source_ip'),\n  scopeKind:     text('scope_kind').notNull(),                     // all|group|server|smart\n  scope:         text('scope'),\n  server:        text('server'),                                   // null for meta-tools\n  method:        text('method').notNull(),                         // tools/call|tools/list|resources/read|...\n  name:          text('name'),                                     // UNPREFIXED tool/resource/prompt name\n  outcome:       text('outcome').notNull(),                        // ok|error|denied|unavailable|timeout\n  errorCode:     integer('error_code'),                            // JSON-RPC code\n  errorMessage:  text('error_message'),                            // capped 512\n  durationMs:    integer('duration_ms').notNull(),\n  upstreamMs:    integer('upstream_ms'),\n  inputBytes:    integer('input_bytes'),\n  outputBytes:   integer('output_bytes'),\n  inputHash:     char('input_hash', { length: 16 }),               // sha256 prefix, canonical JSON\n  inputKeys:     text('input_keys').array(),                       // 'metadata' mode: KEY NAMES only\n  input:         jsonb('input'),                                   // 'full' mode only, <=64 KB\n  output:        jsonb('output'),                                  // 'full' mode only, <=64 KB\n  credentialed:  sql`boolean`,                                     // per-user credential -> metadata forced\n}, (t) => [\n  index('audit_at_idx').on(t.at.desc()),\n  index('audit_server_at_idx').on(t.server, t.at.desc()),\n  index('audit_req_idx').on(t.requestId),\n  index('audit_principal_at_idx').on(t.principalId, t.at.desc()),\n  // partial: the error feed and the triage screen both start here\n  index('audit_err_idx').on(t.at.desc()).where(sql`outcome <> 'ok'`),\n]);\n\n// Retention (daily timer, packages/core/src/obs/retention.ts):\n//   UPDATE audit_event SET input=NULL, output=NULL\n//     WHERE at < now() - $payloadDays * interval '1 day' AND (input IS NOT NULL OR output IS NOT NULL);\n//   DELETE FROM audit_event WHERE id IN (\n//     SELECT id FROM audit_event WHERE at < now() - $retentionDays * interval '1 day' LIMIT 10000);\n//   -- looped until 0 rows. ponytail: plain batched DELETE; switch to monthly RANGE\n//   -- partitions + DROP PARTITION above ~50M rows.",
+      "notes": "One table, not two. mcphub's Activity entity has the same spine but no upstream_ms (so you cannot separate 'the upstream is slow' from 'we are slow'), no request_id (so nothing joins to a log line), and no input_keys mode between verbatim and nothing."
+    },
+    {
+      "name": "HTTP route table",
+      "kind": "route",
+      "sketch": "// packages/server/src/obs/routes/*.ts  (Hono)\nGET  /healthz                       // liveness. UNAUTH. 200 {\"status\":\"ok\"} always, unless the\n                                    // loop is wedged. Touches no dependency. No body detail.\nGET  /readyz                        // readiness. UNAUTH. 200 {\"status\":\"ready\"} | 503\n                                    // {\"status\":\"not_ready\",\"checks\":{\"migrations\":true,\"db\":false,\n                                    //  \"registry\":true,\"routes\":true}}\n                                    // Booleans only \u2014 NO server names, NO version string.\n                                    // Upstream MCP health is deliberately EXCLUDED.\nGET  /metrics                       // prom-client. Requires apiKey permission metrics:read OR an\n                                    // admin session. OpenMetrics content-type when Accept asks.\nGET  /api/health/fleet              // AUTH. Always 200. A report, never a probe.\n                                    // {summary:{total,connected,degraded,failed,sleeping},\n                                    //  servers:[{name,transport,state,since,lastError,lastSuccessAt,\n                                    //            toolCount,p95Ms,errorRate5m}]}\nGET  /api/logs?level&evt&srv&req&q&limit        // AUTH admin. Ring query, <=500.\nGET  /api/logs/stream?level&evt&srv&req         // AUTH admin, SESSION COOKIE ONLY (never ?token=).\n                                    // SSE. Cache-Control: no-store, X-Accel-Buffering: no,\n                                    // ':\\r\\n' keep-alive every 15 s. Max 20 concurrent subscribers.\nGET  /api/observability/triage?window=15m       // AUTH. THE one-screen answer. One SQL query.\nGET  /api/observability/audit?server&principal&outcome&from&to&cursor  // AUTH audit:read. Metadata only.\nGET  /api/observability/audit/:id/payload      // AUTH audit:payload:read. Admin only.\n                                    // Writes its own audit row (evt audit.payload.read) on every hit.\nGET  /api/observability/request/:requestId     // AUTH. {audit, logs:LogRecord[], traceUrl|null}\n                                    // traceUrl = OTEL_TRACE_URL_TEMPLATE with {traceId} substituted.",
+      "notes": "Every MCP error response also carries error.data.requestId, so a user can paste an id at an operator who pastes it into /api/observability/request/:requestId and sees the audit row, every log line and a deep link to the trace."
+    },
+    {
+      "name": "GET /api/observability/triage \u2014 the operator query",
+      "kind": "route",
+      "sketch": "-- \"Which upstream is slow or failing right now, and which client is causing it?\"\n-- ONE query. Served by GET /api/observability/triage?window=15m. Index: audit_server_at_idx.\nWITH w AS (\n  SELECT server, outcome, upstream_ms, duration_ms,\n         coalesce(api_key_id, principal_id, client_name, 'anon') AS caller\n  FROM audit_event\n  WHERE at > now() - ($1::text)::interval AND server IS NOT NULL\n)\nSELECT server,\n       count(*)                                                     AS calls,\n       count(*) FILTER (WHERE outcome <> 'ok')                      AS errors,\n       round(100.0 * count(*) FILTER (WHERE outcome <> 'ok')\n             / nullif(count(*),0), 1)                               AS error_pct,\n       percentile_disc(0.50) WITHIN GROUP (ORDER BY upstream_ms)    AS p50_upstream_ms,\n       percentile_disc(0.95) WITHIN GROUP (ORDER BY upstream_ms)    AS p95_upstream_ms,\n       max(upstream_ms)                                             AS max_upstream_ms,\n       percentile_disc(0.95) WITHIN GROUP (ORDER BY duration_ms)\n         - percentile_disc(0.95) WITHIN GROUP (ORDER BY upstream_ms) AS p95_router_overhead_ms,\n       mode() WITHIN GROUP (ORDER BY caller)                        AS top_caller,\n       count(DISTINCT caller)                                       AS callers\nFROM w GROUP BY server\nORDER BY p95_upstream_ms DESC NULLS LAST, errors DESC\nLIMIT 20;\n\n-- Drill 1 (click a server row): same window, GROUP BY caller, ORDER BY p95 DESC.\n-- Drill 2 (click a call): request_id -> /api/observability/request/:id ->\n--          { audit row, every log line with that req, trace deep link }.\n-- Live half of the same screen, no DB: mcprouter_tool_calls_inflight and\n--   histogram_quantile(0.95, sum by (server,le) (rate(\n--     mcprouter_tool_call_duration_seconds_bucket{phase=\"upstream\"}[5m])))\n--   for the last-60s shape the 15-minute SQL window cannot see.",
+      "notes": "Postgres does the who (unbounded dimensions, exact percentiles); Prometheus does the right-now shape (5-second resolution). The screen is one table of upstreams sorted by p95, a sparkline per row from the Prometheus range query, a top_caller column, and a click-through to the exact request. mcphub cannot render this: its Activity rows record duration but not the upstream/total split, and there is no aggregation endpoint at all."
+    },
+    {
+      "name": "Engine and server contracts (what I need from the other seven)",
+      "kind": "type",
+      "sketch": "// FROM packages/server (HTTP/transport subsystem):\n//   - outermost middleware order is FIXED: (1) start mcp.request span, (2) newRequestId(),\n//     (3) runWithContext(ctx, next). Auth runs INSIDE (3) and sets ctx.principal.\n//   - set response header x-request-id: ctx.requestId, on every response incl. errors.\n//   - include error.data.requestId in every JSON-RPC error body.\n//   - call obs.recordDownstream({ route, method, code, era, ms }) on response.\n//\n// FROM packages/core engine (routing/aggregation subsystem):\nexport interface EngineObsHooks {\n  onToolCall(ref: ResolvedTool | null, r: {\n    outcome: 'ok'|'error'|'denied'|'unavailable'|'timeout';\n    deniedReason?: 'disabled'|'not_in_group'|'no_scope';\n    totalMs: number; upstreamMs?: number;\n    inputBytes: number; outputBytes: number;\n    inputKeys: string[]; inputHash: string;\n    input?: unknown; output?: unknown;   // passed ONLY when policy === 'full'\n    credentialed: boolean;               // true => policy forced to 'metadata'\n    errorCode?: number; errorMessage?: string;\n  }): void;\n  onUpstreamState(server: string, state: UpstreamState, generation: number, err?: Error): void;\n  onUpstreamConnect(server: string, transport: string, ms: number, outcome: string): void;\n  onContextTokens(scopeKind: ScopeKind, scope: string,\n                  mode: 'gross'|'exposed'|'smart_pd'|'smart_nopd', tokens: number): void;\n  onVectorSearch(scopeKind: ScopeKind, ms: number, hits: number): void;\n}\n// The engine MUST report `denied` vs `unavailable` internally even though the WIRE\n// response for both is byte-identical (mcphub's ToolUnavailableError contract,\n// mcpService.ts:2654). Observability keeps the distinction the protocol hides.\n//\n// FROM the auth subsystem: Principal { kind, id, apiKeyId?, displayName }; better-auth apiKey\n//   `permissions` must define metrics:read, audit:read, audit:payload:read; the session cookie\n//   must be HttpOnly + SameSite=Lax so EventSource can authenticate without a query token.\n// FROM the db subsystem: the drizzle instance, the pg Pool (for the pool gauges), and the\n//   migration runner's applied-state (for /readyz).\n// FROM the registry subsystem: the first-reconciliation-complete flag (for /readyz).",
+      "notes": "Hooks are a plain object on the engine, not an event emitter and not an interface with two implementations. One implementation, injected once at boot; tests pass a recording stub."
+    },
+    {
+      "name": "Environment variables",
+      "kind": "env",
+      "sketch": "LOG_LEVEL=info                      # trace|debug|info|warn|error|fatal\nLOG_FILE=                           # unset => stdout only (Docker/k8s rotate for us).\n                                    # set => pino-roll daily, size 50m, keep 14.\nAUDIT_PAYLOADS=metadata             # off | metadata | full   (per-server override in server config)\nAUDIT_RETENTION_DAYS=90             # metadata rows\nAUDIT_PAYLOAD_RETENTION_DAYS=7      # payload columns nulled first, separate clock\nOTEL_EXPORTER_OTLP_ENDPOINT=        # unset => OTel bootstrap returns on line 1, zero cost\nOTEL_SERVICE_NAME=mcprouter\nOTEL_TRACES_SAMPLER=parentbased_always_on\nOTEL_TRACES_SAMPLER_ARG=\nOTEL_TRACE_URL_TEMPLATE=            # e.g. https://grafana.example/explore?traceID={traceId}\n                                    # one string replace; no vendor SDK, no dependency\n# NOT env vars, deliberately: ring size (constant 2000), metric prefix, bucket layouts,\n# SSE keep-alive interval, audit batch size. No config for a value that never changes.",
+      "notes": "Everything OTel is a STANDARD OTEL_* name so an operator's existing collector config drops in. The only MCPRouter-specific OTel variable is the UI deep-link template."
+    },
+    {
+      "name": "Web: LogStream / TriagePanel / RequestDrawer",
+      "kind": "component",
+      "sketch": "// packages/web/src/features/observability/useLogStream.ts\nexport function useLogStream(f: LogFilter): { records: LogRecord[]; dropped: number;\n                                              connected: boolean; pause(): void; resume(): void };\n// ONE EventSource('/api/logs/stream?' + qs) \u2014 cookie auth, no token in the URL.\n// Server-side filtering (level/evt/srv/req/q) so a per-server view is not a client-side\n// firehose. Records held in a fixed 2000-slot array (same cap as the ring) so the tab\n// cannot OOM. Backoff 1s -> 8s on disconnect. Auto-pause on scroll-up.\n\n// TriagePanel: TanStack Query useQuery(['triage', window], 15s refetch) + one Prometheus\n//   range query per visible row for the sparkline. Columns:\n//   server | state dot | calls | err% | p50 | p95 (sparkline) | overhead | top caller | callers\n//   Sorted by p95 desc. Row click -> by-caller breakdown. Cell click -> RequestDrawer.\n\n// RequestDrawer({ requestId }): GET /api/observability/request/:id ->\n//   the audit row, every log line with that req in time order, and the trace deep link.\n//   The requestId renders as a mono chip with a copy button everywhere it appears.\n\n// a11y baseline (non-negotiable): the log stream is role=\"log\" aria-live=\"polite\"\n// aria-relevant=\"additions\"; status dots carry a visible text label, never colour or an\n// emoji alone; the triage table is a real <table> with <caption> and scope=\"col\";\n// pause/resume is a <button aria-pressed>; drawer is a focus-trapped <dialog>.",
+      "notes": "mcphub's LogViewer is one global firehose over an unbounded array with no per-server filter and uses emoji as status (StatusDot.tsx:67,83). Server-side filtering plus a fixed client cap is less code than their client-side filtering and does not melt the tab."
+    }
+  ],
+  "files": [
+    {
+      "path": "packages/core/src/obs/context.ts",
+      "purpose": "AsyncLocalStorage, RequestContext type, runWithContext/currentContext, newRequestId (trace-id adoption + traceparent validation).",
+      "loc": 60
+    },
+    {
+      "path": "packages/core/src/obs/log.ts",
+      "purpose": "pino root logger: mixin correlation, serializers-as-redaction, redact paths, multistream destination selection (stdout / ring / pino-roll / pino-pretty), Evt union.",
+      "loc": 140
+    },
+    {
+      "path": "packages/core/src/obs/ring.ts",
+      "purpose": "Bounded 2000-entry log ring, cursor-based subscribers with drop accounting, server-side filter/query.",
+      "loc": 95
+    },
+    {
+      "path": "packages/core/src/obs/metrics.ts",
+      "purpose": "prom-client registry, all 28 metric families, branded-ResolvedTool recording helpers, exemplar plumbing, default metrics, pg pool collector.",
+      "loc": 240
+    },
+    {
+      "path": "packages/core/src/obs/otel.ts",
+      "purpose": "withSpan helper over @opentelemetry/api only, SpanName union, attribute-name constants.",
+      "loc": 70
+    },
+    {
+      "path": "packages/core/src/obs/audit.ts",
+      "purpose": "Audit queue, 250ms/200-row batch insert, payload policy application + 64KB caps, spill-to-log on DB failure, SIGTERM flush.",
+      "loc": 185
+    },
+    {
+      "path": "packages/core/src/obs/retention.ts",
+      "purpose": "Daily timer: null payload columns at 7d, batched 10k delete at 90d, metrics for rows reclaimed.",
+      "loc": 65
+    },
+    {
+      "path": "packages/core/src/obs/index.ts",
+      "purpose": "The public surface other subsystems import: log, withSpan, recordToolCall, EngineObsHooks, ring.",
+      "loc": 25
+    },
+    {
+      "path": "packages/core/src/db/schema/audit.ts",
+      "purpose": "Drizzle audit_event table + its five indexes.",
+      "loc": 50
+    },
+    {
+      "path": "packages/core/drizzle/0003_audit_event.sql",
+      "purpose": "Generated migration for audit_event (real file, checked in).",
+      "loc": 35
+    },
+    {
+      "path": "packages/server/otel-bootstrap.mjs",
+      "purpose": "node --import preload: early-return when no OTLP endpoint, else register import-in-the-middle hook and start NodeSDK with http/pg/undici instrumentations.",
+      "loc": 45
+    },
+    {
+      "path": "packages/server/src/obs/middleware.ts",
+      "purpose": "Outermost Hono middleware: mcp.request span, requestId, runWithContext, x-request-id header, access log line, downstream metrics.",
+      "loc": 95
+    },
+    {
+      "path": "packages/server/src/obs/routes/health.ts",
+      "purpose": "/healthz (liveness), /readyz (readiness, booleans only), /api/health/fleet (authenticated report).",
+      "loc": 85
+    },
+    {
+      "path": "packages/server/src/obs/routes/metrics.ts",
+      "purpose": "/metrics with metrics:read permission and OpenMetrics content negotiation for exemplars.",
+      "loc": 40
+    },
+    {
+      "path": "packages/server/src/obs/routes/logs.ts",
+      "purpose": "GET /api/logs (ring query) and GET /api/logs/stream (SSE, cookie-only auth, keep-alive, 20-subscriber cap).",
+      "loc": 95
+    },
+    {
+      "path": "packages/server/src/obs/routes/observability.ts",
+      "purpose": "Triage SQL endpoint, audit search, audited payload read, request-by-id join (audit + logs + trace URL).",
+      "loc": 120
+    },
+    {
+      "path": "packages/web/src/features/observability/useLogStream.ts",
+      "purpose": "EventSource hook with server-side filters, fixed client cap, backoff, drop counter, auto-pause.",
+      "loc": 85
+    },
+    {
+      "path": "packages/web/src/features/observability/LogStream.tsx",
+      "purpose": "Live log pane: dense mono rows, level/evt/server/request filters, role=log aria-live, copy-requestId chips.",
+      "loc": 200
+    },
+    {
+      "path": "packages/web/src/features/observability/TriagePanel.tsx",
+      "purpose": "The one screen: upstreams sorted by p95, err%, overhead, top caller, sparkline, drill-down.",
+      "loc": 185
+    },
+    {
+      "path": "packages/web/src/features/observability/FleetHealth.tsx",
+      "purpose": "Per-server state dots, since/lastError/lastSuccess, tool counts, from /api/health/fleet.",
+      "loc": 140
+    },
+    {
+      "path": "packages/web/src/features/observability/RequestDrawer.tsx",
+      "purpose": "One requestId: audit row, its log lines in order, trace deep link. Focus-trapped dialog.",
+      "loc": 150
+    },
+    {
+      "path": "packages/web/src/features/observability/api.ts",
+      "purpose": "TanStack Query hooks for triage/fleet/audit/request endpoints.",
+      "loc": 60
+    },
+    {
+      "path": "deploy/prometheus/alerts.yml",
+      "purpose": "Five starter rules: upstream down 5m, upstream p95 regression, tool error rate, audit dropped nonzero, db pool waiting.",
+      "loc": 55
+    },
+    {
+      "path": "packages/core/test/obs.test.ts",
+      "purpose": "vitest: requestId adoption + traceparent rejection, mixin correlation, serializer strips env/header values, ring cursor drop accounting, label guard rejects unresolved tool.",
+      "loc": 130
+    },
+    {
+      "path": "packages/core/test/audit.test.ts",
+      "purpose": "vitest + @testcontainers/postgresql: batch insert, 64KB truncation marker, metadata mode stores keys not values, credentialed forces metadata, spill-to-log on DB down, retention nulls then deletes.",
+      "loc": 120
+    }
+  ],
+  "security": [
+    "Inbound `traceparent` header (downstream HTTP -> context). Untrusted. Control: strict regex `^00-(?!0{32})([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$`; anything that fails generates a fresh id. Prevents trace-id injection, log-field forging, and a client grafting its requests onto someone else's trace.",
+    "Client-supplied identity strings (`clientInfo.name`/`version`, `Mcp-Name` header). Untrusted. Control: stored in audit only, never used as a metric label, capped at 128/64 chars, control characters and newlines stripped before they reach the ring or the UI. NDJSON escaping already stops log forging on the stdout path; the cap protects the SPA render path and the table.",
+    "Tool names reaching a Prometheus label. Untrusted when unresolved. Control: `recordToolCall` accepts only a branded `ResolvedTool` from the registry; a null ref records `tool=\"__unknown__\"`. A client that calls 10 000 nonexistent tool names creates one series, not 10 000. This is a denial-of-service control, not a tidiness rule.",
+    "`GET /metrics`. Control: better-auth apiKey `permissions` requires `metrics:read`, or an admin session. Never public \u2014 the metric set enumerates every upstream server name, every tool name and the full traffic shape of the organisation.",
+    "`GET /api/logs` and `/api/logs/stream`. Control: better-auth session cookie ONLY (HttpOnly, SameSite=Lax), admin role required. No credential may be passed in the query string \u2014 mcphub puts the JWT in the log-stream URL (frontend services/logService.ts:82), which copies it into every reverse-proxy access log and browser history entry. EventSource sends cookies automatically, so this costs nothing. Responses carry `Cache-Control: no-store` and `X-Accel-Buffering: no`; concurrent subscribers capped at 20.",
+    "Secrets reaching a log line. Control: pino `serializers` is type-directed and cannot be bypassed by a careless call site \u2014 `serializers.server` emits `envKeys`/`headerKeys`, never values. `redact` covers the fixed header/token paths. Tool arguments, tool results, resource bodies, prompt bodies and embedding query text are NEVER logged at any level; log lines carry byte counts and a sha256 prefix instead.",
+    "Audit payload columns (`full` mode). Control: three independent gates \u2014 a distinct `audit:payload:read` permission separate from `audit:read`; admin session required; and every read writes its own audit row (`evt:'audit.payload.read'` with the target row id). Payloads are nulled at 7 days by default while metadata survives 90. Calls that used a per-user credential binding are metadata-only with no override, reproducing mcphub's credentialed-call rule (activityLoggingService.ts:70-75) as an unconditional invariant rather than a flag that fails open for any new auth path.",
+    "`/healthz` and `/readyz` are unauthenticated by necessity (probes). Control: response bodies contain check names and booleans only \u2014 no upstream server names, no version string, no error text. mcphub's unauthenticated `/health` reports degraded fleet state to anyone who can reach the port (healthController.ts:32-46).",
+    "Audit write loss. Control: bounded queue with a re-queue-once retry; when the DB is unreachable, each evicted record is emitted to the log stream at `error` with `evt:'audit.spill'` and the full record, so it lands in stdout/Docker logs instead of vanishing. `mcprouter_audit_dropped_total` and `mcprouter_audit_write_failures_total` are page-worthy at any nonzero value.",
+    "Observability must not undo the hidden-tool contract. `mcprouter_tool_denied_total{reason}` and `audit_event.outcome='denied'` record the distinction between a disabled tool and a nonexistent one, but the JSON-RPC error code and message returned to the client remain byte-identical for both (mcphub's ToolUnavailableError, mcpService.ts:2654). No observability field may leak into a client-visible response except `error.data.requestId`, which is an opaque random value."
+  ],
+  "deferred": [
+    {
+      "item": "Log persistence and shipping (Loki/OTLP logs). Ring is 2000 entries and dies with the process; durable logs are whatever the container runtime kept from stdout.",
+      "add_when": "An operator asks to search logs from before the last restart, or wants more than 2000 lines in the live view. Then point the UI at Loki; do NOT grow the ring."
+    },
+    {
+      "item": "OpenTelemetry metrics and logs pipelines. Traces only in v1.",
+      "add_when": "A team wants a single OTLP pipe instead of a Prometheus scrape \u2014 i.e. they run a collector but not a Prometheus. Adding a PrometheusExporter-to-OTLP bridge is ~20 LOC then."
+    },
+    {
+      "item": "`@opentelemetry/auto-instrumentations-node`. We install three named instrumentations instead.",
+      "add_when": "We need spans inside a dependency we do not control and cannot wrap ourselves \u2014 e.g. a redis or S3 client appears in the tree. Adding one named instrumentation stays cheaper than the meta-package until we need four or more."
+    },
+    {
+      "item": "Monthly RANGE partitioning of `audit_event` with DROP PARTITION retention.",
+      "add_when": "The table exceeds ~50M rows or the nightly DELETE takes over 60 s. Until then a batched DELETE on a team self-host is free."
+    },
+    {
+      "item": "Per-tool latency histogram in Prometheus.",
+      "add_when": "Never for the default registry. If someone must alert per-tool, add a Prometheus recording rule over an audit-derived summary, or emit the histogram for an explicit allowlist of <=20 tool names via `METRICS_TOOL_ALLOWLIST`."
+    },
+    {
+      "item": "Audit sampling for high-volume tools (store 1-in-N for tools over a rate threshold).",
+      "add_when": "Audit ingest exceeds ~10M rows/month or the audit queue depth gauge is persistently nonzero."
+    },
+    {
+      "item": "Grafana dashboard JSON.",
+      "add_when": "Someone actually runs Grafana against us. Our TriagePanel answers the primary question in-product; a dashboard is a second thing to keep in sync."
+    },
+    {
+      "item": "Per-group RED metrics (`mcprouter_group_*`).",
+      "add_when": "A deployment starts billing or rate-limiting per group. Until then group is a filter in the SQL, not a metric dimension."
+    },
+    {
+      "item": "Tail-based sampling / a span processor that keeps only error traces.",
+      "add_when": "Trace volume becomes a cost line. `OTEL_TRACES_SAMPLER_ARG` head sampling is the first, free answer."
+    },
+    {
+      "item": "Anomaly detection / baseline alerting on upstream p95.",
+      "add_when": "Someone complains that static thresholds in alerts.yml page too often. A static threshold that pages is still better than a clever one nobody trusts."
+    },
+    {
+      "item": "Audit export (CSV/NDJSON) for compliance handoff.",
+      "add_when": "A customer asks for an auditor deliverable. It is one streaming SELECT; not worth building speculatively."
+    }
+  ],
+  "risks": [
+    "The requestId-is-the-trace-id trick depends on the `mcp.request` span existing before the context is created. If a future middleware reorder puts auth or routing ahead of the span, log lines silently lose OTel correlation while still having an id \u2014 a failure with no error. Mitigation: one test asserts that with the SDK registered, a log line's `req` equals the exported span's traceId.",
+    "The RequestContext store is mutable in place so auth can set `principal` late. If a second writer appears (e.g. a retry path resetting `server`), audit rows and log lines can disagree about which upstream handled a call. Mitigation: fields are documented single-writer and the engine sets `server` exactly once, at resolution; a retry to a different transport on the same server does not change it.",
+    "`mcprouter_context_tokens` is the one metric where I deliberately accept ~1000 series. A deployment with 500 servers and 200 groups pushes past 2800 and a scrape starts costing real time. The ceiling and the fix (drop the `scope` label, keep the SQL view) are written down, but nobody will notice until the scrape times out.",
+    "The `--import ./otel-bootstrap.mjs` preload with import-in-the-middle is the least boring part of the design and the part most likely to break on a Node minor bump under pure ESM. Mitigation: the bootstrap's first line returns when no OTLP endpoint is set, so the default deployment never loads the hook at all \u2014 a breakage can only affect operators who opted in, and it degrades to 'no traces', not 'no boot'.",
+    "Async batched audit writes mean a tool call can succeed and its audit row can be lost if the process is SIGKILLed inside the 250 ms window. SIGTERM flushes; SIGKILL and OOM do not. For a compliance deployment this is the wrong tradeoff and the upgrade path (synchronous insert, or an on-disk spool) is a real change, not a flag.",
+    "`metadata` as the default payload mode will produce at least one incident where the operator needed the arguments and only has the key names. The per-server `full` override exists precisely for that, but it has to be turned on BEFORE the incident. Mitigation: the RequestDrawer shows a one-click 'enable full payloads for this server' affordance with the 7-day retention stated inline.",
+    "JSON.parse per log line in the ring is fine at hundreds/sec and not fine at tens of thousands. A debug-level flood from one chatty stdio upstream's stderr is the realistic trigger. Mitigation: the ring is attached at `debug`, `LOG_LEVEL` defaults to `info`, and upstream stderr is rate-limited to 20 lines/sec/server before it reaches pino.",
+    "prom-client exemplars require the OpenMetrics content type, which some scrape stacks (and most alertmanager-only setups) do not negotiate. Those operators get correct metrics with no exemplars and may conclude the trace linking is broken. Mitigation: the /metrics response includes a comment line naming the required Accept header, and the docs say it in one sentence.",
+    "Cookie-only auth on /api/logs/stream means the log view does not work from a CLI or a cross-origin dashboard. That is deliberate, but it will be reported as a bug. `mcprouter logs --follow` in the CLI must use `GET /api/logs` polling with an API key, not the SSE endpoint \u2014 a contract the CLI subsystem has to honour."
+  ],
+  "phase": "\"Phase 1 (with the core+server skeleton, before any MCP traffic flows): context.ts, log.ts, ring.ts, /healthz, /readyz, the request middleware, the metrics registry with downstream + upstream + db-pool families. Depends on: packages/server's middleware chain existing; the auth subsystem's Principal type (can start with `principal: null`); the db subsystem's Pool handle. Nothing here depends on the engine being finished. Phase 2 (as soon as tool calls execute end to end): audit_event migration, the audit queue + retention timer, tool-call and denial metrics, the triage endpoint, otel-bootstrap and the seven spans. Depends on: the engine's EngineObsHooks call sites, and the auth subsystem having shipped the metrics:read / audit:read / audit:payload:read permissions on the better-auth apiKey plugin. Phase 3 (with the web SPA): LogStream, TriagePanel, FleetHealth, RequestDrawer, the context-cost and embedding gauges (these depend on the Context Cost and Smart Routing subsystems calling onContextTokens/onVectorSearch), and deploy/prometheus/alerts.yml. The `mcprouter_sessions_active` gauge is born in Phase 2 and is marked for deletion the day the SDK ships 2026-07-28 support \u2014 it is the only piece of this subsystem with a known expiry date.\"",
+  "subsystem": "\"Observability \u2014 structured logging, correlation, tracing, metrics, audit trail, health\"",
+  "summary": "\"One correlation id, generated once at the HTTP edge and equal to the W3C trace-id, carried through the engine by a stdlib AsyncLocalStorage that packages/core owns, so the engine never imports the HTTP layer. That id is injected into every pino line by a `mixin` (no child-logger plumbing), attached to metric exemplars by prom-client's native OpenMetrics support, written to every audit row, returned in the `x-request-id` header and in `error.data.requestId`, and rendered as a copyable chip on every UI row. Secrets stay out of logs by type-directed pino `serializers` rather than regex scrubbing, and tool payloads never reach a log line at all \u2014 only byte counts and a hash. The single idea that makes this leaner than mcphub is a hard split of responsibility: Prometheus answers 'what shape is the fleet right now' with strictly bounded label sets, Postgres answers 'who exactly did what' with one SQL query and unbounded dimensions, and the two are joined by that one id \u2014 so there is no per-tool histogram, no cardinality bomb, no log pipeline to run, and the operator's real question is answered by one table and one statement. mcphub has a monkey-patched 1000-entry console ring, a DB-only activity table with no upstream/total latency split and no request id, no /metrics, no tracing, and a /health that returns 200 'degraded' while every upstream is down.\"",
+  "total_loc_estimate": 2570
+}
