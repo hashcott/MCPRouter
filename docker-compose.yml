@@ -1,0 +1,28 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: mcprouter
+      POSTGRES_PASSWORD: mcprouter
+      POSTGRES_DB: mcprouter
+    ports: ['5432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U mcprouter -d mcprouter']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://mcprouter:mcprouter@db:5432/mcprouter
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET in .env — copy .env.example}
+      PUBLIC_URL: http://localhost:3000
+      LOG_LEVEL: info
+    ports: ['3000:3000']
+
+volumes:
+  pgdata:

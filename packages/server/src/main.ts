@@ -28,7 +28,7 @@ const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
 
 if (config.migrateOnBoot) {
   try {
-    await runMigrations(pool, log);
+    await runMigrations(pool, log, process.env['MIGRATIONS_DIR']);
     readiness.migrationsApplied = true;
   } catch (err) {
     log.fatal({ evt: 'boot.migrate_failed', err }, 'migrations failed');

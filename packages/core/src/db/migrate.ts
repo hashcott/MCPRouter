@@ -19,14 +19,24 @@ function migrationsFolder(): string {
   return resolve(here, '../../../../drizzle');
 }
 
-export async function runMigrations(pool: pg.Pool, log: Logger): Promise<void> {
+/**
+ * `migrationsDir` is not optional decoration: in a deployed image this package
+ * sits under `node_modules/.pnpm/<hash>/...`, where the relative walk above
+ * lands nowhere near the migrations. The process entry point passes the path
+ * explicitly there, exactly as it does for the SPA root.
+ */
+export async function runMigrations(
+  pool: pg.Pool,
+  log: Logger,
+  migrationsDir?: string,
+): Promise<void> {
   const client = await pool.connect();
   try {
     log.info({ evt: 'db.migrate.lock' }, 'acquiring migration lock');
     await client.query('select pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
     try {
       const db = createDb(pool);
-      await migrate(db, { migrationsFolder: migrationsFolder() });
+      await migrate(db, { migrationsFolder: migrationsDir ?? migrationsFolder() });
       log.info({ evt: 'db.migrate.done' }, 'migrations applied');
     } finally {
       await client.query('select pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]);
