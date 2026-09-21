@@ -14,14 +14,19 @@
     "format": "prettier --write .",
     "test:unit": "vitest run --project unit",
     "test:int": "vitest run --project integration",
-    "test": "vitest run"
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:check": "drizzle-kit generate && git diff --exit-code drizzle/"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "12.1.0",
     "@types/node": "26.6.1",
+    "@types/pg": "8.23.1",
+    "@vitest/coverage-v8": "5.0.1",
+    "drizzle-kit": "0.31.10",
     "oxlint": "1.83.0",
     "prettier": "3.9.7",
     "typescript": "7.0.2",
-    "vitest": "5.0.1",
-    "@vitest/coverage-v8": "5.0.1"
+    "vitest": "5.0.1"
   }
 }
