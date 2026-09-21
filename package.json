@@ -16,7 +16,7 @@
     "test:int": "vitest run --project integration",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
-    "db:check": "drizzle-kit generate && git diff --exit-code drizzle/"
+    "db:check": "node scripts/db-check.mjs"
   },
   "devDependencies": {
     "@testcontainers/postgresql": "12.1.0",

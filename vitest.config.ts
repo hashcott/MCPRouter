@@ -26,7 +26,9 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text-summary', 'lcov'],
       include: ['packages/*/src/**/*.ts'],
-      exclude: ['**/*.test.ts', '**/*.itest.ts', '**/dist/**'],
+      // `main.ts` is process bootstrap: importing one starts a server or a CLI,
+      // so no test imports it and counting it measures nothing.
+      exclude: ['**/*.test.ts', '**/*.itest.ts', '**/dist/**', '**/main.ts'],
       thresholds: {
         lines: 70,
         functions: 70,
