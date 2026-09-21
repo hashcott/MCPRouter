@@ -2,7 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import type { Logger } from 'pino';
-import type pg from 'pg';
+import type { Pool } from 'pg';
 import { createDb } from './client.js';
 
 export { createPool, createDb, type Db } from './client.js';
@@ -26,7 +26,7 @@ function migrationsFolder(): string {
  * explicitly there, exactly as it does for the SPA root.
  */
 export async function runMigrations(
-  pool: pg.Pool,
+  pool: Pool,
   log: Logger,
   migrationsDir?: string,
 ): Promise<void> {
