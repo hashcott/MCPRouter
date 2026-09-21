@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { Hono } from 'hono';
 import type { Logger } from 'pino';
 import type pg from 'pg';
@@ -16,10 +18,13 @@ export interface AppDeps {
   pool: pg.Pool;
   registry: Metrics;
   readiness: Readiness;
+  /** Absolute path to the built SPA. Omit to disable static serving. */
+  webRoot?: string | undefined;
 }
 
 const KNOWN_ROUTES = new Set(['/health/live', '/health/ready', '/metrics']);
 const UNMATCHED = '__unmatched__';
+const RESERVED = ['/api', '/mcp', '/health', '/metrics', '/.well-known'];
 
 export function createApp(deps: AppDeps): Hono {
   const { log, pool, registry, readiness } = deps;
@@ -73,6 +78,23 @@ export function createApp(deps: AppDeps): Hono {
     const body = await registry.registry.metrics();
     return c.text(body, 200, { 'content-type': registry.registry.contentType });
   });
+
+  if (deps.webRoot !== undefined) {
+    const root = deps.webRoot;
+    app.get('*', async (c) => {
+      const path = new URL(c.req.url).pathname;
+      if (RESERVED.some((p) => path === p || path.startsWith(`${p}/`))) {
+        return c.json({ error: 'not_found' }, 404);
+      }
+      // Assets are content-hashed by vite; index.html must never be cached.
+      try {
+        const html = await readFile(join(root, 'index.html'), 'utf8');
+        return c.html(html, 200, { 'cache-control': 'no-store' });
+      } catch {
+        return c.json({ error: 'not_found' }, 404);
+      }
+    });
+  }
 
   app.onError((err, c) => {
     log.error({ evt: 'http.error', err: { message: err.message } }, 'unhandled');

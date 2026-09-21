@@ -162,3 +162,62 @@ describe('metrics', () => {
     expect(body).not.toContain('zzz-not-a-route-1');
   });
 });
+
+describe('static SPA', () => {
+  it('serves index.html for an unmatched GET when webRoot is set', async () => {
+    const { mkdtemp, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await mkdtemp(join(tmpdir(), 'mcpr-web-'));
+    await writeFile(join(dir, 'index.html'), '<!doctype html><title>MCPRouter</title>');
+
+    const app = createApp({
+      config: cfg(),
+      log,
+      pool: fakePool(true),
+      registry: createRegistry(),
+      readiness,
+      webRoot: dir,
+    });
+
+    const res = await app.request('/servers/github');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(await res.text()).toContain('MCPRouter');
+  });
+
+  it('does NOT swallow /api, /health, /metrics or /.well-known', async () => {
+    const { mkdtemp, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await mkdtemp(join(tmpdir(), 'mcpr-web-'));
+    await writeFile(join(dir, 'index.html'), '<!doctype html><title>MCPRouter</title>');
+
+    const app = createApp({
+      config: cfg(),
+      log,
+      pool: fakePool(true),
+      registry: createRegistry(),
+      readiness,
+      webRoot: dir,
+    });
+
+    for (const p of ['/api/anything', '/.well-known/x', '/health/nope']) {
+      const res = await app.request(p);
+      expect(res.status, p).toBe(404);
+      expect(res.headers.get('content-type') ?? '', p).not.toContain('text/html');
+    }
+  });
+
+  it('404s an unmatched GET when webRoot is not set', async () => {
+    const app = createApp({
+      config: cfg(),
+      log,
+      pool: fakePool(true),
+      registry: createRegistry(),
+      readiness,
+    });
+    expect((await app.request('/servers/github')).status).toBe(404);
+  });
+});

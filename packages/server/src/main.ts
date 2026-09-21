@@ -1,3 +1,5 @@
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { serve } from '@hono/node-server';
 import { createLogger, createPool, runMigrations } from '@mcprouter/core';
 import { loadConfig } from './config.js';
@@ -11,10 +13,13 @@ const log = createLogger({
   pretty: process.env['NODE_ENV'] !== 'production',
 });
 
+const webRoot =
+  process.env['WEB_ROOT'] ?? resolve(dirname(fileURLToPath(import.meta.url)), '../../web/dist');
+
 const pool = createPool(config.databaseUrl);
 const registry = createRegistry();
 const readiness: Readiness = { migrationsApplied: false, routesMounted: false };
-const app = createApp({ config, log, pool, registry, readiness });
+const app = createApp({ config, log, pool, registry, readiness, webRoot });
 
 const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
   readiness.routesMounted = true;
