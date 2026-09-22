@@ -120,6 +120,20 @@ than tear down a healthy server, and a genuinely dead connection arrives as `tra
 which does go to `retrying`. Cost if wrong: a failed refresh is dropped and debug-logged instead
 of escalating; the next transport-level failure still escalates normally.
 
+**Ruling P9 — the projection memo must be per-registry, not module-global.**
+Found by Task 9's full-file test run: the memo-invalidation test passed in isolation and failed
+beside its neighbours. The memo was a module-level `Map` keyed on `scope.key + catalogVersion`,
+and every `ServerRegistry` starts its counter near zero — so two engines in one process generate
+*identical keys for different catalogs* and serve each other's projected tool lists. Tests are
+the cheap way this shows up; a second Engine in one process is the expensive way.
+It is also, precisely, the module-global mutable state the engine design names as the mcphub
+pattern to avoid.
+**So:** `catalog.ts` holds a `WeakMap<ServerRegistry, Map<string, MemoEntry>>`, so a memo is
+scoped to its registry and is collected with it. `invalidateMemo()` is dropped — with a
+per-registry memo there is nothing global to invalidate, and no test needed it.
+**Note:** a test that passes alone and fails in company is reporting shared state, not
+flakiness. Do not reach for `retry`; the global gate is `retry: 0` for this reason.
+
 ### Per-task self-consistency
 
 | Task | Finding |
@@ -2822,7 +2836,6 @@ git commit -m "feat(core): server registry with hash-diffed applyConfig and per-
   - `isExposed(srv, cfg, sel, kind, bare): boolean` — **THE** predicate, called by both list and call
   - `resolveTool(scope, reg, name): { sel; bare }` — **THE** resolver, the only construction site of `ToolUnavailableError`
   - `projectTools(scope, reg): Tool[]`, `projectPrompts(...)`, `projectResources(...)`, `projectResourceTemplates(...)`
-  - `invalidateMemo()` — test hook
 
 This task is where the mcphub CVE class becomes unrepresentable. `resolveTool` runs the **same** `isExposed` as `projectTools`, so a tool that is not listed cannot be called — not because two gates agree today, but because there is one gate.
 
@@ -3077,10 +3090,23 @@ type MemoEntry = {
   resources: Resource[];
   resourceTemplates: ResourceTemplate[];
 };
-const memo = new Map<string, MemoEntry>();
+/**
+ * Per-registry, NOT module-global. A global map keyed on `scope.key +
+ * catalogVersion` collides across Engine instances: two engines in one process
+ * both start their counters low, so identical keys would serve each other's
+ * projected tool lists. A module-global mutable cache is also precisely the
+ * mcphub pattern this engine exists to avoid. The WeakMap lets a discarded
+ * registry take its memo with it.
+ */
+const memos = new WeakMap<ServerRegistry, Map<string, MemoEntry>>();
 
-export function invalidateMemo(): void {
-  memo.clear();
+function memoOf(reg: ServerRegistry): Map<string, MemoEntry> {
+  let m = memos.get(reg);
+  if (m === undefined) {
+    m = new Map();
+    memos.set(reg, m);
+  }
+  return m;
 }
 
 function build(scope: ResolvedScope, reg: ServerRegistry): MemoEntry {
@@ -3108,6 +3134,7 @@ function build(scope: ResolvedScope, reg: ServerRegistry): MemoEntry {
 }
 
 function entry(scope: ResolvedScope, reg: ServerRegistry): MemoEntry {
+  const memo = memoOf(reg);
   const key = `${scope.key}:${reg.catalogVersion}`;
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
