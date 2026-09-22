@@ -1,3 +1,5 @@
+import type { State } from './state.js';
+
 type Handler<T> = (payload: T) => void;
 
 /**
@@ -43,3 +45,48 @@ export class Bus<E extends Record<string, unknown>> {
     }
   }
 }
+
+export type EngineEvents = {
+  'server:state': {
+    name: string;
+    key: string;
+    from: State;
+    to: State;
+    attempt: number;
+    error?: { code: string; message: string };
+    authorizationUrl?: string;
+  };
+  'server:catalog': {
+    name: string;
+    changed: boolean;
+    tools: number;
+    prompts: number;
+    resources: number;
+    fetchedAt: number;
+  };
+  'call:start': {
+    callId: string;
+    server: string;
+    kind: 'tool' | 'prompt' | 'resource';
+    target: string;
+    principalId: string;
+    scopeKey: string;
+    /** BY REFERENCE. A listener must not retain or mutate this. */
+    args: unknown;
+  };
+  'call:end': {
+    callId: string;
+    ok: boolean;
+    isError: boolean;
+    durationMs: number;
+    errorCode?: string;
+    result?: unknown;
+  };
+  'upstream:log': { name: string; stream: 'stderr' | 'mcp'; level: string; message: string };
+  'config:applied': {
+    generation: number;
+    added: string[];
+    changed: string[];
+    removed: string[];
+  };
+};
