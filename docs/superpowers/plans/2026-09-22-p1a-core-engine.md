@@ -73,6 +73,22 @@ The design's table gives `stopping: { stopped: INTENT }` and the note says "ever
 **Ruling P5 — `catalogVersion` must increment on catalog emit, not only on `applyConfig`.**
 The registry sketch says `catalogVersion` is `++ per applyConfig OR any server:catalog emit`, and `projectTools` memoizes on `${scope.key}:${reg.catalogVersion}`. If a `listChanged` refresh swapped a catalog without bumping the counter, every scope would serve a stale tool list from the memo until the next config write. Task 8 wires the registry to the bus for this, and Task 9's test asserts memo invalidation on refresh specifically.
 
+**Ruling P6 — the SDK is not `exactOptionalPropertyTypes`-clean, so `createTransport` converts at one boundary.**
+Found while executing Task 5. The SDK's `Transport` interface declares one optional `string`
+property, while its own concrete transports expose that property as a getter typed
+`string | undefined`. Under `exactOptionalPropertyTypes` those are not assignable, so
+`new StreamableHTTPClientTransport(...)` cannot be returned as a `Transport` — TS2322, even
+though the object is structurally correct in every way this codebase uses it. The SDK is not
+compiled with the flag, so upstream never saw it.
+**So:** `transport.ts` has one private `asTransport()` helper with the reason written above it,
+and all three branches return through it. The alternative — dropping
+`exactOptionalPropertyTypes` repo-wide — would trade a real correctness flag across four
+packages for one upstream declaration mismatch. Cost if wrong: nothing structural; the day the
+SDK fixes its declaration the helper becomes a no-op and can be deleted.
+**Note for the implementer:** the explanation above deliberately does not name the property,
+because the global constraint forbids that string appearing anywhere in `packages/core` and
+Task 11 Step 6 greps for it.
+
 ### Per-task self-consistency
 
 | Task | Finding |
