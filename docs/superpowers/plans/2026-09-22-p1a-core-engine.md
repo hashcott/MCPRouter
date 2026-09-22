@@ -106,6 +106,20 @@ reconnect bug in Tasks 7 and 8.
 dependency, and an argument crossing the wire becomes observable. The code block in Task 6 is
 the corrected version.
 
+**Ruling P8 — the design's state table drops the result of a refresh, and the catalog goes stale forever.**
+Found by Task 8's Ruling P5 test, which is the reason that test exists. The table makes
+`discoverOk` legal only from `discovering`, while `refresh` is `ready -> ready`. So a
+`listChanged` on a live connection re-lists the upstream and then hands `discoverOk` to a server
+in `ready`, where it is an illegal pair and is **dropped**. The catalog is never swapped, no
+`server:catalog` is emitted, `catalogVersion` never moves, and `projectTools`' memo keeps
+serving the old tool list indefinitely. The symptom is silent and permanent.
+**So:** `ready` gains `discoverOk: 'ready'`. Every catalog swap still flows through the single
+`dispatch` path, which is the invariant the design actually wanted. `discoverFail` is left
+illegal from `ready` deliberately — one failed re-list should keep the last good catalog rather
+than tear down a healthy server, and a genuinely dead connection arrives as `transportClose`,
+which does go to `retrying`. Cost if wrong: a failed refresh is dropped and debug-logged instead
+of escalating; the next transport-level failure still escalates normally.
+
 ### Per-task self-consistency
 
 | Task | Finding |
@@ -765,6 +779,12 @@ export const TABLE: Record<State, Partial<Record<Ev['t'], State | typeof FAIL | 
   },
   ready: {
     refresh: 'ready',
+    // A refresh re-discovers on a live connection and must be able to deliver the
+    // result. Without this the swap is dropped and the catalog silently goes stale
+    // after every listChanged. `discoverFail` stays illegal here on purpose: one
+    // failed re-list should keep the last good catalog, not tear down a healthy
+    // server — a dead connection arrives as `transportClose` instead.
+    discoverOk: 'ready',
     transportClose: 'retrying',
     authChallenge: 'authRequired',
     stop: 'stopping',
