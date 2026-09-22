@@ -89,6 +89,23 @@ SDK fixes its declaration the helper becomes a no-op and can be deleted.
 because the global constraint forbids that string appearing anywhere in `packages/core` and
 Task 11 Step 6 greps for it.
 
+**Ruling P7 — the fake upstream must use the SDK's low-level `Server`, not `McpServer.registerTool`.**
+Found while executing Task 6; both halves were caught by the fake's own test, which exists for
+exactly this reason.
+(a) `registerTool`'s `inputSchema` is zod-typed (`ZodRawShapeCompat | AnySchema`, and
+`AnySchema = z3.ZodTypeAny | z4.$ZodType`). zod is a transitive dependency of the SDK and is
+therefore **not reachable from `packages/core`** — `require.resolve` returns MODULE_NOT_FOUND,
+which is the isolation working. Passing `inputSchema: {}` typechecks and then silently discards
+every argument: handlers saw `{}` and the test read `wrote undefined`. Adding zod to core just
+to describe a fake's arguments is the wrong trade.
+(b) One `Protocol` instance cannot be reconnected — the second `connect()` throws "Already
+connected to a transport". A fake that reuses one server would have surfaced as a phantom
+reconnect bug in Tasks 7 and 8.
+**So:** the fake builds a fresh `Server` per `connect()` and registers `ListToolsRequestSchema` /
+`CallToolRequestSchema` handlers, reading `request.params.arguments` verbatim. No new
+dependency, and an argument crossing the wire becomes observable. The code block in Task 6 is
+the corrected version.
+
 ### Per-task self-consistency
 
 | Task | Finding |
@@ -1515,7 +1532,8 @@ This is the seam that makes Tasks 7–11 testable with no child processes and no
 
 ```ts
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { TransportFactory } from '../src/transport.js';
 
@@ -1529,16 +1547,25 @@ export type FakeKnobs = {
   /** Delay before connect resolves, to exercise the connect semaphore. */
   connectDelayMs?: number;
   /** 'permanent' -> never retry; 'transient' -> retryable. */
-  failConnect?: 'permanent' | 'transient';
+  failConnect?: 'permanent' | 'transient' | undefined;
   /** Throw a 401-shaped error so the engine reaches authRequired. */
   authChallenge?: boolean;
 };
 
+/**
+ * A REAL MCP server over InMemoryTransport — no child process, no port, sub-ms.
+ *
+ * It uses the low-level `Server` with the SDK's own request schemas rather than
+ * `McpServer.registerTool`, for two reasons: `registerTool`'s inputSchema is
+ * zod-typed and zod is deliberately not reachable from packages/core, and the
+ * raw handler receives `arguments` verbatim, which is what lets a test prove an
+ * argument actually crossed the wire.
+ */
 export class FakeUpstream {
-  readonly server: McpServer;
   #tools: FakeTool[];
   #connects = 0;
   #closed = false;
+  #live: Server | undefined;
 
   constructor(
     readonly name: string,
@@ -1546,8 +1573,6 @@ export class FakeUpstream {
     readonly knobs: FakeKnobs = {},
   ) {
     this.#tools = tools;
-    this.server = new McpServer({ name, version: '0.0.0' });
-    this.#register();
   }
 
   get connects(): number {
@@ -1558,37 +1583,46 @@ export class FakeUpstream {
     return this.#closed;
   }
 
-  #register(): void {
-    for (const t of this.#tools) {
-      this.server.registerTool(
-        t.name,
-        {
-          description: t.description ?? `fake ${t.name}`,
-          inputSchema: {},
-        },
-        async (args: Record<string, unknown>) => ({
-          content: [
-            {
-              type: 'text' as const,
-              text: t.handler === undefined ? `${t.name}:ok` : await t.handler(args),
-            },
-          ],
-        }),
-      );
-    }
+  #build(): Server {
+    const server = new Server(
+      { name: this.name, version: '0.0.0' },
+      { capabilities: { tools: { listChanged: true } } },
+    );
+    server.setRequestHandler(ListToolsRequestSchema, () => ({
+      tools: this.#tools.map((t) => ({
+        name: t.name,
+        description: t.description ?? `fake ${t.name}`,
+        inputSchema: { type: 'object' as const, properties: {} },
+      })),
+    }));
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const tool = this.#tools.find((t) => t.name === request.params.name);
+      if (tool === undefined) throw new Error(`no such tool: ${request.params.name}`);
+      const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: tool.handler === undefined ? `${tool.name}:ok` : await tool.handler(args),
+          },
+        ],
+      };
+    });
+    return server;
   }
 
   /** Replace the tool set and announce it, to exercise listChanged handling. */
   setTools(tools: FakeTool[]): void {
     this.#tools = tools;
-    this.server.sendToolListChanged();
+    void this.#live?.sendToolListChanged();
   }
 
   /** Kill the connection from the upstream side, to drive reconnect + backoff. */
   async drop(): Promise<void> {
-    await this.server.close();
+    await this.#live?.close();
   }
 
+  /** A fresh Server per connect: one Protocol instance cannot be reconnected. */
   async connect(): Promise<Transport> {
     this.#connects += 1;
     if (this.knobs.connectDelayMs !== undefined) {
@@ -1603,7 +1637,10 @@ export class FakeUpstream {
       });
     }
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-    await this.server.connect(serverSide);
+    const server = this.#build();
+    await server.connect(serverSide);
+    this.#live = server;
+
     const origClose = clientSide.close.bind(clientSide);
     clientSide.close = async () => {
       this.#closed = true;
