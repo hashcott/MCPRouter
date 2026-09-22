@@ -55,6 +55,12 @@ export const TABLE: Record<State, Partial<Record<Ev['t'], State | typeof FAIL | 
   },
   ready: {
     refresh: 'ready',
+    // A refresh re-discovers on a live connection and must be able to deliver the
+    // result. Without this the swap is dropped and the catalog silently goes stale
+    // after every listChanged. `discoverFail` stays illegal here on purpose: one
+    // failed re-list should keep the last good catalog, not tear down a healthy
+    // server — a dead connection arrives as `transportClose` instead.
+    discoverOk: 'ready',
     transportClose: 'retrying',
     authChallenge: 'authRequired',
     stop: 'stopping',
