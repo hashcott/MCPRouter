@@ -72,7 +72,9 @@ async function shutdown(signal: string): Promise<void> {
     process.exit(0);
   }, config.shutdownTimeoutMs);
   timer.unref();
-  server.close();
+  // Drain: in-flight tool calls finish before their upstreams are stopped.
+  // The timer above caps the wait at SHUTDOWN_TIMEOUT_MS.
+  await new Promise<void>((done) => server.close(() => done()));
   sync?.stop();
   await engine.shutdown();
   await pool.end();

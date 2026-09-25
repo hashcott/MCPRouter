@@ -11,6 +11,12 @@ export const KEY_GRANT_ALL = { mcp: ['all'] };
 /** Parsed on every read and fail-closed (§5.2): anything P1 does not know denies. */
 const Grant = z.strictObject({ mcp: z.tuple([z.literal('all')]) });
 
+/**
+ * §5.2 point 2: a machine credential is never admin, as a TYPE — writing
+ * `isAdmin: true` (or `isAdmin: someRole === 'admin'`) on this path fails to compile.
+ */
+export type MachinePrincipal = Principal & { isAdmin: false };
+
 export type AuthDeps = { db: Db; secret: string; baseURL: string; log: Logger };
 
 /** better-auth is configuration, not code (§13 P1). We store, hash and look up nothing ourselves. */
@@ -51,7 +57,7 @@ const BEARER = /^Bearer\s+(\S+)$/i;
 export async function authenticateKey(
   auth: Auth,
   authorization: string | undefined,
-): Promise<Principal | null> {
+): Promise<MachinePrincipal | null> {
   const key = BEARER.exec(authorization ?? '')?.[1];
   if (key === undefined) return null;
   // Returns {valid:false}, never throws, for an unknown/disabled/expired key.

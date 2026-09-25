@@ -75,10 +75,16 @@ describe('startServerSync', () => {
     expect(engine.status().map((s) => s.name)).not.toContain('gh');
   });
 
+  it('sees an in-place edit made with raw SQL, no updated_at bump needed', async () => {
+    await pool.query(`update servers set enabled = false where slug = 'fs'`);
+    await vi.waitFor(() => expect(names(sync)).not.toContain('fs'));
+    await pool.query(`update servers set enabled = true where slug = 'fs'`);
+    await vi.waitFor(() => expect(names(sync)).toContain('fs'));
+  });
+
   it('logs a server whose secret cannot be opened, by slug, and keeps serving the rest', async () => {
     await createServer(db, kr, { slug: 'broken', config: stdio({ K: 'v' }) });
     await pool.query(`update secrets set tag = decode(repeat('00', 16), 'hex') where label = 'K'`);
-    await pool.query(`update servers set updated_at = now() where slug = 'broken'`);
     await vi.waitFor(() =>
       expect(errors).toContainEqual(expect.objectContaining({ server: 'broken' })),
     );

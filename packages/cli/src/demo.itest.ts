@@ -124,7 +124,14 @@ describe('day-21 demo', () => {
     await c.close();
   });
 
-  it('the same request with a wrong key never reaches the engine', async () => {
+  it('the same request with a wrong key is a 401 from auth, not some other failure', async () => {
+    const res = await app.request('/mcp', {
+      method: 'POST',
+      headers: { authorization: 'Bearer mcpr_wrong', 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe('Bearer');
     await expect(connect('mcpr_wrong')).rejects.toThrow();
   });
 });

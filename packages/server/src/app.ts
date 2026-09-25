@@ -12,6 +12,7 @@ import {
   type Principal,
   type ResolvedScope,
 } from '@mcprouter/core';
+import type { MachinePrincipal } from './auth.js';
 import type { Config } from './config.js';
 import { handleMcp } from './mcp/legacy.js';
 import type { Metrics } from './metrics.js';
@@ -35,7 +36,7 @@ export interface AppDeps {
 
 export interface McpDeps {
   /** `Authorization` header → machine principal, or null. */
-  authenticate: (authorization: string | undefined) => Promise<Principal | null>;
+  authenticate: (authorization: string | undefined) => Promise<MachinePrincipal | null>;
   engine: Engine;
   /** The `{kind:'all'}` target (§4.2): every enabled server currently loaded. */
   scopeAll: () => ResolvedScope;

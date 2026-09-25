@@ -19,10 +19,10 @@ export const EMPTY_SCOPE: ResolvedScope = { key: 'all:', servers: [], flatten: f
 
 /**
  * Keeps the Engine in step with the `servers` table.
- * ponytail: polls a fingerprint of (id, updated_at) every `intervalMs` — no
- * long-lived LISTEN connection to re-establish, correct across replicas.
- * Switch to LISTEN/NOTIFY if 5 s of staleness ever matters. Every writer to
- * `servers` must bump `updated_at` (createServer inserts; later editors update it).
+ * ponytail: polls an md5 of every `servers` and server-owned `secrets` row
+ * every `intervalMs` — no long-lived LISTEN connection to re-establish,
+ * correct across replicas, O(rows) per poll. Switch to LISTEN/NOTIFY if 5 s of
+ * staleness or thousands of servers ever matter.
  */
 export async function startServerSync(o: {
   pool: pg.Pool;
@@ -37,9 +37,14 @@ export async function startServerSync(o: {
   let queue = Promise.resolve();
 
   const tick = async (): Promise<void> => {
+    // Whole rows of both tables: an edit made in psql, or a re-sealed secret, is seen
+    // without any writer having to remember to bump updated_at.
     const r = await o.pool.query<{ v: string }>(
-      `select md5(coalesce(string_agg(id::text || updated_at::text, ',' order by id), '')) as v
-       from servers`,
+      `select md5(
+         coalesce((select string_agg(s::text, ',' order by s.id) from servers s), '') ||
+         coalesce((select string_agg(x::text, ',' order by x.id) from secrets x
+                   where x.server_id is not null), '')
+       ) as v`,
     );
     const v = r.rows[0]?.v ?? '';
     if (v === fingerprint) return;
