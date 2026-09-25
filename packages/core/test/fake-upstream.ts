@@ -1,6 +1,14 @@
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListResourcesRequestSchema,
+  ListToolsRequestSchema,
+  ReadResourceRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { TransportFactory } from '../src/transport.js';
 
@@ -10,6 +18,18 @@ export type FakeTool = {
   handler?: (args: Record<string, unknown>) => Promise<string> | string;
 };
 
+export type FakePrompt = {
+  name: string;
+  description?: string;
+  handler?: (args: Record<string, string>) => Promise<string> | string;
+};
+
+export type FakeResource = {
+  uri: string;
+  name?: string;
+  handler?: () => Promise<string> | string;
+};
+
 export type FakeKnobs = {
   /** Delay before connect resolves, to exercise the connect semaphore. */
   connectDelayMs?: number;
@@ -17,6 +37,10 @@ export type FakeKnobs = {
   failConnect?: 'permanent' | 'transient' | undefined;
   /** Throw a 401-shaped error so the engine reaches authRequired. */
   authChallenge?: boolean;
+  /** Undefined -> no `prompts` capability, same as before this option existed. */
+  prompts?: FakePrompt[];
+  /** Undefined -> no `resources` capability, same as before this option existed. */
+  resources?: FakeResource[];
 };
 
 /**
@@ -51,9 +75,16 @@ export class FakeUpstream {
   }
 
   #build(): Server {
+    const { prompts, resources } = this.knobs;
     const server = new Server(
       { name: this.name, version: '0.0.0' },
-      { capabilities: { tools: { listChanged: true } } },
+      {
+        capabilities: {
+          tools: { listChanged: true },
+          ...(prompts === undefined ? {} : { prompts: {} }),
+          ...(resources === undefined ? {} : { resources: {} }),
+        },
+      },
     );
     server.setRequestHandler(ListToolsRequestSchema, () => ({
       tools: this.#tools.map((t) => ({
@@ -75,6 +106,41 @@ export class FakeUpstream {
         ],
       };
     });
+
+    if (prompts !== undefined) {
+      server.setRequestHandler(ListPromptsRequestSchema, () => ({
+        prompts: prompts.map((p) => ({
+          name: p.name,
+          description: p.description ?? `fake ${p.name}`,
+        })),
+      }));
+      server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+        const prompt = prompts.find((p) => p.name === request.params.name);
+        if (prompt === undefined) throw new Error(`no such prompt: ${request.params.name}`);
+        const args = (request.params.arguments ?? {}) as Record<string, string>;
+        const text =
+          prompt.handler === undefined ? `${prompt.name}:ok` : await prompt.handler(args);
+        return { messages: [{ role: 'user' as const, content: { type: 'text' as const, text } }] };
+      });
+    }
+
+    if (resources !== undefined) {
+      server.setRequestHandler(ListResourcesRequestSchema, () => ({
+        resources: resources.map((r) => ({ uri: r.uri, name: r.name ?? r.uri })),
+      }));
+      // No fake test registers a template; discovery still needs a handler to call.
+      server.setRequestHandler(ListResourceTemplatesRequestSchema, () => ({
+        resourceTemplates: [],
+      }));
+      server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+        const resource = resources.find((r) => r.uri === request.params.uri);
+        if (resource === undefined) throw new Error(`no such resource: ${request.params.uri}`);
+        const text =
+          resource.handler === undefined ? `${resource.uri}:ok` : await resource.handler();
+        return { contents: [{ uri: resource.uri, text }] };
+      });
+    }
+
     return server;
   }
 

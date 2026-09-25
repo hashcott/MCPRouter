@@ -47,22 +47,45 @@ export function isExposed(
 }
 
 /**
- * THE resolver, and the ONLY construction site of ToolUnavailableError — which is
- * what makes hidden, disabled and never-existed indistinguishable from outside.
+ * THE resolver, kind-parameterised, and the ONLY construction site of
+ * ToolUnavailableError — which is what makes hidden, disabled and never-existed
+ * indistinguishable from outside. Prompts resolve by projected name exactly
+ * like tools. Resources are NOT prefixed: scan `scope.servers` in order and
+ * take the first server whose predicate allows this URI — the same
+ * first-in-scope-order rule `flatten` already uses for tools (Ruling P12).
  */
-export function resolveTool(
+export function resolveByKind(
   scope: ResolvedScope,
   reg: ServerRegistry,
+  kind: Kind,
   name: string,
 ): { sel: ServerSelection; bare: string } {
+  if (kind === 'resource') {
+    for (const sel of scope.servers) {
+      const srv = reg.shared(sel.serverName);
+      if (srv !== undefined && isExposed(srv, srv.config, sel, 'resource', name)) {
+        return { sel, bare: name };
+      }
+    }
+    throw new ToolUnavailableError(name);
+  }
   for (const sel of scope.servers) {
     const prefix = `${label(sel)}${SEP}`;
     const bare = scope.flatten ? name : name.startsWith(prefix) ? name.slice(prefix.length) : null;
     if (bare === null) continue;
     const srv = reg.shared(sel.serverName);
-    if (srv !== undefined && isExposed(srv, srv.config, sel, 'tool', bare)) return { sel, bare };
+    if (srv !== undefined && isExposed(srv, srv.config, sel, kind, bare)) return { sel, bare };
   }
   throw new ToolUnavailableError(name);
+}
+
+/** The `'tool'` wrapper — signature unchanged, so existing callers and tests still pass. */
+export function resolveTool(
+  scope: ResolvedScope,
+  reg: ServerRegistry,
+  name: string,
+): { sel: ServerSelection; bare: string } {
+  return resolveByKind(scope, reg, 'tool', name);
 }
 
 // ---- projection, memoized on scope.key + catalogVersion ----------------------
