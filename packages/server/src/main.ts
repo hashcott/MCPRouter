@@ -6,7 +6,8 @@ import { authenticateKey, createAuth } from './auth.js';
 import { loadConfig } from './config.js';
 import { createApp, type Readiness } from './app.js';
 import { createRegistry } from './metrics.js';
-import { EMPTY_SCOPE, startServerSync, type ServerSync } from './servers-sync.js';
+import { EMPTY_SNAPSHOT, resolveTarget } from './scope.js';
+import { startServerSync, type ServerSync } from './servers-sync.js';
 
 const config = loadConfig();
 const log = createLogger({
@@ -36,7 +37,12 @@ const app = createApp({
     authenticate: async (header) => (await authenticateKey(auth, header))?.principal ?? null,
     engine,
     // Before the first sync lands, an empty catalog — never "all" (P1a constraint).
-    scopeAll: () => sync?.scopeAll() ?? EMPTY_SCOPE,
+    scopeAll: () =>
+      resolveTarget(sync?.snapshot() ?? EMPTY_SNAPSHOT, { kind: 'all' })?.scope ?? {
+        key: 'all:',
+        servers: [],
+        flatten: false,
+      },
     timeoutMs: config.mcpCallTimeoutMs,
     authHandler: (req) => auth.handler(req),
   },

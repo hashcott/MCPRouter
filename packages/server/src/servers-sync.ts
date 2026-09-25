@@ -1,25 +1,34 @@
+import { asc, eq } from 'drizzle-orm';
 import type { Logger } from 'pino';
 import type pg from 'pg';
+import { z } from 'zod';
 import {
   loadServerConfigs,
+  schema,
   type Db,
   type Engine,
   type Keyring,
-  type ResolvedScope,
+  type Selection,
 } from '@mcprouter/core';
+import { EMPTY_SNAPSHOT, type Member, type Snapshot } from './scope.js';
 
 export type ServerSync = {
-  /** The `{kind:'all'}` target: every enabled server of the last applied table. */
-  scopeAll(): ResolvedScope;
+  /** What the last successful poll applied. */
+  snapshot(): Snapshot;
   refresh(): Promise<void>;
   stop(): void;
 };
 
-export const EMPTY_SCOPE: ResolvedScope = { key: 'all:', servers: [], flatten: false };
+const SelectionSchema = z.union([z.literal('all'), z.array(z.string())]);
+/** Fail closed: a selection that does not parse exposes nothing. */
+const selection = (raw: unknown): Selection => {
+  const r = SelectionSchema.safeParse(raw);
+  return r.success ? r.data : [];
+};
 
 /**
- * Keeps the Engine in step with the `servers` table.
- * ponytail: polls an md5 of every `servers` and server-owned `secrets` row
+ * Keeps the Engine and the routing snapshot in step with the database.
+ * ponytail: polls an md5 of every row of the tables that shape routing
  * every `intervalMs` — no long-lived LISTEN connection to re-establish,
  * correct across replicas, O(rows) per poll. Switch to LISTEN/NOTIFY if 5 s of
  * staleness or thousands of servers ever matter.
@@ -33,17 +42,22 @@ export async function startServerSync(o: {
   intervalMs?: number;
 }): Promise<ServerSync> {
   let fingerprint: string | undefined;
-  let scope = EMPTY_SCOPE;
+  let snap: Snapshot = EMPTY_SNAPSHOT;
   let queue = Promise.resolve();
 
   const tick = async (): Promise<void> => {
-    // Whole rows of both tables: an edit made in psql, or a re-sealed secret, is seen
-    // without any writer having to remember to bump updated_at.
+    // Whole rows: an edit made in psql, or a re-sealed secret, is seen without
+    // any writer having to remember to bump updated_at.
     const r = await o.pool.query<{ v: string }>(
       `select md5(
          coalesce((select string_agg(s::text, ',' order by s.id) from servers s), '') ||
          coalesce((select string_agg(x::text, ',' order by x.id) from secrets x
-                   where x.server_id is not null), '')
+                   where x.server_id is not null), '') ||
+         coalesce((select string_agg(g::text, ',' order by g.id) from groups g), '') ||
+         coalesce((select string_agg(m::text, ',' order by m.group_id, m.server_id)
+                   from group_server m), '') ||
+         coalesce((select string_agg(o::text, ',' order by o.server_id, o.kind, o.item_name)
+                   from server_item_override o), '')
        ) as v`,
     );
     const v = r.rows[0]?.v ?? '';
@@ -57,16 +71,48 @@ export async function startServerSync(o: {
       );
     }
     await o.engine.applyConfig(configs);
-    const names = configs.filter((c) => c.enabled).map((c) => c.name);
-    scope = {
-      key: `all:${names.join(',')}`,
-      servers: names.map((serverName) => ({
-        serverName,
-        tools: 'all',
-        prompts: 'all',
-        resources: 'all',
-      })),
-      flatten: false,
+
+    const loaded = new Map(configs.map((c) => [c.name, c.enabled]));
+    const serverRows = await o.db
+      .select({ id: schema.servers.id, slug: schema.servers.slug })
+      .from(schema.servers)
+      .orderBy(asc(schema.servers.slug));
+    const memberRows = await o.db
+      .select({
+        groupId: schema.groups.id,
+        groupSlug: schema.groups.slug,
+        serverId: schema.groupServer.serverId,
+        serverSlug: schema.servers.slug,
+        alias: schema.groupServer.alias,
+        tools: schema.groupServer.tools,
+        prompts: schema.groupServer.prompts,
+        resources: schema.groupServer.resources,
+      })
+      .from(schema.groups)
+      .leftJoin(schema.groupServer, eq(schema.groupServer.groupId, schema.groups.id))
+      .leftJoin(schema.servers, eq(schema.servers.id, schema.groupServer.serverId))
+      .orderBy(asc(schema.groups.slug), asc(schema.servers.slug));
+
+    const groups = new Map<string, { id: string; members: Member[] }>();
+    for (const m of memberRows) {
+      const g = groups.get(m.groupSlug) ?? { id: m.groupId, members: [] };
+      groups.set(m.groupSlug, g);
+      if (m.serverId === null || m.serverSlug === null) continue; // a group with no members
+      g.members.push({
+        serverId: m.serverId,
+        serverSlug: m.serverSlug,
+        ...(m.alias === null ? {} : { alias: m.alias }),
+        tools: selection(m.tools),
+        prompts: selection(m.prompts),
+        resources: selection(m.resources),
+      });
+    }
+    snap = {
+      // Only servers the Engine holds; one whose secrets failed to open is not routable.
+      servers: serverRows
+        .filter((s) => loaded.has(s.slug))
+        .map((s) => ({ id: s.id, slug: s.slug, enabled: loaded.get(s.slug) === true })),
+      groups,
     };
     fingerprint = v;
     o.log.info(
@@ -88,5 +134,5 @@ export async function startServerSync(o: {
   await refresh();
   const timer = setInterval(() => void refresh(), o.intervalMs ?? 5_000);
   timer.unref();
-  return { scopeAll: () => scope, refresh, stop: () => clearInterval(timer) };
+  return { snapshot: () => snap, refresh, stop: () => clearInterval(timer) };
 }

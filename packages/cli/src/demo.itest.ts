@@ -11,6 +11,7 @@ import {
   createAuth,
   createRegistry,
   parseConfig,
+  resolveTarget,
   startServerSync,
   type ServerSync,
 } from '@mcprouter/server';
@@ -86,7 +87,7 @@ beforeAll(async () => {
     mcp: {
       authenticate: async (h) => (await authenticateKey(auth, h))?.principal ?? null,
       engine,
-      scopeAll: () => sync.scopeAll(),
+      scopeAll: () => resolveTarget(sync.snapshot(), { kind: 'all' })!.scope,
       timeoutMs: 30_000,
       authHandler: (req) => auth.handler(req),
     },

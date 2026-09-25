@@ -5,7 +5,9 @@ export function describe(): string {
 }
 
 export { createApp, type AppDeps, type McpDeps } from './app.js';
-export { authenticateKey, createAuth, KEY_GRANT_ALL, type Auth } from './auth.js';
+export { authenticateKey, createAuth, KEY_GRANT_ALL, type Auth, type KeyAuth } from './auth.js';
 export { loadConfig, parseConfig, type Config } from './config.js';
 export { createRegistry } from './metrics.js';
-export { EMPTY_SCOPE, startServerSync, type ServerSync } from './servers-sync.js';
+export { startServerSync, type ServerSync } from './servers-sync.js';
+export { checkGrant, parseGrant, toPermissions, type Grant } from './grant.js';
+export { EMPTY_SNAPSHOT, resolveTarget, type Route, type Snapshot, type Target } from './scope.js';

@@ -12,11 +12,13 @@ import {
   type Db,
 } from '@mcprouter/core';
 import { FakeUpstream, fakeFactory } from '../../core/test/fake-upstream.js';
+import { resolveTarget } from './scope.js';
 import { startServerSync, type ServerSync } from './servers-sync.js';
 
 const kr = parseKeyring(`v1:${Buffer.alloc(32, 1).toString('base64url')}`);
 const stdio = (env: Record<string, string> = {}) => ({ type: 'stdio' as const, command: 'x', env });
-const names = (s: ServerSync) => s.scopeAll().servers.map((x) => x.serverName);
+const names = (s: ServerSync) =>
+  resolveTarget(s.snapshot(), { kind: 'all' })?.scope.servers.map((x) => x.serverName) ?? [];
 
 let pg: StartedPostgreSqlContainer;
 let pool: Pool;
@@ -55,7 +57,7 @@ describe('startServerSync', () => {
   it('applies the table before it resolves', () => {
     expect(names(sync)).toEqual(['fs']);
     expect(engine.status().map((s) => s.name)).toEqual(['fs']);
-    expect(sync.scopeAll().flatten).toBe(false);
+    expect(resolveTarget(sync.snapshot(), { kind: 'all' })?.scope.flatten).toBe(false);
   });
 
   it('picks up a server added while it runs', async () => {
@@ -89,5 +91,42 @@ describe('startServerSync', () => {
       expect(errors).toContainEqual(expect.objectContaining({ server: 'broken' })),
     );
     expect(names(sync)).toEqual(['fs']);
+  });
+});
+
+describe('groups in the snapshot', () => {
+  it('a group added while running resolves with its members and selections', async () => {
+    const g = await pool.query(`insert into groups (slug) values ('team') returning id`);
+    await pool.query(
+      `insert into group_server (group_id, server_id, tools, prompts, resources)
+       select $1, id, '["t"]', '[]', '[]' from servers where slug = 'fs'`,
+      [g.rows[0].id],
+    );
+    await vi.waitFor(() =>
+      expect(
+        resolveTarget(sync.snapshot(), { kind: 'group', slug: 'team' })?.scope.servers,
+      ).toEqual([{ serverName: 'fs', tools: ['t'], prompts: [], resources: [] }]),
+    );
+  });
+
+  it('a group with no members resolves empty', async () => {
+    await pool.query(`insert into groups (slug) values ('nobody')`);
+    await vi.waitFor(() =>
+      expect(resolveTarget(sync.snapshot(), { kind: 'group', slug: 'nobody' })?.serverIds).toEqual(
+        [],
+      ),
+    );
+  });
+
+  it('a malformed selection edited by hand exposes nothing for that member, and the group still resolves', async () => {
+    // The CHECK admits any array; an array of non-strings is still wrong.
+    await pool.query(
+      `update group_server set tools = '[1, 2]' where group_id = (select id from groups where slug = 'team')`,
+    );
+    await vi.waitFor(() =>
+      expect(
+        resolveTarget(sync.snapshot(), { kind: 'group', slug: 'team' })?.scope.servers[0]?.tools,
+      ).toEqual([]),
+    );
   });
 });
