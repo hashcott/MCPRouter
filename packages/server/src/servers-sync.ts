@@ -10,7 +10,7 @@ import {
   type Keyring,
   type Selection,
 } from '@mcprouter/core';
-import { EMPTY_SNAPSHOT, type Member, type Snapshot } from './scope.js';
+import { EMPTY_SNAPSHOT, reusedSlugs, type Member, type Snapshot } from './scope.js';
 
 export type ServerSync = {
   /** What the last successful poll applied. */
@@ -63,36 +63,44 @@ export async function startServerSync(o: {
     const v = r.rows[0]?.v ?? '';
     if (v === fingerprint) return;
 
-    const { configs, errors } = await loadServerConfigs(o.db, o.keyring);
+    // One consistent read (a single REPEATABLE READ snapshot) BEFORE the Engine is
+    // touched: configs, servers and memberships all describe the same moment, and no
+    // query can fail after applyConfig and leave the old snapshot routing to new servers.
+    const read = await o.db.transaction(
+      async (tx) => {
+        const loadedServers = await loadServerConfigs(tx, o.keyring);
+        const serverRows = await tx
+          .select({ id: schema.servers.id, slug: schema.servers.slug })
+          .from(schema.servers)
+          .orderBy(asc(schema.servers.slug));
+        const memberRows = await tx
+          .select({
+            groupId: schema.groups.id,
+            groupSlug: schema.groups.slug,
+            serverId: schema.groupServer.serverId,
+            serverSlug: schema.servers.slug,
+            alias: schema.groupServer.alias,
+            tools: schema.groupServer.tools,
+            prompts: schema.groupServer.prompts,
+            resources: schema.groupServer.resources,
+          })
+          .from(schema.groups)
+          .leftJoin(schema.groupServer, eq(schema.groupServer.groupId, schema.groups.id))
+          .leftJoin(schema.servers, eq(schema.servers.id, schema.groupServer.serverId))
+          .orderBy(asc(schema.groups.slug), asc(schema.servers.slug));
+        return { ...loadedServers, serverRows, memberRows };
+      },
+      { isolationLevel: 'repeatable read', accessMode: 'read only' },
+    );
+    const { configs, errors, serverRows, memberRows } = read;
     for (const e of errors) {
       o.log.error(
         { evt: 'servers.load_failed', server: e.slug, reason: e.reason },
         'server left out',
       );
     }
-    await o.engine.applyConfig(configs);
 
     const loaded = new Map(configs.map((c) => [c.name, c.enabled]));
-    const serverRows = await o.db
-      .select({ id: schema.servers.id, slug: schema.servers.slug })
-      .from(schema.servers)
-      .orderBy(asc(schema.servers.slug));
-    const memberRows = await o.db
-      .select({
-        groupId: schema.groups.id,
-        groupSlug: schema.groups.slug,
-        serverId: schema.groupServer.serverId,
-        serverSlug: schema.servers.slug,
-        alias: schema.groupServer.alias,
-        tools: schema.groupServer.tools,
-        prompts: schema.groupServer.prompts,
-        resources: schema.groupServer.resources,
-      })
-      .from(schema.groups)
-      .leftJoin(schema.groupServer, eq(schema.groupServer.groupId, schema.groups.id))
-      .leftJoin(schema.servers, eq(schema.servers.id, schema.groupServer.serverId))
-      .orderBy(asc(schema.groups.slug), asc(schema.servers.slug));
-
     const groups = new Map<string, { id: string; members: Member[] }>();
     for (const m of memberRows) {
       const g = groups.get(m.groupSlug) ?? { id: m.groupId, members: [] };
@@ -107,13 +115,19 @@ export async function startServerSync(o: {
         resources: selection(m.resources),
       });
     }
-    snap = {
+    const next: Snapshot = {
       // Only servers the Engine holds; one whose secrets failed to open is not routable.
       servers: serverRows
         .filter((s) => loaded.has(s.slug))
         .map((s) => ({ id: s.id, slug: s.slug, enabled: loaded.get(s.slug) === true })),
       groups,
     };
+
+    // A slug deleted and re-created: the old snapshot would route to the new upstream
+    // while the Engine swaps. Serve nothing for that (rare) moment rather than the wrong thing.
+    if (reusedSlugs(snap, next).size > 0) snap = EMPTY_SNAPSHOT;
+    await o.engine.applyConfig(configs);
+    snap = next;
     fingerprint = v;
     o.log.info(
       { evt: 'servers.applied', count: configs.length, failed: errors.length },

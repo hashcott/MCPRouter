@@ -134,7 +134,11 @@ function build(scope: ResolvedScope, reg: ServerRegistry): MemoEntry {
       if (!isExposed(srv, srv.config, sel, 'resource', resource.uri)) continue;
       out.resources.push(resource);
     }
-    out.resourceTemplates.push(...catalog.resourceTemplates);
+    // Templates have no URI to test item by item, so they follow the selection as a
+    // whole: only a server exposing ALL of its resources exposes its templates.
+    if (srv.config.enabled && sel.resources === 'all') {
+      out.resourceTemplates.push(...catalog.resourceTemplates);
+    }
   }
   return out;
 }

@@ -175,7 +175,9 @@ describe('audit records', () => {
     expect(records[0]?.inputKeys).toEqual(['text']);
     expect(records[0]?.inputBytes).toBe(Buffer.byteLength('{"text":"secret-value"}'));
     expect(JSON.stringify(records)).not.toContain('secret-value');
-    expect(records[1]?.error).toContain('upstream exploded');
+    // metadata mode (§8): the error's KIND, never its text — upstreams echo argument values.
+    expect(records[1]?.error).toMatch(/Error/);
+    expect(records[1]?.error).not.toContain('upstream exploded');
   });
 
   it('a call past the deadline is recorded as a timeout', async () => {
@@ -202,13 +204,13 @@ describe('races and odd inputs (stub engine)', () => {
       callResolved,
     }) as unknown as Engine;
 
-  async function stubClient(engine: Engine): Promise<Client> {
+  async function stubClient(stubbed: Engine): Promise<Client> {
     const c = new Client({ name: 'test', version: '0.0.0' });
     await c.connect(
       new StreamableHTTPClientTransport(new URL('http://hub.test/mcp'), {
         fetch: (url, init) =>
           handleMcp(new Request(url, init), {
-            engine,
+            engine: stubbed,
             scope,
             principal,
             timeoutMs: 5_000,
@@ -255,5 +257,33 @@ describe('races and odd inputs (stub engine)', () => {
     );
     await expect(c.callTool({ name: 'fs__x' })).rejects.toThrow(/registry exploded/);
     await c.close();
+  });
+});
+
+describe('batches', () => {
+  it('a JSON-RPC batch is refused before anything runs — one POST must be one call (§4.2 limit)', async () => {
+    records.length = 0;
+    const one = {
+      jsonrpc: '2.0',
+      method: 'tools/call',
+      params: { name: 'fs__echo', arguments: {} },
+    };
+    const res = await handleMcp(
+      new Request('http://hub.test/mcp', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify([
+          { ...one, id: 1 },
+          { ...one, id: 2 },
+        ]),
+      }),
+      call(),
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32600 }, id: null });
+    expect(records).toEqual([]);
   });
 });

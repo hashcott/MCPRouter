@@ -66,7 +66,11 @@ export async function createServer(db: Db, kr: Keyring, input: NewServer): Promi
  * cannot be parsed or opened lands in `errors` and is left out: one bad row
  * must neither take down every other upstream nor disappear silently (§11.7).
  */
-export async function loadServerConfigs(db: Db, kr: Keyring): Promise<LoadedServers> {
+/** Takes anything that can `select` — the pool-backed Db or a transaction — so a caller can read consistently. */
+export async function loadServerConfigs(
+  db: Pick<Db, 'select'>,
+  kr: Keyring,
+): Promise<LoadedServers> {
   const rows = await db.select().from(servers).orderBy(servers.slug);
   const secretRows =
     rows.length === 0

@@ -76,3 +76,15 @@ export function resolveTarget(snap: Snapshot, target: Target): Route | null {
     label: `g/${target.slug}`,
   };
 }
+
+/**
+ * Slugs whose server id differs between two snapshots: deleted and re-created
+ * under the same name. While the Engine swaps to the new config, the old
+ * snapshot's routes and memberships would reach the NEW upstream by name.
+ */
+export function reusedSlugs(prev: Snapshot, next: Snapshot): Set<string> {
+  const ids = new Map(next.servers.map((s) => [s.slug, s.id]));
+  return new Set(
+    prev.servers.filter((s) => ids.has(s.slug) && ids.get(s.slug) !== s.id).map((s) => s.slug),
+  );
+}

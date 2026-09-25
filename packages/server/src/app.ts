@@ -7,7 +7,7 @@ import type pg from 'pg';
 import { currentContext, newRequestId, runWithContext, type Engine } from '@mcprouter/core';
 import type { KeyAuth } from './auth.js';
 import type { Config } from './config.js';
-import { checkGrant } from './grant.js';
+import { canSee, checkGrant } from './grant.js';
 import { handleMcp, type CallRecord } from './mcp/legacy.js';
 import type { Route, Target } from './scope.js';
 import type { Metrics } from './metrics.js';
@@ -171,11 +171,12 @@ function mountMcp(app: Hono, mcp: McpDeps): void {
 
   const inflight = new Map<string, number>();
 
-  // §4.2, in this order: authenticate → resolve (404) → checkGrant (403) → limit (429) → handle.
+  // §4.2, in this order: authenticate → resolve + visibility (404) → checkGrant (403) → limit (429) → handle.
   const serve = (target: (c: Context) => Target) =>
     guarded(async (c, a) => {
       const route = mcp.resolve(target(c));
-      if (route === null) return c.json({ error: 'not_found' }, 404);
+      // A group this key cannot see is indistinguishable from one that does not exist.
+      if (route === null || !canSee(a.grant, route)) return c.json({ error: 'not_found' }, 404);
       if (checkGrant(a.grant, route) !== 'ok') {
         return c.json({ error: 'insufficient_scope' }, 403, {
           'WWW-Authenticate': 'Bearer error="insufficient_scope"',

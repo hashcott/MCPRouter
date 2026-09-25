@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { checkGrant, parseGrant, toPermissions, type Grant } from './grant.js';
+import { canSee, checkGrant, parseGrant, toPermissions, type Grant } from './grant.js';
 import type { Route } from './scope.js';
 
 const A = '00000000-0000-4000-8000-00000000000a';
@@ -75,4 +75,43 @@ describe('checkGrant', () => {
   ] as const)('%s → %s', (_n, grant, r, expected) => {
     expect(checkGrant(grant as Grant, r)).toBe(expected);
   });
+});
+
+// §4.2: a group the principal cannot see answers the same 404 as a group that does not exist.
+describe('canSee', () => {
+  const groupG = route([A, B], G);
+  const groupH = route([A], H);
+  const empty = route([], '00000000-0000-4000-8000-0000000000ee');
+
+  it.each([
+    ['all on any group', { kind: 'all' }, groupG, true],
+    ['groups[G] on G', { kind: 'groups', ids: [G] }, groupG, true],
+    ['groups[G] on H — another group is invisible', { kind: 'groups', ids: [G] }, groupH, false],
+    [
+      'servers[A] on G={A,B} — sees a member: visible, then 403 on containment',
+      { kind: 'servers', ids: [A] },
+      groupG,
+      true,
+    ],
+    [
+      'servers[B] on H={A} — no member in reach: invisible',
+      { kind: 'servers', ids: [B] },
+      groupH,
+      false,
+    ],
+    ['servers[A] on an empty group', { kind: 'servers', ids: [A] }, empty, true],
+    ['groups[G] on an empty other group', { kind: 'groups', ids: [G] }, empty, false],
+  ] as const)('%s → %s', (_n, grant, r, expected) => {
+    expect(canSee(grant as Grant, r)).toBe(expected);
+  });
+
+  it.each([
+    ['groups[G] on /mcp', { kind: 'groups', ids: [G] }, route([A, B])],
+    ['servers[B] on server A', { kind: 'servers', ids: [B] }, route([A])],
+  ] as const)(
+    'non-group routes are always visible (%s): the answer there is 403, not 404',
+    (_n, grant, r) => {
+      expect(canSee(grant as Grant, r)).toBe(true);
+    },
+  );
 });

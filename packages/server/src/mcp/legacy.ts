@@ -32,6 +32,7 @@ export type CallRecord = {
   /** metadata mode (§8): argument key names and byte size, never values. */
   inputKeys: string[];
   inputBytes: number;
+  /** The error's class name only, never its message. */
   error: string | null;
 };
 
@@ -55,7 +56,26 @@ function notFound(err: unknown): never {
  * request, and `notifications/initialized` is already a second one — so the
  * Server and the transport are both built per request (spike 4).
  */
-export async function handleMcp(req: Request, call: McpCall): Promise<Response> {
+export async function handleMcp(original: Request, call: McpCall): Promise<Response> {
+  // One POST is one message. A batch would hand every entry to the Server at once
+  // and walk straight past the per-principal limit; MCP dropped batches in 2025-06-18.
+  const body = await original.text();
+  if (body.trimStart().startsWith('[')) {
+    return Response.json(
+      {
+        jsonrpc: '2.0',
+        error: { code: -32600, message: 'Batch requests are not supported.' },
+        id: null,
+      },
+      { status: 400 },
+    );
+  }
+  const req = new Request(original.url, {
+    method: original.method,
+    headers: original.headers,
+    body,
+    signal: original.signal,
+  });
   const { engine, scope, principal } = call;
   const signal = AbortSignal.any([req.signal, AbortSignal.timeout(call.timeoutMs)]);
 
@@ -105,7 +125,10 @@ export async function handleMcp(req: Request, call: McpCall): Promise<Response> 
       }
       // An upstream failure is the tool's result, not the gateway's: the model sees it.
       const text = err instanceof Error ? err.message : 'tool call failed';
-      done(signal.aborted ? 'timeout' : 'error', text);
+      // The model sees the text; the audit row keeps only the kind (§8 metadata mode) —
+      // upstream messages routinely echo argument values back.
+      const kind = err instanceof Error ? err.name : 'unknown';
+      done(signal.aborted ? 'timeout' : 'error', kind);
       return { content: [{ type: 'text', text }], isError: true };
     }
   });

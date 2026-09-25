@@ -75,6 +75,8 @@ async function shutdown(signal: string): Promise<void> {
   log.info({ evt: 'shutdown.begin', signal }, 'shutting down');
   const timer = setTimeout(() => {
     log.warn({ evt: 'shutdown.timeout' }, 'forcing exit');
+    // Audit rows still queued or in flight go to the log, never nowhere (§8).
+    audit.spillAll();
     process.exit(0);
   }, config.shutdownTimeoutMs);
   timer.unref();

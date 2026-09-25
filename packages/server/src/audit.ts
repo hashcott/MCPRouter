@@ -17,6 +17,8 @@ export class AuditWriter {
   #queue: Entry[] = [];
   #timer: NodeJS.Timeout | undefined;
   #flushing: Promise<void> | undefined;
+  /** The batch whose INSERT is awaiting the database — spilled if we give up on it. */
+  #inflight: Entry[] | undefined;
 
   constructor(o: { db: Db; log: Logger; cap?: number; batch?: number; intervalMs?: number }) {
     this.#o = { cap: 10_000, batch: 200, intervalMs: 250, ...o };
@@ -54,15 +56,31 @@ export class AuditWriter {
       }),
     ]);
     clearTimeout(timer);
-    for (const e of this.#queue.splice(0)) this.#spill(e.row);
+    this.spillAll();
+  }
+
+  /**
+   * Synchronous last resort — the forced-exit path cannot await. Everything not yet
+   * persisted goes to the log, including a batch whose INSERT never came back.
+   */
+  spillAll(): void {
+    clearInterval(this.#timer);
+    const abandoned = this.#inflight ?? [];
+    this.#inflight = undefined; // #drain sees the swap and leaves this batch alone
+    for (const e of [...abandoned, ...this.#queue.splice(0)]) this.#spill(e.row);
   }
 
   async #drain(): Promise<void> {
     while (this.#queue.length > 0) {
       const batch = this.#queue.splice(0, this.#o.batch);
+      this.#inflight = batch;
       try {
         await this.#o.db.insert(schema.auditEvent).values(batch.map((e) => e.row));
+        if (this.#inflight === batch) this.#inflight = undefined;
       } catch (err) {
+        // spillAll() already logged this batch and gave up on it: never twice, never re-queued.
+        if (this.#inflight !== batch) return;
+        this.#inflight = undefined;
         this.#o.log.warn(
           {
             evt: 'audit.flush_failed',

@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Bus, type EngineEvents } from '../src/bus.js';
 import { ServerRegistry } from '../src/registry.js';
-import { isExposed, label, project, projectTools, resolveTool } from '../src/catalog.js';
+import {
+  isExposed,
+  label,
+  project,
+  projectResourceTemplates,
+  projectTools,
+  resolveTool,
+} from '../src/catalog.js';
 import { ToolUnavailableError } from '../src/errors.js';
 import type { ResolvedScope, ServerConfig, ServerSelection } from '../src/types.js';
 import { FakeUpstream, fakeFactory } from './fake-upstream.js';
@@ -27,7 +34,8 @@ const sel = (serverName: string, over: Partial<ServerSelection> = {}): ServerSel
 });
 
 const scopeOf = (servers: ServerSelection[], flatten = false): ResolvedScope => ({
-  key: `${servers.map((s) => `${s.serverName}/${s.alias ?? ''}/${String(s.tools)}`).join('|')}:${String(flatten)}`,
+  // ResolvedScope.key must be a pure function of EVERY field, or the memo serves a stale projection.
+  key: JSON.stringify([servers, flatten]),
   servers,
   flatten,
 });
@@ -169,6 +177,30 @@ describe('the one predicate', () => {
           .sort(),
       ).toEqual(['a__one', 'a__two']),
     );
+    await reg.shutdown();
+  });
+});
+
+describe('resource templates follow the resource selection', () => {
+  const fake = () =>
+    new FakeUpstream('a', [], {
+      resources: [{ uri: 'mem://x' }],
+      resourceTemplates: [{ uriTemplate: 'mem://{id}', name: 'by id' }],
+    });
+
+  it('listed under "all", hidden under a narrowed or empty selection', async () => {
+    const reg = await ready([cfg('a')], { a: fake() });
+    expect(projectResourceTemplates(scopeOf([sel('a')]), reg)).toHaveLength(1);
+    expect(projectResourceTemplates(scopeOf([sel('a', { resources: [] })]), reg)).toEqual([]);
+    expect(projectResourceTemplates(scopeOf([sel('a', { resources: ['mem://x'] })]), reg)).toEqual(
+      [],
+    );
+    await reg.shutdown();
+  });
+
+  it('hidden when the server is disabled', async () => {
+    const reg = await ready([cfg('a', { enabled: false })], { a: fake() });
+    expect(projectResourceTemplates(scopeOf([sel('a')]), reg)).toEqual([]);
     await reg.shutdown();
   });
 });

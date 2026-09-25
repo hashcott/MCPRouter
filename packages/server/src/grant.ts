@@ -48,3 +48,21 @@ export function checkGrant(grant: Grant, route: Route): 'ok' | 'insufficient' {
       return route.serverIds.every((id) => grant.ids.includes(id)) ? 'ok' : 'insufficient';
   }
 }
+
+/**
+ * §4.2: "Group không tồn tại và group principal không thấy được trả về 404
+ * byte-identical." A group is visible when the grant could reach any part of
+ * it; seeing a group but not all of it is the containment failure → 403.
+ * Non-group routes are always "visible": their failure is 403.
+ */
+export function canSee(grant: Grant, route: Route): boolean {
+  if (route.groupId === undefined) return true;
+  switch (grant.kind) {
+    case 'all':
+      return true;
+    case 'groups':
+      return grant.ids.includes(route.groupId);
+    case 'servers':
+      return route.serverIds.length === 0 || route.serverIds.some((id) => grant.ids.includes(id));
+  }
+}

@@ -29,6 +29,11 @@ const snap: Snapshot = {
 };
 const keys: Record<string, KeyAuth> = {
   'Bearer good': { principal: { id: 'u1', isAdmin: false }, keyId: 'k1', grant: { kind: 'all' } },
+  'Bearer other-team': {
+    principal: { id: 'u3', isAdmin: false },
+    keyId: 'k3',
+    grant: { kind: 'groups', ids: ['00000000-0000-4000-8000-0000000000e2'] },
+  },
   'Bearer team': {
     principal: { id: 'u2', isAdmin: false },
     keyId: 'k2',
@@ -185,6 +190,13 @@ describe('scoped routes', () => {
       expect(res.status).toBe(403);
       expect(res.headers.get('www-authenticate')).toBe('Bearer error="insufficient_scope"');
     }
+  });
+
+  it('a group outside the key is the same 404 as an unknown group', async () => {
+    const a = await post('/mcp/g/team', 'Bearer other-team', rpc('tools/list'));
+    const b = await post('/mcp/g/nope', 'Bearer other-team', rpc('tools/list'));
+    expect(a.status).toBe(404);
+    expect([a.status, await a.text()]).toEqual([b.status, await b.text()]);
   });
 
   it('an unknown group and an unknown path are the same 404, byte for byte', async () => {

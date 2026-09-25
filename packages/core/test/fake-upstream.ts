@@ -45,6 +45,8 @@ export type FakeKnobs = {
   prompts?: FakePrompt[];
   /** Undefined -> no `resources` capability, same as before this option existed. */
   resources?: FakeResource[];
+  /** Served by resources/templates/list when `resources` is set. */
+  resourceTemplates?: { uriTemplate: string; name: string }[];
 };
 
 /**
@@ -143,7 +145,7 @@ export class FakeUpstream {
       }));
       // No fake test registers a template; discovery still needs a handler to call.
       server.setRequestHandler(ListResourceTemplatesRequestSchema, () => ({
-        resourceTemplates: [],
+        resourceTemplates: this.knobs.resourceTemplates ?? [],
       }));
       server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         const resource = resources.find((r) => r.uri === request.params.uri);

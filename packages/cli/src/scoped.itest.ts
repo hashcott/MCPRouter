@@ -130,9 +130,11 @@ describe('P2 demo — two keys, two groups', () => {
     expect(await toolNames('/mcp/g/ops', keyB)).toEqual(['fs__list_dir', 'fs__read_file']);
   });
 
-  it("key B on key A's group is 403 insufficient_scope", async () => {
-    const res = await post('/mcp/g/eng', keyB, rpc(1, 'tools/list'));
-    expect(res.status).toBe(403);
+  it("key A's group is invisible to key B: the same 404 as a group that does not exist", async () => {
+    const hidden = await post('/mcp/g/eng', keyB, rpc(1, 'tools/list'));
+    const missing = await post('/mcp/g/no-such-group', keyB, rpc(1, 'tools/list'));
+    expect(hidden.status).toBe(404);
+    expect([hidden.status, await hidden.text()]).toEqual([missing.status, await missing.text()]);
   });
 
   it('a tool disabled while A holds a stale list fails at CALL time with the one not-found message', async () => {

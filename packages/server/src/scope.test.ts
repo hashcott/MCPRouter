@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EMPTY_SNAPSHOT, resolveTarget, type Snapshot } from './scope.js';
+import { EMPTY_SNAPSHOT, reusedSlugs, resolveTarget, type Snapshot } from './scope.js';
 
 const snap: Snapshot = {
   servers: [
@@ -83,5 +83,22 @@ describe('resolveTarget', () => {
 
   it('the empty snapshot serves an empty "all"', () => {
     expect(resolveTarget(EMPTY_SNAPSHOT, { kind: 'all' })?.scope.servers).toEqual([]);
+  });
+});
+
+// While the Engine swaps configs, a slug whose server was deleted and re-created must not
+// route through the OLD snapshot's memberships to the NEW upstream.
+describe('slug reuse during applyConfig', () => {
+  const next: Snapshot = {
+    servers: [
+      { id: 'id-fs-NEW', slug: 'fs', enabled: true },
+      { id: 'id-gh', slug: 'gh', enabled: true },
+    ],
+    groups: new Map(),
+  };
+
+  it('reusedSlugs finds slugs whose server id changed, and only those', () => {
+    expect([...reusedSlugs(snap, next)]).toEqual(['fs']);
+    expect([...reusedSlugs(snap, snap)]).toEqual([]);
   });
 });
