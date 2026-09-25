@@ -4,7 +4,8 @@ export function describe(): string {
   return `mcprouter ${VERSION}`;
 }
 
-export { createApp, type AppDeps, type McpDeps } from './app.js';
+export { createApp, type AppDeps, type AuditRow, type McpDeps } from './app.js';
+export { AuditWriter } from './audit.js';
 export { authenticateKey, createAuth, KEY_GRANT_ALL, type Auth, type KeyAuth } from './auth.js';
 export { loadConfig, parseConfig, type Config } from './config.js';
 export { createRegistry } from './metrics.js';

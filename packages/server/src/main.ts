@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { serve } from '@hono/node-server';
 import { createDb, createLogger, createPool, Engine, runMigrations } from '@mcprouter/core';
+import { AuditWriter } from './audit.js';
 import { authenticateKey, createAuth } from './auth.js';
 import { loadConfig } from './config.js';
 import { createApp, type Readiness } from './app.js';
@@ -23,6 +24,8 @@ const pool = createPool(config.databaseUrl);
 const db = createDb(pool);
 const engine = new Engine({ logger: log });
 const auth = createAuth({ db, secret: config.authSecret, baseURL: config.publicUrl.href, log });
+const audit = new AuditWriter({ db, log });
+audit.start();
 let sync: ServerSync | undefined;
 const registry = createRegistry();
 const readiness: Readiness = { migrationsApplied: false, routesMounted: false };
@@ -40,7 +43,7 @@ const app = createApp({
     resolve: (t) => resolveTarget(sync?.snapshot() ?? EMPTY_SNAPSHOT, t),
     timeoutMs: config.mcpCallTimeoutMs,
     maxInflight: config.maxInflight,
-    audit: () => {},
+    audit: (row) => audit.push(row),
     authHandler: (req) => auth.handler(req),
   },
 });
@@ -78,6 +81,7 @@ async function shutdown(signal: string): Promise<void> {
   // Drain: in-flight tool calls finish before their upstreams are stopped.
   // The timer above caps the wait at SHUTDOWN_TIMEOUT_MS.
   await new Promise<void>((done) => server.close(() => done()));
+  await audit.stop();
   sync?.stop();
   await engine.shutdown();
   await pool.end();
