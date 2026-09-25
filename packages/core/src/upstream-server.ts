@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import {
+  PromptListChangedNotificationSchema,
+  ResourceListChangedNotificationSchema,
+  ToolListChangedNotificationSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import type { Bus, EngineEvents } from './bus.js';
 import { UpstreamAuthRequiredError, UpstreamUnavailableError } from './errors.js';
 import type { Semaphore } from './semaphore.js';
@@ -60,6 +65,16 @@ export function configHashOf(cfg: ServerConfig): string {
     .digest('hex');
 }
 
+/**
+ * A numeric env knob that cannot fail open: `Number('')` is 0 and `Number('x')`
+ * is NaN, either of which silently disables a cap or stalls every connect.
+ */
+export function envInt(name: string, fallback: number, min = 1): number {
+  const raw = process.env[name];
+  const n = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isInteger(n) && n >= min ? n : fallback;
+}
+
 /** Errors we must never retry: retrying cannot change the answer. */
 function isPermanent(err: unknown): boolean {
   const e = err as { permanent?: boolean; code?: unknown; message?: string };
@@ -78,8 +93,8 @@ function isAuthChallenge(err: unknown): boolean {
 export class UpstreamServer {
   readonly key: string;
   readonly name: string;
-  readonly config: ServerConfig;
   readonly configHash: string;
+  #config: ServerConfig;
 
   #state: State;
   #intent: State = 'closed';
@@ -89,6 +104,8 @@ export class UpstreamServer {
   #lastError: Error | undefined;
   #epoch = 0;
   #client: Client | undefined;
+  /** A transport whose handshake is in flight — teardown must be able to close it. */
+  #pending: Transport | undefined;
   #timer: NodeJS.Timeout | undefined;
   #stopping: Promise<void> | undefined;
   readonly #stderr: string[] = [];
@@ -99,14 +116,19 @@ export class UpstreamServer {
     this.#o = o;
     this.key = o.key;
     this.name = o.config.name;
-    this.config = o.config;
+    this.#config = o.config;
     this.configHash = configHashOf(o.config);
     this.#state = o.config.enabled ? 'idle' : 'disabled';
     this.#retry = {
-      baseMs: o.retry?.baseMs ?? Number(process.env['MCPROUTER_RETRY_BASE_MS'] ?? 1000),
-      maxMs: o.retry?.maxMs ?? Number(process.env['MCPROUTER_RETRY_MAX_MS'] ?? 30_000),
-      maxAttempts: o.retry?.maxAttempts ?? Number(process.env['MCPROUTER_RETRY_MAX_ATTEMPTS'] ?? 0),
+      baseMs: o.retry?.baseMs ?? envInt('MCPROUTER_RETRY_BASE_MS', 1000),
+      maxMs: o.retry?.maxMs ?? envInt('MCPROUTER_RETRY_MAX_MS', 30_000),
+      maxAttempts: o.retry?.maxAttempts ?? envInt('MCPROUTER_RETRY_MAX_ATTEMPTS', 0, 0),
     };
+  }
+
+  /** Live: an enabled-only toggle updates it in place (see setEnabled). */
+  get config(): ServerConfig {
+    return this.#config;
   }
 
   get state(): State {
@@ -153,7 +175,19 @@ export class UpstreamServer {
     this.#dispatch({ t: 'start' });
   }
 
+  /**
+   * The registry's enabled-only toggle. The config is updated in place so the one
+   * predicate (`isExposed` reads `config.enabled`) agrees with the state machine.
+   */
+  async setEnabled(on: boolean): Promise<void> {
+    this.#config = { ...this.#config, enabled: on };
+    if (!on) return this.stop('disabled');
+    this.#dispatch({ t: 'enable' });
+    this.start();
+  }
+
   refresh(): void {
+    if (this.#state !== 'ready') return;
     this.#dispatch({ t: 'refresh' });
     void this.#discover(this.#epoch);
   }
@@ -212,9 +246,12 @@ export class UpstreamServer {
     this.#timer = undefined;
     this.#dispatch({ t: 'stop', intent });
     const client = this.#client;
+    const pending = this.#pending;
     this.#client = undefined;
+    this.#pending = undefined;
     try {
       await client?.close();
+      await pending?.close();
     } catch {
       /* closing a dead transport is not an error */
     }
@@ -271,12 +308,26 @@ export class UpstreamServer {
         this.#attempt = 0;
         return;
       case 'retrying':
+        this.#dropClient();
         this.#stale = this.#catalog !== undefined;
         this.#scheduleBackoff();
+        return;
+      case 'failed':
+      case 'authRequired':
+        this.#dropClient();
         return;
       default:
         return;
     }
+  }
+
+  /** A connection we will not use again: close it, and silence its onclose first. */
+  #dropClient(): void {
+    const client = this.#client;
+    this.#client = undefined;
+    if (client === undefined) return;
+    client.onclose = () => {};
+    void client.close().catch(() => {});
   }
 
   #scheduleBackoff(): void {
@@ -299,7 +350,7 @@ export class UpstreamServer {
 
     try {
       const transport: Transport = await this.#o.connectSem.run(() =>
-        this.#o.connect(this.config, {
+        this.#o.connect(this.#config, {
           headers: this.#o.headers ?? {},
           signal: abort.signal,
           onStderr: (line) => this.#pushStderr(line),
@@ -315,7 +366,19 @@ export class UpstreamServer {
         if (epoch !== this.#epoch) return;
         this.#dispatch({ t: 'transportClose' });
       };
-      await client.connect(transport);
+      const onListChanged = (): Promise<void> => {
+        if (epoch === this.#epoch) this.refresh();
+        return Promise.resolve();
+      };
+      client.setNotificationHandler(ToolListChangedNotificationSchema, onListChanged);
+      client.setNotificationHandler(PromptListChangedNotificationSchema, onListChanged);
+      client.setNotificationHandler(ResourceListChangedNotificationSchema, onListChanged);
+      this.#pending = transport;
+      try {
+        await client.connect(transport);
+      } finally {
+        if (this.#pending === transport) this.#pending = undefined;
+      }
       if (epoch !== this.#epoch) {
         await client.close().catch(() => {});
         return;
@@ -373,7 +436,7 @@ export class UpstreamServer {
     resourceTemplates: ResourceTemplate[],
     capabilities: ServerCapabilities,
   ): ServerCatalog {
-    const overrides = this.config.tools ?? {};
+    const overrides = this.#config.tools ?? {};
     const toolMap = new Map<string, Tool>(
       tools.map((t) => {
         const override = overrides[t.name]?.description;
@@ -442,7 +505,7 @@ export class UpstreamServer {
     return {
       ...(o.signal === undefined ? {} : { signal: o.signal }),
       ...(o.onProgress === undefined ? {} : { onprogress: o.onProgress }),
-      timeout: o.deadlineMs ?? Number(process.env['MCPROUTER_REQUEST_TIMEOUT_MS'] ?? 60_000),
+      timeout: o.deadlineMs ?? envInt('MCPROUTER_REQUEST_TIMEOUT_MS', 60_000),
       resetTimeoutOnProgress: true,
     };
   }

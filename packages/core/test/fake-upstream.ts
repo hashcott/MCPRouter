@@ -31,6 +31,10 @@ export type FakeResource = {
 };
 
 export type FakeKnobs = {
+  /** tools/list throws, so discovery fails after a successful connect. */
+  failList?: boolean;
+  /** Never answer initialize: the handshake hangs until the client gives up. */
+  silent?: boolean;
   /** Delay before connect resolves, to exercise the connect semaphore. */
   connectDelayMs?: number;
   /** 'permanent' -> never retry; 'transient' -> retryable. */
@@ -57,6 +61,7 @@ export class FakeUpstream {
   #connects = 0;
   #closed = false;
   #live: Server | undefined;
+  #open = 0;
 
   constructor(
     readonly name: string,
@@ -68,6 +73,11 @@ export class FakeUpstream {
 
   get connects(): number {
     return this.#connects;
+  }
+
+  /** Client-side transports handed out and not yet closed — a leak shows here. */
+  get open(): number {
+    return this.#open;
   }
 
   get closed(): boolean {
@@ -86,13 +96,16 @@ export class FakeUpstream {
         },
       },
     );
-    server.setRequestHandler(ListToolsRequestSchema, () => ({
-      tools: this.#tools.map((t) => ({
-        name: t.name,
-        description: t.description ?? `fake ${t.name}`,
-        inputSchema: { type: 'object' as const, properties: {} },
-      })),
-    }));
+    server.setRequestHandler(ListToolsRequestSchema, () => {
+      if (this.knobs.failList === true) throw new Error('fake list failure');
+      return {
+        tools: this.#tools.map((t) => ({
+          name: t.name,
+          description: t.description ?? `fake ${t.name}`,
+          inputSchema: { type: 'object' as const, properties: {} },
+        })),
+      };
+    });
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const tool = this.#tools.find((t) => t.name === request.params.name);
       if (tool === undefined) throw new Error(`no such tool: ${request.params.name}`);
@@ -170,13 +183,19 @@ export class FakeUpstream {
       });
     }
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-    const server = this.#build();
-    await server.connect(serverSide);
-    this.#live = server;
+    if (this.knobs.silent !== true) {
+      const server = this.#build();
+      await server.connect(serverSide);
+      this.#live = server;
+    }
 
+    this.#open += 1;
+    let counted = true;
     const origClose = clientSide.close.bind(clientSide);
     clientSide.close = async () => {
       this.#closed = true;
+      if (counted) this.#open -= 1;
+      counted = false;
       await origClose();
     };
     return clientSide;

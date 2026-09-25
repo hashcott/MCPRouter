@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Bus, type EngineEvents } from '../src/bus.js';
 import { Semaphore } from '../src/semaphore.js';
-import { UpstreamServer, configHashOf } from '../src/upstream-server.js';
+import { UpstreamServer, configHashOf, envInt } from '../src/upstream-server.js';
 import { UpstreamUnavailableError } from '../src/errors.js';
 import type { ServerConfig } from '../src/types.js';
 import { FakeUpstream, fakeFactory } from './fake-upstream.js';
@@ -145,5 +145,58 @@ describe('UpstreamServer', () => {
     for (let i = 0; i < 250; i += 1) srv.pushStderrForTest(`line ${i}`);
     expect(srv.stderrTail).toHaveLength(200);
     expect(srv.stderrTail[199]).toBe('line 249');
+  });
+
+  it('closes the connection when discovery fails, instead of leaking one per retry', async () => {
+    const fake = new FakeUpstream('fs', [{ name: 't' }], { failList: true });
+    const { srv } = make(fake);
+    srv.start();
+    await vi.waitFor(() => expect(fake.connects).toBeGreaterThanOrEqual(4));
+    expect(fake.open).toBeLessThanOrEqual(1);
+    await srv.stop('closed');
+    expect(fake.open).toBe(0);
+  });
+
+  it('stop() during a hung handshake closes the half-open transport', async () => {
+    const fake = new FakeUpstream('fs', [], { silent: true });
+    const { srv } = make(fake);
+    srv.start();
+    await vi.waitFor(() => expect(fake.open).toBe(1));
+    await srv.stop('closed');
+    expect(fake.open).toBe(0);
+  });
+
+  it('re-lists on an upstream tools/list_changed without reconnecting', async () => {
+    const fake = new FakeUpstream('fs', [{ name: 'a' }]);
+    const { srv } = make(fake);
+    srv.start();
+    await vi.waitFor(() => expect(srv.state).toBe('ready'));
+    fake.setTools([{ name: 'a' }, { name: 'b' }]);
+    await vi.waitFor(() => expect([...(srv.catalog?.tools.keys() ?? [])]).toEqual(['a', 'b']));
+    expect(fake.connects).toBe(1);
+    await srv.stop('closed');
+  });
+
+  it('refresh() outside ready does not start a discovery', async () => {
+    const fake = new FakeUpstream('fs', [{ name: 'a' }]);
+    const { srv } = make(fake);
+    srv.refresh();
+    expect(srv.state).toBe('idle');
+    expect(fake.connects).toBe(0);
+    await srv.stop('closed');
+  });
+
+  it.each(['', 'abc', '0', '-3'])('envInt falls back when the value is %j', (raw) => {
+    process.env['MCPROUTER_TEST_INT'] = raw;
+    expect(envInt('MCPROUTER_TEST_INT', 7)).toBe(7);
+    delete process.env['MCPROUTER_TEST_INT'];
+  });
+
+  it('envInt reads a valid value and honours min 0', () => {
+    process.env['MCPROUTER_TEST_INT'] = '0';
+    expect(envInt('MCPROUTER_TEST_INT', 7, 0)).toBe(0);
+    process.env['MCPROUTER_TEST_INT'] = '12';
+    expect(envInt('MCPROUTER_TEST_INT', 7)).toBe(12);
+    delete process.env['MCPROUTER_TEST_INT'];
   });
 });

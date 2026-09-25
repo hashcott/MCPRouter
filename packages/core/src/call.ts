@@ -3,14 +3,11 @@ import type { Bus, EngineEvents } from './bus.js';
 import { resolveByKind, resolveTool } from './catalog.js';
 import { PayloadTooLargeError, UpstreamUnavailableError, redact } from './errors.js';
 import type { ServerRegistry } from './registry.js';
-import type { MiniLogger } from './upstream-server.js';
+import { envInt, type MiniLogger } from './upstream-server.js';
 import type { Principal, ResolvedScope, ServerSelection } from './types.js';
 
 /** Ruling P13: a missing, non-numeric or non-positive value must not disable the cap. */
-function maxArgBytes(): number {
-  const n = Number(process.env['MCPROUTER_MAX_ARG_BYTES']);
-  return Number.isFinite(n) && n > 0 ? n : 1_048_576;
-}
+const maxArgBytes = (): number => envInt('MCPROUTER_MAX_ARG_BYTES', 1_048_576);
 
 export type CallDeps = { reg: ServerRegistry; bus: Bus<EngineEvents>; logger: MiniLogger };
 

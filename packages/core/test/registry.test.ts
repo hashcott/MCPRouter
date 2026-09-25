@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Bus, type EngineEvents } from '../src/bus.js';
 import { ServerRegistry } from '../src/registry.js';
-import { CredentialsRequiredError } from '../src/errors.js';
-import type { Principal, ServerConfig } from '../src/types.js';
+import { CredentialsRequiredError, ToolUnavailableError } from '../src/errors.js';
+import { projectTools, resolveTool } from '../src/catalog.js';
+import type { Principal, ResolvedScope, ServerConfig } from '../src/types.js';
 import { FakeUpstream, fakeFactory } from './fake-upstream.js';
 
 const cfg = (name: string, over: Partial<ServerConfig> = {}): ServerConfig =>
@@ -133,5 +134,72 @@ describe('ServerRegistry', () => {
     await reg.applyConfig([cfg('a')]);
     await reg.shutdown();
     expect(reg.list().every((s) => s.state === 'closed')).toBe(true);
+  });
+
+  it('a disabled server is neither listed nor callable, and re-enabling brings it back', async () => {
+    const fa = new FakeUpstream('a', [{ name: 't' }]);
+    const { reg } = make({ a: fa });
+    const scope: ResolvedScope = {
+      key: 's',
+      servers: [{ serverName: 'a', tools: 'all', prompts: 'all', resources: 'all' }],
+      flatten: false,
+    };
+    await reg.applyConfig([cfg('a')]);
+    await vi.waitFor(() => expect(reg.shared('a')?.state).toBe('ready'));
+
+    await reg.applyConfig([cfg('a', { enabled: false })]);
+    expect(projectTools(scope, reg)).toEqual([]);
+    const hidden = (() => {
+      try {
+        return resolveTool(scope, reg, 'a__t');
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(hidden).toBeInstanceOf(ToolUnavailableError);
+    expect((hidden as Error).message).toBe(new ToolUnavailableError('a__t').message);
+
+    await reg.applyConfig([cfg('a')]);
+    await vi.waitFor(() => expect(reg.shared('a')?.state).toBe('ready'));
+    expect(projectTools(scope, reg).map((t) => t.name)).toEqual(['a__t']);
+    await reg.shutdown();
+  });
+
+  it('concurrent first leases for one user share a single per-user instance', async () => {
+    const fa = new FakeUpstream('a', [{ name: 't' }]);
+    const { reg } = make({ a: fa });
+    await reg.applyConfig([cfg('a', { credentialMode: 'per-user' })]);
+    const user: Principal = {
+      id: 'u2',
+      isAdmin: false,
+      credentials: {
+        revision: () => 1,
+        resolveHeaders: async () => {
+          await new Promise((r) => setTimeout(r, 5));
+          return { authorization: 'Bearer x' };
+        },
+      },
+    } as Principal;
+    const [x, y] = await Promise.all([reg.lease('a', user), reg.lease('a', user)]);
+    expect(x).toBe(y);
+    await reg.shutdown();
+    expect(fa.open).toBe(0);
+  });
+
+  it('overlapping applyConfig calls apply in order and the last one wins', async () => {
+    const fa = new FakeUpstream('a', [{ name: 't' }]);
+    const { reg } = make({ a: fa });
+    await reg.applyConfig([cfg('a', { args: ['1'] })]);
+    await vi.waitFor(() => expect(reg.shared('a')?.state).toBe('ready'));
+    await Promise.all([
+      reg.applyConfig([cfg('a', { args: ['2'] })]),
+      reg.applyConfig([cfg('a', { args: ['3'] })]),
+    ]);
+    expect(reg.shared('a')?.config).toMatchObject({ args: ['3'] });
+    // #configs must agree with what runs: re-applying v2 is a real change.
+    await reg.applyConfig([cfg('a', { args: ['2'] })]);
+    expect(reg.shared('a')?.config).toMatchObject({ args: ['2'] });
+    await reg.shutdown();
+    expect(fa.open).toBe(0);
   });
 });

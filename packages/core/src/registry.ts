@@ -1,16 +1,17 @@
 import type { Bus, EngineEvents } from './bus.js';
-import { CredentialsRequiredError } from './errors.js';
+import { CredentialsRequiredError, UpstreamUnavailableError } from './errors.js';
 import { Semaphore } from './semaphore.js';
 import type { TransportFactory } from './transport.js';
 import {
   UpstreamServer,
   configHashOf,
+  envInt,
   type MiniLogger,
   type RetryPolicy,
 } from './upstream-server.js';
 import type { Principal, ServerConfig } from './types.js';
 
-const PER_USER_IDLE_MS = Number(process.env['MCPROUTER_PER_USER_IDLE_MS'] ?? 600_000);
+const PER_USER_IDLE_MS = envInt('MCPROUTER_PER_USER_IDLE_MS', 600_000);
 const TICK_MS = 30_000;
 
 export type ServerRegistryOpts = {
@@ -28,6 +29,11 @@ export class ServerRegistry {
   #catalogVersion = 0;
   readonly #shared = new Map<string, UpstreamServer>();
   readonly #perUser = new Map<string, Leased>();
+  /** First leases in flight, so parallel calls from one user share one instance. */
+  readonly #leasing = new Map<string, Promise<UpstreamServer>>();
+  /** applyConfig runs strictly one at a time: interleaved diffs drift #configs from what runs. */
+  #chain: Promise<void> = Promise.resolve();
+  #down = false;
   readonly #configs = new Map<string, ServerConfig>();
   readonly #sem: Semaphore;
   readonly #o: ServerRegistryOpts;
@@ -35,9 +41,7 @@ export class ServerRegistry {
 
   constructor(o: ServerRegistryOpts) {
     this.#o = o;
-    this.#sem = new Semaphore(
-      o.connectConcurrency ?? Number(process.env['MCPROUTER_CONNECT_CONCURRENCY'] ?? 8),
-    );
+    this.#sem = new Semaphore(o.connectConcurrency ?? envInt('MCPROUTER_CONNECT_CONCURRENCY', 8));
     // Ruling P5: the memo in catalog.ts keys on this counter, so a listChanged
     // refresh that swapped a catalog MUST invalidate it.
     o.bus.on('server:catalog', () => {
@@ -63,7 +67,13 @@ export class ServerRegistry {
   }
 
   /** Idempotent full-state diff, keyed by name + configHash. The only mutator. */
-  async applyConfig(configs: ServerConfig[]): Promise<void> {
+  applyConfig(configs: ServerConfig[]): Promise<void> {
+    const run = this.#chain.then(() => this.#apply(configs));
+    this.#chain = run.catch(() => {});
+    return run;
+  }
+
+  async #apply(configs: ServerConfig[]): Promise<void> {
     const wanted = new Map(configs.map((c) => [c.name, c]));
     const added: string[] = [];
     const changed: string[] = [];
@@ -84,8 +94,7 @@ export class ServerRegistry {
       if (before !== undefined && sameExceptEnabled(before, want)) {
         if (before.enabled !== want.enabled) {
           this.#configs.set(name, want);
-          if (want.enabled) srv.start();
-          else await srv.stop('disabled');
+          await srv.setEnabled(want.enabled);
         }
         continue;
       }
@@ -151,11 +160,25 @@ export class ServerRegistry {
       hit.lastUsed = Date.now();
       return hit.srv;
     }
-    const headers = await principal.credentials.resolveHeaders(name);
-    const srv = this.#spawn(cfg, key, headers);
-    this.#perUser.set(key, { srv, lastUsed: Date.now() });
-    srv.start();
-    return srv;
+    const inflight = this.#leasing.get(key);
+    if (inflight !== undefined) return inflight;
+
+    const creds = principal.credentials;
+    const p = (async () => {
+      const headers = await creds.resolveHeaders(name);
+      // The world may have moved while we awaited: never spawn into a registry
+      // that shut down, or from a config that was replaced or removed.
+      const now = this.#configs.get(name);
+      if (this.#down || now === undefined || configHashOf(now) !== configHashOf(cfg)) {
+        throw new UpstreamUnavailableError(name, 'closed');
+      }
+      const srv = this.#spawn(cfg, key, headers);
+      this.#perUser.set(key, { srv, lastUsed: Date.now() });
+      srv.start();
+      return srv;
+    })().finally(() => this.#leasing.delete(key));
+    this.#leasing.set(key, p);
+    return p;
   }
 
   async #stopChildrenOf(name: string): Promise<void> {
@@ -178,7 +201,10 @@ export class ServerRegistry {
   }
 
   async shutdown(): Promise<void> {
+    this.#down = true;
     clearInterval(this.#ticker);
+    await this.#chain;
+    await Promise.allSettled(this.#leasing.values());
     const all = [...this.#shared.values(), ...[...this.#perUser.values()].map((l) => l.srv)];
     this.#perUser.clear();
     await Promise.all(all.map((s) => s.stop('closed')));
