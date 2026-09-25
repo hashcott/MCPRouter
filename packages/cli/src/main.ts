@@ -1,15 +1,26 @@
 import { parseArgs } from 'node:util';
 import { createDb, createLogger, createPool, createServer } from '@mcprouter/core';
 import { createAuth, loadConfig } from '@mcprouter/server';
-import { addUser, CliError, createKey, parseServerAdd, secretLines } from './commands.js';
+import {
+  addGroup,
+  addUser,
+  CliError,
+  createKey,
+  parseGroupAdd,
+  parseServerAdd,
+  secretLines,
+  setToolEnabled,
+} from './commands.js';
 
 const HELP = `mcprouter <command>
 
   secret                                      print a fresh AUTH_SECRET and MCPR_SECRET_KEYS
   users add --email <e> --name <n> [--role viewer|operator|admin]
-  keys create --email <e> [--name <n>]        print a new API key (shown once)
+  keys create --email <e> [--name <n>] [--group <g>]… | [--server <s>]…   print a new API key (shown once); neither: every server
   servers add <slug> --url <url> [--sse] [--header K=V | --header K]… [--allow-private-network] [--disabled]
   servers add <slug> [--env K=V | --env K]… [--cwd <dir>] -- <command> [args…]
+  servers tool <server> <tool> --enable | --disable
+  groups add <slug> [--server <slug>[=tool,tool]]…   --server s=a,b selects ONLY those tools
 
 Every command except 'secret' reads the server's configuration from the environment.
 `;
@@ -49,7 +60,12 @@ async function run(): Promise<void> {
     } else if (cmd === 'keys' && sub === 'create') {
       const { values } = parseArgs({
         args: rest,
-        options: { email: { type: 'string' }, name: { type: 'string', default: 'cli' } },
+        options: {
+          email: { type: 'string' },
+          name: { type: 'string', default: 'cli' },
+          group: { type: 'string', multiple: true, default: [] },
+          server: { type: 'string', multiple: true, default: [] },
+        },
       });
       if (values.email === undefined) throw new CliError('--email is required');
       const log = createLogger({ level: 'warn', file: undefined, pretty: false });
@@ -60,11 +76,32 @@ async function run(): Promise<void> {
         log,
       });
       process.stdout.write(
-        `${await createKey(auth, pool, { email: values.email, name: values.name })}\n`,
+        `${await createKey(auth, pool, {
+          email: values.email,
+          name: values.name,
+          groups: values.group,
+          servers: values.server,
+        })}\n`,
       );
     } else if (cmd === 'servers' && sub === 'add') {
       const input = parseServerAdd(rest, process.env);
       process.stdout.write(`${await createServer(db, config.secretKeys, input)}\n`);
+    } else if (cmd === 'groups' && sub === 'add') {
+      process.stdout.write(`${await addGroup(pool, parseGroupAdd(rest))}\n`);
+    } else if (cmd === 'servers' && sub === 'tool') {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          enable: { type: 'boolean', default: false },
+          disable: { type: 'boolean', default: false },
+        },
+      });
+      const [server, tool] = positionals;
+      if (server === undefined || tool === undefined || values.enable === values.disable) {
+        throw new CliError('usage: mcprouter servers tool <server> <tool> --enable | --disable');
+      }
+      await setToolEnabled(pool, { server, tool, enabled: values.enable });
     } else {
       throw new CliError(`unknown command: ${[cmd, sub].filter(Boolean).join(' ')}`);
     }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CliError, parseServerAdd, secretLines } from './commands.js';
+import { CliError, parseGroupAdd, parseServerAdd, secretLines } from './commands.js';
 
 describe('secretLines', () => {
   it('prints an AUTH_SECRET and a keyring line, fresh each time', () => {
@@ -73,4 +73,28 @@ describe('parseServerAdd', () => {
   ])('rejects %s', (_n, argv) => {
     expect(() => parseServerAdd(argv, {})).toThrow(CliError);
   });
+});
+
+describe('parseGroupAdd', () => {
+  it('--server alone selects everything; --server s=a,b selects those tools', () => {
+    expect(
+      parseGroupAdd(['eng', '--server', 'fs', '--server', 'gh=create_issue,list_issues']),
+    ).toEqual({
+      slug: 'eng',
+      members: [
+        { server: 'fs', tools: 'all' },
+        { server: 'gh', tools: ['create_issue', 'list_issues'] },
+      ],
+    });
+  });
+
+  it('a group may start empty', () => {
+    expect(parseGroupAdd(['empty'])).toEqual({ slug: 'empty', members: [] });
+  });
+
+  it.each([
+    ['no slug', []],
+    ['an empty tool list', ['g', '--server', 'fs=']],
+    ['an unknown flag', ['g', '--alias', 'x']],
+  ])('rejects %s', (_n, argv) => expect(() => parseGroupAdd(argv)).toThrow(CliError));
 });

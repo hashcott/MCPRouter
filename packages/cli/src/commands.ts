@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import type pg from 'pg';
 import { generateKeyLine, type NewServer } from '@mcprouter/core';
-import { KEY_GRANT_ALL, type Auth } from '@mcprouter/server';
+import { toPermissions, type Auth, type Grant } from '@mcprouter/server';
 
 /** A usage error: printed as one line, exit 1, no stack. */
 export class CliError extends Error {
@@ -108,12 +108,17 @@ export async function addUser(
   return id;
 }
 
-/** R3: in P1 the CLI is the only minter and `all` the only grant. P2 moves minting to POST /api/keys. */
+/** R1: in P2a the CLI is still the only minter. P3 moves minting to POST /api/keys with the subset check. */
 export async function createKey(
   auth: Auth,
   pool: pg.Pool,
-  input: { email: string; name: string },
+  input: { email: string; name: string; groups?: string[]; servers?: string[] },
 ): Promise<string> {
+  const groups = input.groups ?? [];
+  const servers = input.servers ?? [];
+  if (groups.length > 0 && servers.length > 0) {
+    throw new CliError('a key is scoped to groups OR servers, not both');
+  }
   const r = await pool.query<{ id: string }>('select id from "user" where email = $1', [
     input.email,
   ]);
@@ -121,8 +126,112 @@ export async function createKey(
   if (userId === undefined) {
     throw new CliError(`no user with email ${input.email} — run \`mcprouter users add\` first`);
   }
+  const grant: Grant =
+    groups.length > 0
+      ? { kind: 'groups', ids: await idsOf(pool, 'groups', groups) }
+      : servers.length > 0
+        ? { kind: 'servers', ids: await idsOf(pool, 'servers', servers) }
+        : { kind: 'all' };
   const k = await auth.api.createApiKey({
-    body: { name: input.name, userId, permissions: KEY_GRANT_ALL },
+    body: { name: input.name, userId, permissions: toPermissions(grant) },
   });
   return k.key;
+}
+
+export function parseGroupAdd(argv: string[]): {
+  slug: string;
+  members: { server: string; tools: 'all' | string[] }[];
+} {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: argv,
+      allowPositionals: true,
+      strict: true,
+      options: { server: { type: 'string', multiple: true, default: [] } },
+    });
+  } catch (err) {
+    throw new CliError(err instanceof Error ? err.message : String(err));
+  }
+  const [slug] = parsed.positionals;
+  if (slug === undefined)
+    throw new CliError('usage: mcprouter groups add <slug> [--server <slug>[=tool,tool]]…');
+  const members = parsed.values.server.map((spec) => {
+    const eq = spec.indexOf('=');
+    if (eq < 0) return { server: spec, tools: 'all' as const };
+    const tools = spec
+      .slice(eq + 1)
+      .split(',')
+      .filter((t) => t.length > 0);
+    if (tools.length === 0)
+      throw new CliError(`--server ${spec}: name at least one tool after '='`);
+    return { server: spec.slice(0, eq), tools };
+  });
+  return { slug, members };
+}
+
+async function idsOf(
+  pool: pg.Pool,
+  table: 'servers' | 'groups',
+  slugs: string[],
+): Promise<string[]> {
+  const r = await pool.query<{ id: string; slug: string }>(
+    `select id, slug from ${table} where slug = any($1)`,
+    [slugs],
+  );
+  const bySlug = new Map(r.rows.map((x) => [x.slug, x.id]));
+  return slugs.map((s) => {
+    const id = bySlug.get(s);
+    if (id === undefined)
+      throw new CliError(`no ${table === 'servers' ? 'server' : 'group'} named ${s}`);
+    return id;
+  });
+}
+
+/** R6: an explicit tool list selects ONLY those tools — no prompts, no resources. */
+export async function addGroup(
+  pool: pg.Pool,
+  input: { slug: string; members: { server: string; tools: 'all' | string[] }[] },
+): Promise<string> {
+  const serverIds = await idsOf(
+    pool,
+    'servers',
+    input.members.map((m) => m.server),
+  );
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const g = await client.query<{ id: string }>(
+      'insert into groups (slug) values ($1) returning id',
+      [input.slug],
+    );
+    const groupId = g.rows[0]?.id as string;
+    for (const [i, m] of input.members.entries()) {
+      const narrow = m.tools !== 'all';
+      await client.query(
+        `insert into group_server (group_id, server_id, tools, prompts, resources)
+         values ($1, $2, $3, $4, $4)`,
+        [groupId, serverIds[i], JSON.stringify(m.tools), JSON.stringify(narrow ? [] : 'all')],
+      );
+    }
+    await client.query('commit');
+    return groupId;
+  } catch (err) {
+    await client.query('rollback');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function setToolEnabled(
+  pool: pg.Pool,
+  input: { server: string; tool: string; enabled: boolean },
+): Promise<void> {
+  const [serverId] = await idsOf(pool, 'servers', [input.server]);
+  await pool.query(
+    `insert into server_item_override (server_id, kind, item_name, enabled) values ($1, 'tool', $2, $3)
+     on conflict (server_id, kind, item_name) do update set enabled = excluded.enabled, updated_at = now()`,
+    [serverId, input.tool, input.enabled],
+  );
 }
