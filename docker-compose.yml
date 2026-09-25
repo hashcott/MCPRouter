@@ -20,6 +20,7 @@ services:
     environment:
       DATABASE_URL: postgres://mcprouter:mcprouter@db:5432/mcprouter
       AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET in .env — copy .env.example}
+      MCPR_SECRET_KEYS: ${MCPR_SECRET_KEYS:?set MCPR_SECRET_KEYS in .env — copy .env.example}
       PUBLIC_URL: http://localhost:3000
       LOG_LEVEL: info
     ports: ['3000:3000']

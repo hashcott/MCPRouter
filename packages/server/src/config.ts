@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
+import { generateKeyLine, KeyringError, parseKeyring, type Keyring } from '@mcprouter/core';
 
-const SECRET_KEYS = ['AUTH_SECRET', 'DATABASE_URL'] as const;
+const SECRET_KEYS = ['AUTH_SECRET', 'DATABASE_URL', 'MCPR_SECRET_KEYS'] as const;
 
 /** `<VAR>_FILE` support: a mounted-file value wins only when the var itself is absent. */
 function withFileFallbacks(
@@ -31,6 +32,22 @@ const Schema = z.object({
   AUTH_SECRET: z
     .string()
     .min(32, { message: 'must be at least 32 characters — run `mcprouter secret`' }),
+  // §5.4: no key, no boot — and never a key file we invent ourselves.
+  MCPR_SECRET_KEYS: z
+    .string()
+    .optional()
+    .transform((raw, ctx): Keyring => {
+      try {
+        return parseKeyring(raw);
+      } catch (err) {
+        if (!(err instanceof KeyringError)) throw err;
+        ctx.addIssue({
+          code: 'custom',
+          message: `${err.message} — generate one and add it to the environment: ${generateKeyLine()}`,
+        });
+        return z.NEVER;
+      }
+    }),
   PUBLIC_URL: z.url({ message: 'must be an absolute URL, e.g. https://hub.example.com' }),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
@@ -45,6 +62,7 @@ const Schema = z.object({
 export interface Config {
   readonly databaseUrl: string;
   readonly authSecret: string;
+  readonly secretKeys: Keyring;
   readonly publicUrl: URL;
   readonly port: number;
   readonly logLevel: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
@@ -74,6 +92,7 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
   const config: Config = {
     databaseUrl: v.DATABASE_URL,
     authSecret: v.AUTH_SECRET,
+    secretKeys: v.MCPR_SECRET_KEYS,
     publicUrl: new URL(v.PUBLIC_URL),
     port: v.PORT,
     logLevel: v.LOG_LEVEL,
@@ -84,6 +103,7 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
       return {
         databaseUrl: '[redacted]',
         authSecret: '[redacted]',
+        secretKeys: '[redacted]',
         publicUrl: this.publicUrl.href,
         port: this.port,
         logLevel: this.logLevel,

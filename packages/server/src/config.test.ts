@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { parseConfig } from './config.js';
 
+const KEY = `v1:${Buffer.alloc(32, 9).toString('base64url')}`;
+
 const valid = {
   DATABASE_URL: 'postgres://u:p@localhost:5432/mcprouter',
   AUTH_SECRET: 'x'.repeat(32),
   PUBLIC_URL: 'https://hub.example.com',
+  MCPR_SECRET_KEYS: KEY,
 };
 
 describe('parseConfig', () => {
@@ -25,6 +28,7 @@ describe('parseConfig', () => {
     expect(joined).toContain('DATABASE_URL');
     expect(joined).toContain('AUTH_SECRET');
     expect(joined).toContain('PUBLIC_URL');
+    expect(joined).toContain('MCPR_SECRET_KEYS');
   });
 
   it('rejects a short AUTH_SECRET with a remediation hint', () => {
@@ -64,5 +68,34 @@ describe('parseConfig', () => {
     expect(dumped).not.toContain('x'.repeat(32));
     expect(dumped).toContain('[redacted]');
     expect(dumped).not.toContain(':p@');
+    expect(dumped).not.toContain(KEY.slice(3));
+    expect(JSON.parse(dumped).secretKeys).toBe('[redacted]');
+  });
+
+  it('parses MCPR_SECRET_KEYS into a keyring', () => {
+    const r = parseConfig(valid);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.secretKeys.active).toBe(1);
+  });
+
+  it('refuses a missing MCPR_SECRET_KEYS with a generated line to paste', () => {
+    const { MCPR_SECRET_KEYS: _drop, ...rest } = valid;
+    const r = parseConfig(rest);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    const joined = r.issues.join('\n');
+    expect(joined).toContain('MCPR_SECRET_KEYS: not set');
+    expect(joined).toMatch(/MCPR_SECRET_KEYS=v1:[A-Za-z0-9_-]{43}/);
+  });
+
+  it('refuses a malformed MCPR_SECRET_KEYS without echoing it', () => {
+    const bad = `v1:${Buffer.alloc(16, 5).toString('base64url')}`;
+    const r = parseConfig({ ...valid, MCPR_SECRET_KEYS: bad });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    const joined = r.issues.join('\n');
+    expect(joined).toContain('MCPR_SECRET_KEYS: v1 must decode to exactly 32 bytes');
+    expect(joined).not.toContain(bad);
   });
 });

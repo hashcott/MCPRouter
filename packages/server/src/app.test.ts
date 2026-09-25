@@ -10,6 +10,7 @@ function cfg(): Config {
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     AUTH_SECRET: 'z'.repeat(32),
     PUBLIC_URL: 'http://localhost:3000',
+    MCPR_SECRET_KEYS: `v1:${Buffer.alloc(32, 3).toString('base64url')}`,
   });
   if (!r.ok) throw new Error(r.issues.join(','));
   return r.config;
