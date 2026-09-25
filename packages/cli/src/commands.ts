@@ -235,3 +235,88 @@ export async function setToolEnabled(
     [serverId, input.tool, input.enabled],
   );
 }
+
+const KINDS = new Set(['tool', 'prompt', 'resource']);
+function kindOf(k: string): 'tool' | 'prompt' | 'resource' {
+  if (!KINDS.has(k)) throw new CliError(`kind must be tool, prompt or resource — got ${k}`);
+  return k as 'tool' | 'prompt' | 'resource';
+}
+
+/** What needs a human: never reviewed, changed since approval, rejected, or defective. */
+export async function listReviews(
+  pool: pg.Pool,
+  input: { server?: string },
+): Promise<
+  {
+    server: string;
+    kind: 'tool' | 'prompt' | 'resource';
+    name: string;
+    state: string;
+    defHash: string | null;
+  }[]
+> {
+  const r = await pool.query(
+    `select s.slug as server, te.kind, te.name, te.def_hash,
+            case
+              when te.defect is not null then 'defective'
+              when coalesce(o.review_state, 'unreviewed') = 'rejected' then 'rejected'
+              when coalesce(o.review_state, 'unreviewed') = 'unreviewed' then 'unreviewed'
+              when o.approved_hash is distinct from te.def_hash then 'changed'
+              else 'approved'
+            end as state
+     from tool_embedding te
+     join servers s on s.id = te.server_id
+     left join server_item_override o
+       on o.server_id = te.server_id and o.kind = te.kind and o.item_name = te.name
+     where ($1::text is null or s.slug = $1)
+     order by s.slug, te.kind, te.name`,
+    [input.server ?? null],
+  );
+  return r.rows
+    .filter((x) => x.state !== 'approved')
+    .map((x) => ({
+      server: x.server,
+      kind: x.kind,
+      name: x.name,
+      state: x.state,
+      defHash: x.def_hash,
+    }));
+}
+
+/**
+ * TOCTOU-safe (§11.2): approves ONLY the definition whose hash the operator was
+ * shown. If it changed again in between, nothing is written.
+ */
+export async function approveItem(
+  pool: pg.Pool,
+  input: { server: string; kind: string; name: string; hash: string },
+): Promise<void> {
+  const r = await pool.query(
+    `insert into server_item_override (server_id, kind, item_name, review_state, approved_hash, approved_def, approved_at)
+     select te.server_id, te.kind, te.name, 'approved', te.def_hash, te.def, now()
+     from tool_embedding te join servers s on s.id = te.server_id
+     where s.slug = $1 and te.kind = $2 and te.name = $3 and te.def_hash = $4
+     on conflict (server_id, kind, item_name) do update
+       set review_state = 'approved', approved_hash = excluded.approved_hash,
+           approved_def = excluded.approved_def, approved_at = now(), updated_at = now()`,
+    [input.server, kindOf(input.kind), input.name, input.hash],
+  );
+  if (r.rowCount === 0) {
+    throw new CliError(
+      `${input.server} ${input.kind} ${input.name}: no definition with hash ${input.hash} — it changed or does not exist; run \`mcprouter review list\` again`,
+    );
+  }
+}
+
+export async function rejectItem(
+  pool: pg.Pool,
+  input: { server: string; kind: string; name: string },
+): Promise<void> {
+  const [serverId] = await idsOf(pool, 'servers', [input.server]);
+  await pool.query(
+    `insert into server_item_override (server_id, kind, item_name, review_state) values ($1, $2, $3, 'rejected')
+     on conflict (server_id, kind, item_name) do update
+       set review_state = 'rejected', approved_hash = null, approved_def = null, approved_at = null, updated_at = now()`,
+    [serverId, kindOf(input.kind), input.name],
+  );
+}

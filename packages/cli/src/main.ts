@@ -4,10 +4,13 @@ import { createAuth, loadConfig } from '@mcprouter/server';
 import {
   addGroup,
   addUser,
+  approveItem,
   CliError,
   createKey,
+  listReviews,
   parseGroupAdd,
   parseServerAdd,
+  rejectItem,
   secretLines,
   setToolEnabled,
 } from './commands.js';
@@ -21,6 +24,9 @@ const HELP = `mcprouter <command>
   servers add <slug> [--env K=V | --env K]… [--cwd <dir>] -- <command> [args…]
   servers tool <server> <tool> --enable | --disable
   groups add <slug> [--server <slug>[=tool,tool]]…   --server s=a,b selects ONLY those tools
+  review list [--server <s>]                          items needing a human: unreviewed, changed, rejected, defective
+  review approve <server> <kind> <name> --hash <h>    approve exactly the definition you were shown
+  review reject <server> <kind> <name>
 
 Every command except 'secret' reads the server's configuration from the environment.
 `;
@@ -102,6 +108,35 @@ async function run(): Promise<void> {
         throw new CliError('usage: mcprouter servers tool <server> <tool> --enable | --disable');
       }
       await setToolEnabled(pool, { server, tool, enabled: values.enable });
+    } else if (cmd === 'review' && sub === 'list') {
+      const { values } = parseArgs({ args: rest, options: { server: { type: 'string' } } });
+      for (const r of await listReviews(
+        pool,
+        values.server === undefined ? {} : { server: values.server },
+      )) {
+        process.stdout.write(
+          `${r.server}\t${r.kind}\t${r.name}\t${r.state}\t${r.defHash ?? '-'}\n`,
+        );
+      }
+    } else if (cmd === 'review' && (sub === 'approve' || sub === 'reject')) {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { hash: { type: 'string' } },
+      });
+      const [server, kind, name] = positionals;
+      if (server === undefined || kind === undefined || name === undefined) {
+        throw new CliError(
+          `usage: mcprouter review ${sub} <server> <kind> <name>${sub === 'approve' ? ' --hash <h>' : ''}`,
+        );
+      }
+      if (sub === 'approve') {
+        if (values.hash === undefined)
+          throw new CliError('--hash is required: approve exactly what you reviewed');
+        await approveItem(pool, { server, kind, name, hash: values.hash });
+      } else {
+        await rejectItem(pool, { server, kind, name });
+      }
     } else {
       throw new CliError(`unknown command: ${[cmd, sub].filter(Boolean).join(' ')}`);
     }
