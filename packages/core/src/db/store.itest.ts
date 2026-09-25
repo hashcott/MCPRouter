@@ -63,6 +63,7 @@ describe('createServer + loadServerConfigs', () => {
         name: 'fs',
         enabled: true,
         credentialMode: 'shared',
+        tools: {},
         type: 'stdio',
         command: 'npx',
         args: ['-y', 'fs-mcp'],
@@ -73,6 +74,7 @@ describe('createServer + loadServerConfigs', () => {
         name: 'remote',
         enabled: true,
         credentialMode: 'shared',
+        tools: {},
         type: 'streamable-http',
         url: 'https://mcp.example.com/mcp',
         headers: { Authorization: 'Bearer tok-9' },
@@ -211,5 +213,29 @@ describe('§11.7 — a new column on secrets does not change the AAD', () => {
     } finally {
       await pool.query('alter table secrets drop column scan_egress');
     }
+  });
+});
+
+describe('tool overrides', () => {
+  it('reach the Engine config keyed by bare name; other kinds do not', async () => {
+    const id = await createServer(db, KR1, { slug: 'ov', config: { type: 'stdio', command: 'x' } });
+    await pool.query(
+      `insert into server_item_override (server_id, kind, item_name, enabled, description) values
+         ($1, 'tool', 'rm', false, null),
+         ($1, 'tool', 'ls', true, 'List files, carefully'),
+         ($1, 'prompt', 'p', false, null)`,
+      [id],
+    );
+    const cfg = (await loadServerConfigs(db, KR1)).configs.find((c) => c.name === 'ov');
+    expect(cfg?.tools).toEqual({
+      rm: { enabled: false },
+      ls: { enabled: true, description: 'List files, carefully' },
+    });
+  });
+
+  it('a server with no overrides gets an empty map', async () => {
+    await createServer(db, KR1, { slug: 'plain', config: { type: 'stdio', command: 'x' } });
+    const cfg = (await loadServerConfigs(db, KR1)).configs.find((c) => c.name === 'plain');
+    expect(cfg?.tools).toEqual({});
   });
 });

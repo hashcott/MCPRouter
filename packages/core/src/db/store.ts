@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { open, seal, type Keyring, type SealedSecret, type SecretScope } from '../security/seal.js';
 import type { ServerConfig } from '../types.js';
 import type { Db } from './client.js';
-import { secrets, servers } from './schema/index.js';
+import { secrets, serverItemOverride, servers } from './schema/index.js';
 import {
   PlainServerConfig,
   StoredServerConfig,
@@ -81,6 +81,23 @@ export async function loadServerConfigs(db: Db, kr: Keyring): Promise<LoadedServ
             ),
           );
 
+  // R5: only tool overrides — the Engine models no prompt/resource overrides yet.
+  const overrideRows =
+    rows.length === 0
+      ? []
+      : await db
+          .select()
+          .from(serverItemOverride)
+          .where(
+            and(
+              eq(serverItemOverride.kind, 'tool'),
+              inArray(
+                serverItemOverride.serverId,
+                rows.map((r) => r.id),
+              ),
+            ),
+          );
+
   const out: LoadedServers = { configs: [], errors: [] };
   for (const row of rows) {
     try {
@@ -96,7 +113,22 @@ export async function loadServerConfigs(db: Db, kr: Keyring): Promise<LoadedServ
           }),
         );
       const cfg = StoredServerConfig.parse(row.config);
-      const base = { name: row.slug, enabled: row.enabled, credentialMode: row.credentialMode };
+      const tools = Object.fromEntries(
+        overrideRows
+          .filter((o) => o.serverId === row.id)
+          .map((o) => [
+            o.itemName,
+            o.description === null
+              ? { enabled: o.enabled }
+              : { enabled: o.enabled, description: o.description },
+          ]),
+      );
+      const base = {
+        name: row.slug,
+        enabled: row.enabled,
+        credentialMode: row.credentialMode,
+        tools,
+      };
       out.configs.push(
         cfg.type === 'stdio'
           ? {
