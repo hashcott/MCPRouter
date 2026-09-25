@@ -33,7 +33,7 @@ const app = createApp({
   readiness,
   webRoot,
   mcp: {
-    authenticate: (header) => authenticateKey(auth, header),
+    authenticate: async (header) => (await authenticateKey(auth, header))?.principal ?? null,
     engine,
     // Before the first sync lands, an empty catalog — never "all" (P1a constraint).
     scopeAll: () => sync?.scopeAll() ?? EMPTY_SCOPE,

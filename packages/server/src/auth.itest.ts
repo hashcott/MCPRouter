@@ -48,13 +48,19 @@ describe('authenticateKey', () => {
     const id = await user('operator');
     const key = await mint(id, KEY_GRANT_ALL);
     expect(key.startsWith('mcpr_')).toBe(true);
-    expect(await authenticateKey(auth, `Bearer ${key}`)).toEqual({ id, isAdmin: false });
-    expect(await authenticateKey(auth, `bearer ${key}`)).toEqual({ id, isAdmin: false });
+    expect((await authenticateKey(auth, `Bearer ${key}`))?.principal).toEqual({
+      id,
+      isAdmin: false,
+    });
+    expect((await authenticateKey(auth, `bearer ${key}`))?.principal).toEqual({
+      id,
+      isAdmin: false,
+    });
   });
 
   it("an admin's key is not admin", async () => {
     const key = await mint(await user('admin'), KEY_GRANT_ALL);
-    expect((await authenticateKey(auth, `Bearer ${key}`))?.isAdmin).toBe(false);
+    expect((await authenticateKey(auth, `Bearer ${key}`))?.principal.isAdmin).toBe(false);
   });
 
   it.each([
@@ -78,6 +84,7 @@ describe('authenticateKey', () => {
     ['a widened grant', '{"mcp":["all","admin"]}'],
     ['null', null],
     ['malformed JSON', '{mcp'],
+    ['a slug where an id belongs', '{"servers":["fs"]}'],
   ])('fails closed on permissions edited to %s', async (_n, raw) => {
     const key = await mint(await user('operator'), KEY_GRANT_ALL);
     await pool.query(
@@ -99,5 +106,15 @@ describe('authenticateKey', () => {
       [old.slice(0, 6)],
     );
     expect(await authenticateKey(auth, `Bearer ${old}`)).toBeNull();
+  });
+
+  it('carries the key id and a scoped grant', async () => {
+    const id = await user('operator');
+    const g = '00000000-0000-4000-8000-0000000000aa';
+    const key = await mint(id, { groups: [g] });
+    const a = await authenticateKey(auth, `Bearer ${key}`);
+    expect(a?.grant).toEqual({ kind: 'groups', ids: [g] });
+    expect(a?.keyId).toMatch(/.+/);
+    expect(a?.principal).toEqual({ id, isAdmin: false });
   });
 });

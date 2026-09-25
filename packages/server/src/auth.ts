@@ -2,20 +2,19 @@ import { apiKey } from '@better-auth/api-key';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import type { Logger } from 'pino';
-import { z } from 'zod';
 import { schema, type Db, type Principal } from '@mcprouter/core';
+import { parseGrant, toPermissions, type Grant } from './grant.js';
 
-/** The only grant P1 mints. P2 widens `Grant` to groups/servers. */
-export const KEY_GRANT_ALL = { mcp: ['all'] };
-
-/** Parsed on every read and fail-closed (§5.2): anything P1 does not know denies. */
-const Grant = z.strictObject({ mcp: z.tuple([z.literal('all')]) });
+/** The unscoped grant. Scoped keys are minted with toPermissions({ kind: 'groups' | 'servers', … }). */
+export const KEY_GRANT_ALL = toPermissions({ kind: 'all' });
 
 /**
  * §5.2 point 2: a machine credential is never admin, as a TYPE — writing
  * `isAdmin: true` (or `isAdmin: someRole === 'admin'`) on this path fails to compile.
  */
 export type MachinePrincipal = Principal & { isAdmin: false };
+
+export type KeyAuth = { principal: MachinePrincipal; keyId: string; grant: Grant };
 
 export type AuthDeps = { db: Db; secret: string; baseURL: string; log: Logger };
 
@@ -57,13 +56,15 @@ const BEARER = /^Bearer\s+(\S+)$/i;
 export async function authenticateKey(
   auth: Auth,
   authorization: string | undefined,
-): Promise<MachinePrincipal | null> {
+): Promise<KeyAuth | null> {
   const key = BEARER.exec(authorization ?? '')?.[1];
   if (key === undefined) return null;
   // Returns {valid:false}, never throws, for an unknown/disabled/expired key.
   const r = await auth.api.verifyApiKey({ body: { key } });
   if (!r.valid || r.key === null) return null;
-  if (!Grant.safeParse(r.key.permissions).success) return null;
+  // Parsed on every read, fail-closed (§5.2): a grant this build does not know denies.
+  const grant = parseGrant(r.key.permissions);
+  if (grant === null) return null;
   // §5.2: a machine credential is never admin, whatever its owner's role.
-  return { id: r.key.referenceId, isAdmin: false };
+  return { principal: { id: r.key.referenceId, isAdmin: false }, keyId: r.key.id, grant };
 }
