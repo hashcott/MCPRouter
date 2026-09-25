@@ -61,6 +61,7 @@ const Schema = z.object({
   MCP_MAX_INFLIGHT: z.coerce.number().int().min(1).default(8),
   MCPR_INTEGRITY: z.enum(['enforce', 'observe', 'off']).default('enforce'),
   MCPR_NEW_ITEMS: z.enum(['quarantine', 'approve']).default('quarantine'),
+  MCPR_RESULT_MAX_BYTES: z.coerce.number().int().min(1_024).default(1_048_576),
 });
 
 export interface Config {
@@ -77,6 +78,7 @@ export interface Config {
   readonly maxInflight: number;
   readonly integrity: 'enforce' | 'observe' | 'off';
   readonly newItems: 'quarantine' | 'approve';
+  readonly resultMaxBytes: number;
   toJSON(): Record<string, unknown>;
 }
 
@@ -111,6 +113,7 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
     maxInflight: v.MCP_MAX_INFLIGHT,
     integrity: v.MCPR_INTEGRITY,
     newItems: v.MCPR_NEW_ITEMS,
+    resultMaxBytes: v.MCPR_RESULT_MAX_BYTES,
     toJSON() {
       return {
         databaseUrl: '[redacted]',
@@ -126,6 +129,7 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
         maxInflight: this.maxInflight,
         integrity: this.integrity,
         newItems: this.newItems,
+        resultMaxBytes: this.resultMaxBytes,
       };
     },
   };

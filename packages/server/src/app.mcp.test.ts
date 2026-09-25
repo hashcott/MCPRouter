@@ -44,6 +44,7 @@ const audited: AuditRow[] = [];
 let gate: (() => void) | undefined;
 let engine: Engine;
 let app: ReturnType<typeof createApp>;
+let registry: ReturnType<typeof createRegistry>;
 
 beforeAll(async () => {
   const logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -74,11 +75,12 @@ beforeAll(async () => {
     MCPR_SECRET_KEYS: `v1:${Buffer.alloc(32, 3).toString('base64url')}`,
   });
   if (!r.ok) throw new Error(r.issues.join(','));
+  registry = createRegistry();
   app = createApp({
     config: r.config,
     log: pino({ level: 'silent' }),
     pool: {} as pg.Pool,
-    registry: createRegistry(),
+    registry,
     readiness: { migrationsApplied: true, routesMounted: true },
     mcp: {
       authenticate: async (h) => keys[h ?? ''] ?? null,
@@ -86,6 +88,7 @@ beforeAll(async () => {
       resolve: (t) => resolveTarget(snap, t),
       timeoutMs: 5_000,
       maxInflight: 1,
+      resultMaxBytes: 1_048_576,
       audit: (row) => audited.push(row),
       authHandler: async () => new Response('from-better-auth'),
     },
@@ -250,5 +253,28 @@ describe('audit rows', () => {
         inputKeys: ['a'],
       }),
     ]);
+  });
+});
+
+describe('integrity blocks', () => {
+  it('a not_found for an integrity reason is audited as integrity.block and counted', async () => {
+    audited.length = 0;
+    const explain = engine.explain.bind(engine);
+    engine.explain = () => 'changed';
+    try {
+      await post('/mcp', 'Bearer good', rpc('tools/call', { name: 'fs__whatever', arguments: {} }));
+    } finally {
+      engine.explain = explain;
+    }
+    expect(audited).toEqual([
+      expect.objectContaining({
+        evt: 'integrity.block',
+        outcome: 'not_found',
+        error: 'integrity:changed',
+      }),
+    ]);
+    expect(
+      await registry.registry.getSingleMetricAsString('mcprouter_integrity_block_total'),
+    ).toContain('reason="changed"} 1');
   });
 });

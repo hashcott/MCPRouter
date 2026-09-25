@@ -4,6 +4,7 @@ export interface Metrics {
   registry: Registry;
   httpRequests: Counter<'route' | 'method' | 'status'>;
   httpDuration: Histogram<'route' | 'method'>;
+  integrityBlocks: Counter<'reason'>;
 }
 
 /**
@@ -29,7 +30,14 @@ export function createRegistry(): Metrics {
     registers: [registry],
   });
 
-  return { registry, httpRequests, httpDuration };
+  const integrityBlocks = new Counter({
+    name: 'mcprouter_integrity_block_total',
+    help: 'Calls refused because an item is unreviewed, rejected, changed or defective',
+    labelNames: ['reason'] as const,
+    registers: [registry],
+  });
+
+  return { registry, httpRequests, httpDuration, integrityBlocks };
 }
 
 export type { Registry };

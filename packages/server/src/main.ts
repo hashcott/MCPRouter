@@ -45,6 +45,7 @@ const app = createApp({
     resolve: (t) => resolveTarget(sync?.snapshot() ?? EMPTY_SNAPSHOT, t),
     timeoutMs: config.mcpCallTimeoutMs,
     maxInflight: config.maxInflight,
+    resultMaxBytes: config.resultMaxBytes,
     audit: (row) => audit.push(row),
     authHandler: (req) => auth.handler(req),
   },

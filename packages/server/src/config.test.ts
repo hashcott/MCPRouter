@@ -118,4 +118,9 @@ describe('parseConfig', () => {
     expect(r.ok && [r.config.integrity, r.config.newItems]).toEqual(['enforce', 'quarantine']);
     expect(parseConfig({ ...valid, MCPR_INTEGRITY: 'lax' }).ok).toBe(false);
   });
+
+  it('caps results at 1 MiB by default', () => {
+    const r = parseConfig(valid);
+    expect(r.ok && r.config.resultMaxBytes).toBe(1_048_576);
+  });
 });

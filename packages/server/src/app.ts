@@ -4,7 +4,13 @@ import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import type { Logger } from 'pino';
 import type pg from 'pg';
-import { currentContext, newRequestId, runWithContext, type Engine } from '@mcprouter/core';
+import {
+  currentContext,
+  INTEGRITY_BLOCKS,
+  newRequestId,
+  runWithContext,
+  type Engine,
+} from '@mcprouter/core';
 import type { KeyAuth } from './auth.js';
 import type { Config } from './config.js';
 import { canSee, checkGrant } from './grant.js';
@@ -30,7 +36,7 @@ export interface AppDeps {
 }
 
 export type AuditRow = CallRecord & {
-  evt: 'tool.call';
+  evt: 'tool.call' | 'integrity.block';
   requestId: string | null;
   principalId: string;
   keyId: string;
@@ -46,6 +52,8 @@ export interface McpDeps {
   timeoutMs: number;
   /** Per-principal concurrent MCP requests (§4.2, default 8). */
   maxInflight: number;
+  /** §4.2: the largest result returned downstream. */
+  resultMaxBytes: number;
   audit: (row: AuditRow) => void;
   /** better-auth's fetch handler. */
   authHandler: (req: Request) => Promise<Response>;
@@ -113,7 +121,7 @@ export function createApp(deps: AppDeps): Hono {
     return c.text(body, 200, { 'content-type': registry.registry.contentType });
   });
 
-  if (deps.mcp !== undefined) mountMcp(app, deps.mcp);
+  if (deps.mcp !== undefined) mountMcp(app, deps.mcp, registry);
 
   if (deps.webRoot !== undefined) {
     const root = deps.webRoot;
@@ -140,7 +148,7 @@ export function createApp(deps: AppDeps): Hono {
   return app;
 }
 
-function mountMcp(app: Hono, mcp: McpDeps): void {
+function mountMcp(app: Hono, mcp: McpDeps, metrics: Metrics): void {
   const limit = bodyLimit({
     maxSize: 4 * 1024 * 1024,
     onError: (c) => c.json({ error: 'payload_too_large' }, 413),
@@ -194,15 +202,23 @@ function mountMcp(app: Hono, mcp: McpDeps): void {
           scope: route.scope,
           principal: a.principal,
           timeoutMs: mcp.timeoutMs,
-          audit: (r) =>
+          resultMaxBytes: mcp.resultMaxBytes,
+          audit: (r) => {
+            const block =
+              r.reason !== undefined && INTEGRITY_BLOCKS.has(r.reason) ? r.reason : undefined;
+            const blocked = block !== undefined;
+            // Audited and counted — never shown: the caller got the plain not-found (§11.1).
+            if (blocked) metrics.integrityBlocks.inc({ reason: block });
             mcp.audit({
               ...r,
-              evt: 'tool.call',
+              evt: blocked ? 'integrity.block' : 'tool.call',
+              ...(blocked ? { error: `integrity:${block}` } : {}),
               requestId: currentContext()?.requestId ?? null,
               principalId: who,
               keyId: a.keyId,
               route: route.label,
-            }),
+            });
+          },
         });
       } finally {
         const left = (inflight.get(who) ?? 1) - 1;

@@ -18,6 +18,7 @@ import {
   ToolUnavailableError,
   VERSION,
   type Engine,
+  type Exposure,
   type Outcome,
   type Principal,
   type ResolvedScope,
@@ -34,6 +35,8 @@ export type CallRecord = {
   inputBytes: number;
   /** The error's class name only, never its message. */
   error: string | null;
+  /** Internal — why a name did not resolve. Never sent to the client. */
+  reason?: Exposure | undefined;
 };
 
 export type McpCall = {
@@ -41,8 +44,25 @@ export type McpCall = {
   scope: ResolvedScope;
   principal: Principal;
   timeoutMs: number;
+  /** §4.2: the largest result returned downstream. */
+  resultMaxBytes: number;
   audit?: ((r: CallRecord) => void) | undefined;
 };
+
+/** §4.2: a result larger than the cap becomes its text, truncated, with the spec's marker. */
+export function capResult(res: CallToolResult, maxBytes: number): CallToolResult {
+  const size = Buffer.byteLength(JSON.stringify(res), 'utf8');
+  if (size <= maxBytes) return res;
+  const text = res.content.map((c) => (c.type === 'text' ? c.text : JSON.stringify(c))).join('\n');
+  const keep = Buffer.from(text, 'utf8')
+    .subarray(0, Math.max(0, maxBytes - 256))
+    .toString('utf8');
+  const dropped = size - Buffer.byteLength(keep, 'utf8');
+  return {
+    ...(res.isError === undefined ? {} : { isError: res.isError }),
+    content: [{ type: 'text', text: `${keep}\n[mcprouter:truncated ${dropped} bytes]` }],
+  };
+}
 
 /** Hidden, missing and disabled are one protocol error with core's one message. */
 function notFound(err: unknown): never {
@@ -95,15 +115,23 @@ export async function handleMcp(original: Request, call: McpCall): Promise<Respo
       inputKeys: Object.keys(args),
       inputBytes: Buffer.byteLength(JSON.stringify(args), 'utf8'),
     };
-    const done = (outcome: Outcome, error: string | null = null): void =>
-      call.audit?.({ ...rec, outcome, durationMs: Date.now() - started, error });
+    const done = (outcome: Outcome, error: string | null = null, reason?: Exposure): void =>
+      call.audit?.({
+        ...rec,
+        outcome,
+        durationMs: Date.now() - started,
+        error,
+        ...(reason === undefined ? {} : { reason }),
+      });
 
     // §11.4: resolve and execute stay two steps — P2b's policy gate sits between them.
     let decision: ToolDecision;
     try {
       decision = engine.resolve(scope, r.params.name);
     } catch (err) {
-      if (err instanceof ToolUnavailableError) done('not_found');
+      if (err instanceof ToolUnavailableError) {
+        done('not_found', null, engine.explain(scope, r.params.name));
+      }
       return notFound(err);
     }
     rec.server = decision.server;
@@ -117,7 +145,7 @@ export async function handleMcp(original: Request, call: McpCall): Promise<Respo
         signal,
       })) as CallToolResult;
       done(res.isError === true ? 'error' : 'ok');
-      return res;
+      return capResult(res, call.resultMaxBytes);
     } catch (err) {
       if (err instanceof ToolUnavailableError) {
         done('not_found');

@@ -3,7 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Engine, ToolUnavailableError, type Principal, type ResolvedScope } from '@mcprouter/core';
 import { FakeUpstream, fakeFactory } from '../../../core/test/fake-upstream.js';
-import { handleMcp, type CallRecord, type McpCall } from './legacy.js';
+import { capResult, handleMcp, type CallRecord, type McpCall } from './legacy.js';
 
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
 const principal: Principal = { id: 'u1', isAdmin: false };
@@ -26,6 +26,7 @@ beforeAll(async () => {
         },
       },
       { name: 'slow', handler: () => new Promise((r) => setTimeout(() => r('late'), 2_000)) },
+      { name: 'big', handler: () => 'y'.repeat(5_000) },
     ],
     {
       prompts: [
@@ -55,8 +56,10 @@ const call = (timeoutMs = 5_000): McpCall => ({
   scope,
   principal,
   timeoutMs,
+  resultMaxBytes: 1_048_576,
   audit: (r) => records.push(r),
 });
+const handleMcpCap = (resultMaxBytes: number): McpCall => ({ ...call(), resultMaxBytes });
 
 async function client(timeoutMs?: number): Promise<Client> {
   const c = new Client({ name: 'test', version: '0.0.0' });
@@ -72,7 +75,12 @@ describe('handleMcp', () => {
   it('serves initialize, initialized and tools/list as separate requests', async () => {
     const c = await client();
     const { tools } = await c.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(['fs__boom', 'fs__echo', 'fs__slow']);
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      'fs__big',
+      'fs__boom',
+      'fs__echo',
+      'fs__slow',
+    ]);
     await c.close();
   });
 
@@ -214,6 +222,7 @@ describe('races and odd inputs (stub engine)', () => {
             scope,
             principal,
             timeoutMs: 5_000,
+            resultMaxBytes: 1_048_576,
             audit: (r) => records.push(r),
           }),
       }),
@@ -285,5 +294,42 @@ describe('batches', () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32600 }, id: null });
     expect(records).toEqual([]);
+  });
+});
+
+describe('result cap (§4.2)', () => {
+  it('passes a result under the cap untouched', () => {
+    const r = { content: [{ type: 'text' as const, text: 'ok' }] };
+    expect(capResult(r, 1_000)).toBe(r);
+  });
+
+  it('truncates a result over the cap with the marker, keeping isError', async () => {
+    const c2 = new Client({ name: 't', version: '0' });
+    await c2.connect(
+      new StreamableHTTPClientTransport(new URL('http://hub.test/mcp'), {
+        fetch: (url, init) => handleMcp(new Request(url, init), handleMcpCap(1_000)),
+      }),
+    );
+    const res = await c2.callTool({ name: 'fs__big', arguments: {} });
+    await c2.close();
+    const text = JSON.stringify(res.content);
+    expect(text).toMatch(/\[mcprouter:truncated \d+ bytes\]/);
+    expect(Buffer.byteLength(text)).toBeLessThan(1_200);
+    expect(
+      capResult({ isError: true, content: [{ type: 'text', text: 'z'.repeat(2_000) }] }, 500)
+        .isError,
+    ).toBe(true);
+  });
+});
+
+describe('integrity reason on not_found', () => {
+  it('records why a name did not resolve — internally only', async () => {
+    records.length = 0;
+    const c = await client();
+    await expect(c.callTool({ name: 'fs__nope', arguments: {} })).rejects.toThrow(
+      /Tool not found: fs__nope$/,
+    );
+    await c.close();
+    expect(records[0]).toMatchObject({ outcome: 'not_found', reason: 'missing' });
   });
 });

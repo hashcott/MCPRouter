@@ -91,6 +91,7 @@ beforeAll(async () => {
       resolve: (t) => resolveTarget(sync.snapshot(), t),
       timeoutMs: 30_000,
       maxInflight: 8,
+      resultMaxBytes: 1_048_576,
       audit: () => {},
       authHandler: (req) => auth.handler(req),
     },

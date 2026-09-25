@@ -75,7 +75,10 @@ export class AuditWriter {
       const batch = this.#queue.splice(0, this.#o.batch);
       this.#inflight = batch;
       try {
-        await this.#o.db.insert(schema.auditEvent).values(batch.map((e) => e.row));
+        // `reason` has no column: what matters of it is already in evt/error.
+        await this.#o.db
+          .insert(schema.auditEvent)
+          .values(batch.map(({ row: { reason: _reason, ...row } }) => row));
         if (this.#inflight === batch) this.#inflight = undefined;
       } catch (err) {
         // spillAll() already logged this batch and gave up on it: never twice, never re-queued.
