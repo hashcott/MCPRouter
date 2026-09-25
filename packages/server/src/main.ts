@@ -1,10 +1,12 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { serve } from '@hono/node-server';
-import { createLogger, createPool, runMigrations } from '@mcprouter/core';
+import { createDb, createLogger, createPool, Engine, runMigrations } from '@mcprouter/core';
+import { authenticateKey, createAuth } from './auth.js';
 import { loadConfig } from './config.js';
 import { createApp, type Readiness } from './app.js';
 import { createRegistry } from './metrics.js';
+import { EMPTY_SCOPE, startServerSync, type ServerSync } from './servers-sync.js';
 
 const config = loadConfig();
 const log = createLogger({
@@ -17,9 +19,28 @@ const webRoot =
   process.env['WEB_ROOT'] ?? resolve(dirname(fileURLToPath(import.meta.url)), '../../web/dist');
 
 const pool = createPool(config.databaseUrl);
+const db = createDb(pool);
+const engine = new Engine({ logger: log });
+const auth = createAuth({ db, secret: config.authSecret, baseURL: config.publicUrl.href, log });
+let sync: ServerSync | undefined;
 const registry = createRegistry();
 const readiness: Readiness = { migrationsApplied: false, routesMounted: false };
-const app = createApp({ config, log, pool, registry, readiness, webRoot });
+const app = createApp({
+  config,
+  log,
+  pool,
+  registry,
+  readiness,
+  webRoot,
+  mcp: {
+    authenticate: (header) => authenticateKey(auth, header),
+    engine,
+    // Before the first sync lands, an empty catalog — never "all" (P1a constraint).
+    scopeAll: () => sync?.scopeAll() ?? EMPTY_SCOPE,
+    timeoutMs: config.mcpCallTimeoutMs,
+    authHandler: (req) => auth.handler(req),
+  },
+});
 
 const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
   readiness.routesMounted = true;
@@ -39,6 +60,8 @@ if (config.migrateOnBoot) {
   log.warn({ evt: 'boot.migrate_skipped' }, 'MIGRATE_ON_BOOT=false');
 }
 
+sync = await startServerSync({ pool, db, keyring: config.secretKeys, engine, log });
+
 let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
@@ -50,6 +73,8 @@ async function shutdown(signal: string): Promise<void> {
   }, config.shutdownTimeoutMs);
   timer.unref();
   server.close();
+  sync?.stop();
+  await engine.shutdown();
   await pool.end();
   log.info({ evt: 'shutdown.done' }, 'bye');
   process.exit(0);

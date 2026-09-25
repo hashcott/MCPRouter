@@ -98,4 +98,12 @@ describe('parseConfig', () => {
     expect(joined).toContain('MCPR_SECRET_KEYS: v1 must decode to exactly 32 bytes');
     expect(joined).not.toContain(bad);
   });
+
+  it('defaults MCP_CALL_TIMEOUT_MS to 60 s and accepts an override', () => {
+    const d = parseConfig(valid);
+    expect(d.ok && d.config.mcpCallTimeoutMs).toBe(60_000);
+    const o = parseConfig({ ...valid, MCP_CALL_TIMEOUT_MS: '5000' });
+    expect(o.ok && o.config.mcpCallTimeoutMs).toBe(5_000);
+    expect(parseConfig({ ...valid, MCP_CALL_TIMEOUT_MS: '10' }).ok).toBe(false);
+  });
 });
