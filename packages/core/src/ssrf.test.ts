@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { assertSafeUrl, guardedFetch, isBlockedIp } from './ssrf.js';
-import { UnsafeUrlError } from './errors.js';
+import { assertSafeUrl, capFrames, guardedFetch, isBlockedIp } from './ssrf.js';
+import { FrameTooLargeError, UnsafeUrlError } from './errors.js';
 
 describe('isBlockedIp', () => {
   const blocked = [
@@ -186,5 +186,52 @@ describe('guardedFetch', () => {
     });
     await f('https://example.test/a');
     expect(got?.redirect).toBe('manual');
+  });
+});
+
+describe('capFrames — bytes between blank lines, counted before parsing', () => {
+  const body = (s: string) => new Response(s, { headers: { 'content-type': 'text/event-stream' } });
+
+  it('passes a response whose frames are all under the cap', async () => {
+    const res = capFrames(body('data: aaaa\n\ndata: bbbb\n\n'), 12);
+    expect(await res.text()).toBe('data: aaaa\n\ndata: bbbb\n\n');
+  });
+
+  it('errors the stream as soon as ONE frame exceeds the cap, whatever the total', async () => {
+    const res = capFrames(body(`data: ${'x'.repeat(50)}\n\n`), 20);
+    await expect(res.text()).rejects.toBeInstanceOf(FrameTooLargeError);
+  });
+
+  it('a long stream of small frames is fine — the cap is per frame, not per stream', async () => {
+    const res = capFrames(body('data: ok\n\n'.repeat(1_000)), 12);
+    expect((await res.text()).length).toBe(10_000);
+  });
+
+  it('CRLF framing counts the same', async () => {
+    const res = capFrames(body('data: aaaa\r\n\r\ndata: bbbb\r\n\r\n'), 12);
+    expect(await res.text()).toContain('bbbb');
+  });
+
+  it('keeps status and headers', () => {
+    const res = capFrames(new Response('{}', { status: 202, headers: { 'x-a': '1' } }), 10);
+    expect([res.status, res.headers.get('x-a')]).toEqual([202, '1']);
+  });
+
+  it('the error is permanent: the server goes to failed, not retrying', () => {
+    expect(new FrameTooLargeError(1).permanent).toBe(true);
+  });
+
+  it('guardedFetch applies it to every upstream response', async () => {
+    process.env['MCPROUTER_UPSTREAM_MAX_FRAME_BYTES'] = '8';
+    try {
+      const f = guardedFetch(true, {
+        fetchImpl: async () => new Response('x'.repeat(100)),
+        resolve: async () => ['10.0.0.1'],
+      });
+      const res = await f('http://10.0.0.1/mcp');
+      await expect(res.text()).rejects.toBeInstanceOf(FrameTooLargeError);
+    } finally {
+      delete process.env['MCPROUTER_UPSTREAM_MAX_FRAME_BYTES'];
+    }
   });
 });

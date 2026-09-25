@@ -8,6 +8,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import type { Bus, EngineEvents } from './bus.js';
 import { hashDefinition } from './guardrails/hash.js';
+import { envInt } from './knobs.js';
 import { UpstreamAuthRequiredError, UpstreamUnavailableError } from './errors.js';
 import type { Semaphore } from './semaphore.js';
 import { next, type Ev, type State } from './state.js';
@@ -69,15 +70,7 @@ export function configHashOf(cfg: ServerConfig): string {
     .digest('hex');
 }
 
-/**
- * A numeric env knob that cannot fail open: `Number('')` is 0 and `Number('x')`
- * is NaN, either of which silently disables a cap or stalls every connect.
- */
-export function envInt(name: string, fallback: number, min = 1): number {
-  const raw = process.env[name];
-  const n = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
-  return Number.isInteger(n) && n >= min ? n : fallback;
-}
+export { envInt } from './knobs.js';
 
 /** Errors we must never retry: retrying cannot change the answer. */
 function isPermanent(err: unknown): boolean {
@@ -86,7 +79,9 @@ function isPermanent(err: unknown): boolean {
   const code = String(e.code ?? '');
   if (['ENOENT', 'EACCES', 'ENOTDIR', 'ENOTFOUND', 'UNSAFE_URL'].includes(code)) return true;
   if (code === '404') return true;
-  return /Unsupported scheme|non-public address|Unresolved value for/.test(e.message ?? '');
+  return /Unsupported scheme|non-public address|Unresolved value for|upstream frame exceeds|upstream listed more than/.test(
+    e.message ?? '',
+  );
 }
 
 function isAuthChallenge(err: unknown): boolean {

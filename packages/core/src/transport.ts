@@ -8,6 +8,7 @@ import {
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { envInt } from './knobs.js';
 import { assertSafeUrl, guardedFetch } from './ssrf.js';
 import type { ServerConfig } from './types.js';
 
@@ -83,6 +84,8 @@ export const createTransport: TransportFactory = async (cfg, ctx) => {
         env: { ...augmentPath(getDefaultEnvironment()), ...childEnv },
         ...(cfg.cwd === undefined ? {} : { cwd: cfg.cwd }),
         stderr: 'pipe',
+        // §11.2: the longest line (one JSON-RPC message) we buffer before parsing.
+        maxBufferSize: envInt('MCPROUTER_UPSTREAM_MAX_FRAME_BYTES', 16 * 1024 * 1024),
       });
       // A piped stderr nobody reads fills the OS buffer and blocks the child.
       // The SDK types it as Stream; with 'pipe' it is a PassThrough.

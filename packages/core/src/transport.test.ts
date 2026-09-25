@@ -92,3 +92,18 @@ describe('createTransport', () => {
     await expect(createTransport(cfg, ctx)).rejects.toThrow(/TOKEN/);
   });
 });
+
+it('a stdio transport caps its line buffer with MCPROUTER_UPSTREAM_MAX_FRAME_BYTES', async () => {
+  process.env['MCPROUTER_UPSTREAM_MAX_FRAME_BYTES'] = '4096';
+  try {
+    const t = await createTransport(
+      { name: 's', ...base, type: 'stdio', command: 'node' },
+      { headers: {}, signal: new AbortController().signal, onStderr: () => {} },
+    );
+    // The SDK's own line buffer, read by its runtime field names (not part of its typings).
+    const sdk = t as unknown as Record<string, Record<string, number>>;
+    expect(sdk['_readBuffer']?.['_maxBufferSize']).toBe(4096);
+  } finally {
+    delete process.env['MCPROUTER_UPSTREAM_MAX_FRAME_BYTES'];
+  }
+});

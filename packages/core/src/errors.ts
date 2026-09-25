@@ -82,3 +82,13 @@ export function redact(err: Error, secrets: readonly string[]): Error {
   }
   return err;
 }
+
+/** An upstream frame over MCPROUTER_UPSTREAM_MAX_FRAME_BYTES: the server fails, it does not retry. */
+export class FrameTooLargeError extends Error {
+  readonly code = 'FRAME_TOO_LARGE';
+  readonly permanent = true;
+  constructor(maxBytes: number) {
+    super(`upstream frame exceeds ${maxBytes} bytes`);
+    this.name = 'FrameTooLargeError';
+  }
+}

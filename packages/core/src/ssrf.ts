@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { isIPv4, isIPv6 } from 'node:net';
-import { UnsafeUrlError } from './errors.js';
+import { FrameTooLargeError, UnsafeUrlError } from './errors.js';
+import { envInt } from './knobs.js';
 
 const MAX_HOPS = 5;
 
@@ -119,18 +120,51 @@ async function resolveOrRefuse(host: string, deps: GuardDeps): Promise<string[]>
  * is load-bearing: with the default `'follow'` the platform chases the Location header
  * itself and our per-hop check never runs.
  */
+/**
+ * §11.2: cap BEFORE parsing. Counts bytes since the last blank line — one SSE event,
+ * or one whole JSON body — so a long stream of small frames is fine while a single
+ * huge frame errors the stream before the SDK ever buffers or parses it.
+ */
+export function capFrames(res: Response, maxBytes: number): Response {
+  if (res.body === null) return res;
+  let since = 0;
+  let prev = 0;
+  const body = res.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, ctl) {
+        for (const b of chunk) {
+          if (b === 0x0d) continue; // CRLF framing counts like LF
+          since = b === 0x0a && prev === 0x0a ? 0 : since + 1;
+          prev = b;
+          if (since > maxBytes) {
+            ctl.error(new FrameTooLargeError(maxBytes));
+            return;
+          }
+        }
+        ctl.enqueue(chunk);
+      },
+    }),
+  );
+  return new Response(body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
+}
+
 export function guardedFetch(allowPrivate?: boolean, deps: GuardDeps = {}): typeof fetch {
   const impl = deps.fetchImpl ?? fetch;
   return (async (input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
+    const maxFrame = envInt('MCPROUTER_UPSTREAM_MAX_FRAME_BYTES', 16 * 1024 * 1024);
     let target = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
 
     for (let hop = 0; hop <= MAX_HOPS; hop += 1) {
       await assertSafeUrl(target, allowPrivate, deps);
       const res = await impl(target, { ...init, redirect: 'manual' });
-      if (res.status < 300 || res.status > 399) return res;
+      if (res.status < 300 || res.status > 399) return capFrames(res, maxFrame);
 
       const location = res.headers.get('location');
-      if (location === null) return res;
+      if (location === null) return capFrames(res, maxFrame);
       const next = new URL(location, target);
       // The same init — Authorization and per-user headers included — goes to
       // every hop, so a hop to another origin would hand it our credentials.
