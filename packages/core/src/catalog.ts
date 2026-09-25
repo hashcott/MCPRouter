@@ -2,7 +2,11 @@ import { ToolUnavailableError } from './errors.js';
 import type { ServerRegistry } from './registry.js';
 import type { UpstreamServer } from './upstream-server.js';
 import {
+  reviewKey,
   SEP,
+  type Integrity,
+  type ItemDef,
+  type ItemKind,
   type Prompt,
   type ResolvedScope,
   type Resource,
@@ -20,14 +24,74 @@ export function project(sel: ServerSelection, bare: string, flatten: boolean): s
   return flatten ? bare : `${label(sel)}${SEP}${bare}`;
 }
 
-type Kind = 'tool' | 'prompt' | 'resource';
+type Kind = ItemKind;
+
+export type Exposure =
+  | 'ok'
+  | 'server_disabled'
+  | 'item_disabled'
+  | 'unselected'
+  | 'missing'
+  | 'defective'
+  | 'unreviewed'
+  | 'rejected'
+  | 'changed';
+
+/** The reasons that are integrity blocks — audited and counted, never shown (§11.1). */
+export const INTEGRITY_BLOCKS: ReadonlySet<Exposure> = new Set<Exposure>([
+  'defective',
+  'unreviewed',
+  'rejected',
+  'changed',
+]);
+
+function integrityVerdict(
+  integrity: Integrity | undefined,
+  item: ItemDef | undefined,
+  kind: ItemKind,
+  bare: string,
+): Exposure {
+  if ((integrity?.mode ?? 'off') !== 'enforce') return 'ok'; // R5, R11
+  if (item === undefined || item.hashes === 'defect') return 'defective';
+  // SPARSE: no row is unreviewed, never approved-by-omission.
+  const review = integrity?.reviews[reviewKey(kind, bare)] ?? {
+    state: 'unreviewed',
+    approvedHash: null,
+  };
+  if (review.state === 'rejected') return 'rejected';
+  if (review.state !== 'approved') return 'unreviewed';
+  // `changed` is DERIVED here, never stored (§11.2).
+  return review.approvedHash === item.hashes.defHash ? 'ok' : 'changed';
+}
 
 /**
- * THE predicate. Three layers, one function, called by BOTH list and call.
- *
- * mcphub needs a filter at list time AND an independent execution gate, and
- * their CVE was the two disagreeing. Here there is nothing to disagree with.
+ * THE predicate, with its reason. Layers: server → per-item → scope → presence →
+ * integrity. mcphub needs a filter at list time AND an independent execution gate,
+ * and their CVE was the two disagreeing. Here list and call share this function.
  */
+export function exposure(
+  srv: UpstreamServer,
+  cfg: ServerConfig,
+  sel: ServerSelection,
+  kind: Kind,
+  bare: string,
+): Exposure {
+  if (!cfg.enabled) return 'server_disabled'; // layer 1: server
+  if (kind === 'tool' && cfg.tools?.[bare]?.enabled === false) return 'item_disabled'; // layer 2
+  const allow = kind === 'tool' ? sel.tools : kind === 'prompt' ? sel.prompts : sel.resources;
+  if (allow !== 'all' && !allow.includes(bare)) return 'unselected'; // layer 3: scope
+  const catalog = srv.catalog;
+  if (catalog === undefined) return 'missing';
+  const present =
+    kind === 'tool'
+      ? catalog.tools.has(bare)
+      : kind === 'prompt'
+        ? catalog.prompts.has(bare)
+        : catalog.resources.some((r) => r.uri === bare);
+  if (!present) return 'missing'; // layer 4: presence
+  return integrityVerdict(cfg.integrity, catalog.defs[kind].get(bare), kind, bare); // layer 5
+}
+
 export function isExposed(
   srv: UpstreamServer,
   cfg: ServerConfig,
@@ -35,15 +99,24 @@ export function isExposed(
   kind: Kind,
   bare: string,
 ): boolean {
-  if (!cfg.enabled) return false; // layer 1: server
-  if (kind === 'tool' && cfg.tools?.[bare]?.enabled === false) return false; // layer 2: per-tool
-  const allow = kind === 'tool' ? sel.tools : kind === 'prompt' ? sel.prompts : sel.resources;
-  if (allow !== 'all' && !allow.includes(bare)) return false; // layer 3: scope allowlist
-  const catalog = srv.catalog;
-  if (catalog === undefined) return false;
-  if (kind === 'tool') return catalog.tools.has(bare);
-  if (kind === 'prompt') return catalog.prompts.has(bare);
-  return catalog.resources.some((r) => r.uri === bare);
+  return exposure(srv, cfg, sel, kind, bare) === 'ok';
+}
+
+/**
+ * Why a tool name did not resolve — for the audit row and the counter ONLY.
+ * Never reaches a client: integrity tells the caller nothing (§11.1).
+ */
+export function explainTool(scope: ResolvedScope, reg: ServerRegistry, name: string): Exposure {
+  for (const sel of scope.servers) {
+    const prefix = `${label(sel)}${SEP}`;
+    const bare = scope.flatten ? name : name.startsWith(prefix) ? name.slice(prefix.length) : null;
+    if (bare === null) continue;
+    const srv = reg.shared(sel.serverName);
+    if (srv === undefined) continue;
+    const why = exposure(srv, srv.config, sel, 'tool', bare);
+    if (why !== 'missing') return why;
+  }
+  return 'missing';
 }
 
 /**

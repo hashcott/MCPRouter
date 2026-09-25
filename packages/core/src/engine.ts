@@ -11,6 +11,7 @@ import {
   type ToolDecision,
 } from './call.js';
 import {
+  explainTool,
   projectPrompts,
   projectResourceTemplates,
   projectResources,
@@ -18,6 +19,7 @@ import {
 } from './catalog.js';
 import { ServerRegistry } from './registry.js';
 import { createTransport, type TransportFactory } from './transport.js';
+import type { Exposure } from './catalog.js';
 import type { MiniLogger } from './upstream-server.js';
 import type {
   Principal,
@@ -80,6 +82,11 @@ export class Engine {
 
   callTool(req: CallToolReq): Promise<unknown> {
     return callToolImpl(this.#deps, req);
+  }
+
+  /** Internal reason a name did not resolve (audit/metrics). Never shown to a client. */
+  explain(scope: ResolvedScope, name: string): Exposure {
+    return explainTool(scope, this.#reg, name);
   }
 
   /** §11.4: exposed so P2's policy gate can sit between resolve and execute. */

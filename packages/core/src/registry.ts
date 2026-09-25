@@ -91,11 +91,11 @@ export class ServerRegistry {
       }
       const before = this.#configs.get(name);
       // An enabled-only flip is a toggle, never a restart.
+      // An enabled flip or a review change is applied in place, never a restart.
       if (before !== undefined && sameExceptEnabled(before, want)) {
-        if (before.enabled !== want.enabled) {
-          this.#configs.set(name, want);
-          await srv.setEnabled(want.enabled);
-        }
+        this.#configs.set(name, want);
+        srv.setIntegrity(want.integrity);
+        if (before.enabled !== want.enabled) await srv.setEnabled(want.enabled);
         continue;
       }
       if (configHashOf(want) !== srv.configHash) {

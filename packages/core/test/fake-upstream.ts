@@ -15,6 +15,8 @@ import type { TransportFactory } from '../src/transport.js';
 export type FakeTool = {
   name: string;
   description?: string;
+  /** Extra fields merged into the listed definition (_meta, annotations, a schema…). */
+  extra?: Record<string, unknown>;
   handler?: (args: Record<string, unknown>) => Promise<string> | string;
 };
 
@@ -105,6 +107,7 @@ export class FakeUpstream {
           name: t.name,
           description: t.description ?? `fake ${t.name}`,
           inputSchema: { type: 'object' as const, properties: {} },
+          ...t.extra,
         })),
       };
     });

@@ -5,6 +5,7 @@ import type {
   ServerCapabilities,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
+import type { DefHashes } from './guardrails/hash.js';
 
 export type { Prompt, Resource, ResourceTemplate, ServerCapabilities, Tool };
 
@@ -53,6 +54,11 @@ export type ServerConfigBase = {
   tools?: Record<string, { enabled?: boolean; description?: string }> | undefined;
   timeouts?: { connectMs?: number; requestMs?: number } | undefined;
   maxConcurrentCalls?: number | undefined;
+  /**
+   * Absent ≡ mode 'off' (R11). packages/server ALWAYS sets it. Excluded from the
+   * connection hash: approving an item never restarts an upstream.
+   */
+  integrity?: Integrity | undefined;
 };
 
 export type ServerConfig = ServerConfigBase &
@@ -82,6 +88,8 @@ export type ServerCatalog = {
   capabilities: ServerCapabilities;
   instructions?: string | undefined;
   fetchedAt: number;
+  /** Every item as received, with its hashes — resources keyed by URI. */
+  defs: Record<ItemKind, ReadonlyMap<string, ItemDef>>;
   /** Drives the server:catalog{changed} flag. */
   namesHash: string;
 };
@@ -103,3 +111,19 @@ export type CallOpts = {
   /** Resolved credential values, passed so redact() can strip them from any thrown error. */
   secrets?: readonly string[] | undefined;
 };
+
+export type ItemKind = 'tool' | 'prompt' | 'resource';
+export type IntegrityMode = 'enforce' | 'observe' | 'off';
+export type ReviewState = 'approved' | 'unreviewed' | 'rejected';
+export type Review = { state: ReviewState; approvedHash: string | null };
+
+/**
+ * Operator OPINION (§11.2). `reviews` is SPARSE: a missing key means
+ * { state: 'unreviewed', approvedHash: null } — never approved by omission.
+ */
+export type Integrity = { mode: IntegrityMode; reviews: Record<string, Review> };
+
+export const reviewKey = (kind: ItemKind, bare: string): string => `${kind}:${bare}`;
+
+/** The definition exactly as the upstream sent it, and its hashes (the engine's TRUTH). */
+export type ItemDef = { def: unknown; hashes: DefHashes | 'defect' };

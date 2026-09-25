@@ -7,12 +7,14 @@ import {
   ToolListChangedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { Bus, EngineEvents } from './bus.js';
+import { hashDefinition } from './guardrails/hash.js';
 import { UpstreamAuthRequiredError, UpstreamUnavailableError } from './errors.js';
 import type { Semaphore } from './semaphore.js';
 import { next, type Ev, type State } from './state.js';
 import type { TransportFactory } from './transport.js';
 import type {
   CallOpts,
+  ItemDef,
   Prompt,
   Resource,
   ResourceTemplate,
@@ -49,6 +51,8 @@ export type UpstreamServerOpts = {
 
 /** Stable across key order, so a cosmetic config rewrite does not restart a server. */
 export function configHashOf(cfg: ServerConfig): string {
+  // Opinion is not connection state: reviews change without a reconnect.
+  const { integrity: _opinion, ...connection } = cfg;
   const canon = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(canon);
     if (v !== null && typeof v === 'object') {
@@ -61,7 +65,7 @@ export function configHashOf(cfg: ServerConfig): string {
     return v;
   };
   return createHash('sha256')
-    .update(JSON.stringify(canon(cfg)))
+    .update(JSON.stringify(canon(connection)))
     .digest('hex');
 }
 
@@ -173,6 +177,11 @@ export class UpstreamServer {
 
   start(): void {
     this.#dispatch({ t: 'start' });
+  }
+
+  /** Reviews only move exposure; the connection, the catalog and its hashes stay. */
+  setIntegrity(integrity: ServerConfig['integrity']): void {
+    this.#config = { ...this.#config, integrity };
   }
 
   /**
@@ -410,6 +419,20 @@ export class UpstreamServer {
         caps.resources === undefined
           ? []
           : (await client.listResourceTemplates()).resourceTemplates;
+      // §11.2: cap the item count before anything is built from it. The SERVER fails.
+      const max = envInt('MCPROUTER_UPSTREAM_MAX_ITEMS', 2_000);
+      const counts = [
+        ['tools', tools.length],
+        ['prompts', prompts.length],
+        ['resources', resources.length],
+      ] as const;
+      for (const [kind, n] of counts) {
+        if (n > max) {
+          throw Object.assign(new Error(`upstream listed more than ${max} ${kind}`), {
+            permanent: true,
+          });
+        }
+      }
       if (epoch !== this.#epoch) return;
 
       this.#dispatch({
@@ -448,7 +471,15 @@ export class UpstreamServer {
       ...prompts.map((p) => p.name).sort(),
       ...resources.map((r) => r.uri).sort(),
     ].join('\u001f');
+    // Hashed from the RAW lists: what the upstream sent, before any description override.
+    const defsOf = <T extends object>(items: T[], key: (t: T) => string) =>
+      new Map<string, ItemDef>(items.map((t) => [key(t), { def: t, hashes: hashDefinition(t) }]));
     return {
+      defs: {
+        tool: defsOf(tools, (t) => t.name),
+        prompt: defsOf(prompts, (p) => p.name),
+        resource: defsOf(resources, (r) => r.uri),
+      },
       tools: toolMap,
       prompts: new Map(prompts.map((p) => [p.name, p])),
       resources,

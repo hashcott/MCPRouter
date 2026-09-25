@@ -27,7 +27,18 @@ export {
   type ReadResourceReq,
   type ToolDecision,
 } from './call.js';
-export { isExposed, label, project, projectTools, resolveTool } from './catalog.js';
+export {
+  explainTool,
+  exposure,
+  INTEGRITY_BLOCKS,
+  isExposed,
+  label,
+  project,
+  projectTools,
+  resolveTool,
+  type Exposure,
+} from './catalog.js';
+export { canonical, hashDefinition, type DefHashes } from './guardrails/hash.js';
 export { createTransport, type TransportCtx, type TransportFactory } from './transport.js';
 export { assertSafeUrl, guardedFetch, isBlockedIp } from './ssrf.js';
 export {
@@ -40,15 +51,21 @@ export {
   UpstreamUnavailableError,
   redact,
 } from './errors.js';
-export { SEP } from './types.js';
+export { reviewKey, SEP } from './types.js';
 export type {
   CallOpts,
   CredentialResolver,
+  Integrity,
+  IntegrityMode,
+  ItemDef,
+  ItemKind,
   Principal,
   Prompt,
   ResolvedScope,
   Resource,
   ResourceTemplate,
+  Review,
+  ReviewState,
   ServerCatalog,
   ServerConfig,
   ServerSelection,
