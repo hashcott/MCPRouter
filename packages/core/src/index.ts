@@ -9,6 +9,7 @@ export {
 export { createLogger, redactServerConfig, type Logger, type LoggerOptions } from './obs/log.js';
 export { createDb, createPool, runMigrations, MIGRATION_LOCK_ID, type Db } from './db/migrate.js';
 export { schema, type Schema } from './db/schema/index.js';
+export type { Outcome, Selection } from './db/schema/index.js';
 export { generateKeyLine, KeyringError, parseKeyring, type Keyring } from './security/seal.js';
 export { createServer, loadServerConfigs, type LoadedServers, type NewServer } from './db/store.js';
 export { PlainServerConfig, type PlainServerConfigInput } from './db/server-config.js';
