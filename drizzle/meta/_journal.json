@@ -36,6 +36,13 @@
       "when": 1790329857587,
       "tag": "0004_sloppy_mesmero",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790343037808,
+      "tag": "0005_lovely_kingpin",
+      "breakpoints": true
     }
   ]
 }

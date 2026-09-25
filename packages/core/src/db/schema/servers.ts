@@ -1,5 +1,14 @@
 import { sql } from 'drizzle-orm';
-import { boolean, check, jsonb, pgTable, text, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import {
+  boolean,
+  check,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
 import type { StoredServerConfig } from '../server-config.js';
 import { timestamps } from './_shared.js';
 
@@ -16,6 +25,8 @@ export const servers = pgTable(
       .notNull()
       .default('shared'),
     allowPrivateNetwork: boolean('allow_private_network').notNull().default(false),
+    /** Set once, by the first catalog of an enabled server. Re-enable NEVER approves anything (§11.2). */
+    firstEnabledAt: timestamp('first_enabled_at', { withTimezone: true }),
     ...timestamps(),
   },
   (t) => [

@@ -7,9 +7,11 @@ import {
   pgTable,
   primaryKey,
   text,
+  timestamp,
   uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
+import { user } from './auth.js';
 import { timestamps } from './_shared.js';
 import { servers } from './servers.js';
 
@@ -84,10 +86,25 @@ export const serverItemOverride = pgTable(
     itemName: text('item_name').notNull(),
     enabled: boolean('enabled').notNull().default(true),
     description: text('description'),
+    /** Operator OPINION (§11.2). NULL = no opinion yet = unreviewed. `changed` is derived, never stored. */
+    reviewState: text('review_state').$type<'approved' | 'unreviewed' | 'rejected'>(),
+    approvedHash: text('approved_hash'),
+    /** What was actually blessed — the P3 diff pane and every post-incident question need it. */
+    approvedDef: jsonb('approved_def'),
+    approvedBy: text('approved_by').references(() => user.id, { onDelete: 'set null' }),
+    approvedAt: timestamp('approved_at', { withTimezone: true }),
     ...timestamps(),
   },
   (t) => [
     primaryKey({ columns: [t.serverId, t.kind, t.itemName] }),
     check('server_item_override_kind', sql`${t.kind} in ('tool', 'prompt', 'resource')`),
+    check(
+      'server_item_override_review_state',
+      sql`${t.reviewState} is null or ${t.reviewState} in ('approved', 'unreviewed', 'rejected')`,
+    ),
+    check(
+      'server_item_override_approval_complete',
+      sql`${t.reviewState} is distinct from 'approved' or (${t.approvedHash} is not null and ${t.approvedDef} is not null and ${t.approvedAt} is not null)`,
+    ),
   ],
 );
