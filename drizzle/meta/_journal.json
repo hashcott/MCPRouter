@@ -8,6 +8,13 @@
       "when": 1789978675661,
       "tag": "0000_ordinary_selene",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790326605657,
+      "tag": "0001_rapid_la_nuit",
+      "breakpoints": true
     }
   ]
 }

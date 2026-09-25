@@ -1,5 +1,9 @@
 import { jsonb, pgTable, text } from 'drizzle-orm/pg-core';
 import { createdAt, updatedAt } from './_shared.js';
+import { secrets } from './secrets.js';
+import { servers } from './servers.js';
+
+export { secrets, servers };
 
 /**
  * Single-row-per-key system configuration. In P0 it exists to give the
@@ -13,5 +17,5 @@ export const systemSetting = pgTable('system_setting', {
   updatedAt,
 });
 
-export const schema = { systemSetting };
+export const schema = { systemSetting, servers, secrets };
 export type Schema = typeof schema;
