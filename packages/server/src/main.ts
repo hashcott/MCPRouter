@@ -34,16 +34,13 @@ const app = createApp({
   readiness,
   webRoot,
   mcp: {
-    authenticate: async (header) => (await authenticateKey(auth, header))?.principal ?? null,
+    authenticate: (header) => authenticateKey(auth, header),
     engine,
-    // Before the first sync lands, an empty catalog — never "all" (P1a constraint).
-    scopeAll: () =>
-      resolveTarget(sync?.snapshot() ?? EMPTY_SNAPSHOT, { kind: 'all' })?.scope ?? {
-        key: 'all:',
-        servers: [],
-        flatten: false,
-      },
+    // Before the first sync lands, an empty snapshot — never "all" (P1a constraint).
+    resolve: (t) => resolveTarget(sync?.snapshot() ?? EMPTY_SNAPSHOT, t),
     timeoutMs: config.mcpCallTimeoutMs,
+    maxInflight: config.maxInflight,
+    audit: () => {},
     authHandler: (req) => auth.handler(req),
   },
 });

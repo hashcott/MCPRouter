@@ -106,4 +106,10 @@ describe('parseConfig', () => {
     expect(o.ok && o.config.mcpCallTimeoutMs).toBe(5_000);
     expect(parseConfig({ ...valid, MCP_CALL_TIMEOUT_MS: '10' }).ok).toBe(false);
   });
+
+  it('defaults MCP_MAX_INFLIGHT to 8', () => {
+    const d = parseConfig(valid);
+    expect(d.ok && d.config.maxInflight).toBe(8);
+    expect(parseConfig({ ...valid, MCP_MAX_INFLIGHT: '0' }).ok).toBe(false);
+  });
 });

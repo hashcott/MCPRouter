@@ -58,6 +58,7 @@ const Schema = z.object({
     .transform((v) => v === 'true'),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(0).default(10_000),
   MCP_CALL_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(60_000),
+  MCP_MAX_INFLIGHT: z.coerce.number().int().min(1).default(8),
 });
 
 export interface Config {
@@ -71,6 +72,7 @@ export interface Config {
   readonly migrateOnBoot: boolean;
   readonly shutdownTimeoutMs: number;
   readonly mcpCallTimeoutMs: number;
+  readonly maxInflight: number;
   toJSON(): Record<string, unknown>;
 }
 
@@ -102,6 +104,7 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
     migrateOnBoot: v.MIGRATE_ON_BOOT,
     shutdownTimeoutMs: v.SHUTDOWN_TIMEOUT_MS,
     mcpCallTimeoutMs: v.MCP_CALL_TIMEOUT_MS,
+    maxInflight: v.MCP_MAX_INFLIGHT,
     toJSON() {
       return {
         databaseUrl: '[redacted]',
@@ -114,6 +117,7 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
         migrateOnBoot: this.migrateOnBoot,
         shutdownTimeoutMs: this.shutdownTimeoutMs,
         mcpCallTimeoutMs: this.mcpCallTimeoutMs,
+        maxInflight: this.maxInflight,
       };
     },
   };

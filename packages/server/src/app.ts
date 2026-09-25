@@ -4,17 +4,12 @@ import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import type { Logger } from 'pino';
 import type pg from 'pg';
-import {
-  currentContext,
-  newRequestId,
-  runWithContext,
-  type Engine,
-  type Principal,
-  type ResolvedScope,
-} from '@mcprouter/core';
-import type { MachinePrincipal } from './auth.js';
+import { currentContext, newRequestId, runWithContext, type Engine } from '@mcprouter/core';
+import type { KeyAuth } from './auth.js';
 import type { Config } from './config.js';
-import { handleMcp } from './mcp/legacy.js';
+import { checkGrant } from './grant.js';
+import { handleMcp, type CallRecord } from './mcp/legacy.js';
+import type { Route, Target } from './scope.js';
 import type { Metrics } from './metrics.js';
 
 export interface Readiness {
@@ -34,13 +29,24 @@ export interface AppDeps {
   mcp?: McpDeps | undefined;
 }
 
+export type AuditRow = CallRecord & {
+  evt: 'tool.call';
+  requestId: string | null;
+  principalId: string;
+  keyId: string;
+  route: string;
+};
+
 export interface McpDeps {
-  /** `Authorization` header → machine principal, or null. */
-  authenticate: (authorization: string | undefined) => Promise<MachinePrincipal | null>;
+  /** `Authorization` header → key principal and grant, or null. */
+  authenticate: (authorization: string | undefined) => Promise<KeyAuth | null>;
   engine: Engine;
-  /** The `{kind:'all'}` target (§4.2): every enabled server currently loaded. */
-  scopeAll: () => ResolvedScope;
+  /** Pure route resolution over the current snapshot; null → 404. */
+  resolve: (target: Target) => Route | null;
   timeoutMs: number;
+  /** Per-principal concurrent MCP requests (§4.2, default 8). */
+  maxInflight: number;
+  audit: (row: AuditRow) => void;
   /** better-auth's fetch handler. */
   authHandler: (req: Request) => Promise<Response>;
 }
@@ -144,15 +150,15 @@ function mountMcp(app: Hono, mcp: McpDeps): void {
 
   // Every /mcp route is bearer-authenticated, the 405s and 404s included (§4.2).
   const guarded =
-    (handler: (c: Context, p: Principal) => Response | Promise<Response>) =>
+    (handler: (c: Context, a: KeyAuth) => Response | Promise<Response>) =>
     async (c: Context): Promise<Response> => {
-      const principal = await mcp.authenticate(c.req.header('authorization'));
-      if (principal === null) {
+      const a = await mcp.authenticate(c.req.header('authorization'));
+      if (a === null) {
         return c.json({ error: 'unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer' });
       }
       const ctx = currentContext();
-      if (ctx !== undefined) ctx.principal = principal.id;
-      return handler(c, principal);
+      if (ctx !== undefined) ctx.principal = a.principal.id;
+      return handler(c, a);
     };
 
   // A stateless transport answers GET with a 200 event stream that never ends (spike 4).
@@ -163,16 +169,58 @@ function mountMcp(app: Hono, mcp: McpDeps): void {
       { Allow: 'POST' },
     );
 
+  const inflight = new Map<string, number>();
+
+  // §4.2, in this order: authenticate → resolve (404) → checkGrant (403) → limit (429) → handle.
+  const serve = (target: (c: Context) => Target) =>
+    guarded(async (c, a) => {
+      const route = mcp.resolve(target(c));
+      if (route === null) return c.json({ error: 'not_found' }, 404);
+      if (checkGrant(a.grant, route) !== 'ok') {
+        return c.json({ error: 'insufficient_scope' }, 403, {
+          'WWW-Authenticate': 'Bearer error="insufficient_scope"',
+        });
+      }
+      const who = a.principal.id;
+      const n = inflight.get(who) ?? 0;
+      if (n >= mcp.maxInflight) {
+        return c.json({ error: 'too_many_requests' }, 429, { 'Retry-After': '1' });
+      }
+      inflight.set(who, n + 1);
+      try {
+        return await handleMcp(c.req.raw, {
+          engine: mcp.engine,
+          scope: route.scope,
+          principal: a.principal,
+          timeoutMs: mcp.timeoutMs,
+          audit: (r) =>
+            mcp.audit({
+              ...r,
+              evt: 'tool.call',
+              requestId: currentContext()?.requestId ?? null,
+              principalId: who,
+              keyId: a.keyId,
+              route: route.label,
+            }),
+        });
+      } finally {
+        const left = (inflight.get(who) ?? 1) - 1;
+        if (left === 0) inflight.delete(who);
+        else inflight.set(who, left);
+      }
+    });
+
   app.post(
     '/mcp',
-    guarded((c, principal) =>
-      handleMcp(c.req.raw, {
-        engine: mcp.engine,
-        scope: mcp.scopeAll(),
-        principal,
-        timeoutMs: mcp.timeoutMs,
-      }),
-    ),
+    serve(() => ({ kind: 'all' })),
+  );
+  app.post(
+    '/mcp/g/:group',
+    serve((c) => ({ kind: 'group', slug: c.req.param('group') ?? '' })),
+  );
+  app.post(
+    '/mcp/s/:server',
+    serve((c) => ({ kind: 'server', slug: c.req.param('server') ?? '' })),
   );
   app.on(['GET', 'DELETE'], ['/mcp', '/mcp/*'], guarded(notAllowed));
   // Before the /mcp/* catch-all: Hono's `/mcp/*` also matches `/mcp` itself.

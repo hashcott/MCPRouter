@@ -85,10 +85,12 @@ beforeAll(async () => {
     registry: createRegistry(),
     readiness: { migrationsApplied: true, routesMounted: true },
     mcp: {
-      authenticate: async (h) => (await authenticateKey(auth, h))?.principal ?? null,
+      authenticate: (h) => authenticateKey(auth, h),
       engine,
-      scopeAll: () => resolveTarget(sync.snapshot(), { kind: 'all' })!.scope,
+      resolve: (t) => resolveTarget(sync.snapshot(), t),
       timeoutMs: 30_000,
+      maxInflight: 8,
+      audit: () => {},
       authHandler: (req) => auth.handler(req),
     },
   });

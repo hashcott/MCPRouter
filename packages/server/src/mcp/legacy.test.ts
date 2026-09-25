@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { Engine, type Principal, type ResolvedScope } from '@mcprouter/core';
+import { Engine, ToolUnavailableError, type Principal, type ResolvedScope } from '@mcprouter/core';
 import { FakeUpstream, fakeFactory } from '../../../core/test/fake-upstream.js';
-import { handleMcp, type McpCall } from './legacy.js';
+import { handleMcp, type CallRecord, type McpCall } from './legacy.js';
 
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
 const principal: Principal = { id: 'u1', isAdmin: false };
@@ -49,7 +49,14 @@ beforeAll(async () => {
 
 afterAll(() => engine.shutdown());
 
-const call = (timeoutMs = 5_000): McpCall => ({ engine, scope, principal, timeoutMs });
+const records: CallRecord[] = [];
+const call = (timeoutMs = 5_000): McpCall => ({
+  engine,
+  scope,
+  principal,
+  timeoutMs,
+  audit: (r) => records.push(r),
+});
 
 async function client(timeoutMs?: number): Promise<Client> {
   const c = new Client({ name: 'test', version: '0.0.0' });
@@ -149,5 +156,104 @@ describe('handleMcp', () => {
     expect(res.headers.get('content-type')).toContain('application/json');
     expect(res.headers.get('mcp-session-id')).toBeNull();
     expect(res.headers.get('x-accel-buffering')).toBe('no');
+  });
+});
+
+describe('audit records', () => {
+  it('one per call: server, bare item, outcome, argument KEY NAMES and size — never values', async () => {
+    records.length = 0;
+    const c = await client();
+    await c.callTool({ name: 'fs__echo', arguments: { text: 'secret-value' } });
+    await c.callTool({ name: 'fs__boom', arguments: {} });
+    await expect(c.callTool({ name: 'fs__nope', arguments: {} })).rejects.toThrow();
+    await c.close();
+    expect(records.map((r) => [r.server, r.item, r.outcome])).toEqual([
+      ['fs', 'echo', 'ok'],
+      ['fs', 'boom', 'error'],
+      [null, 'fs__nope', 'not_found'],
+    ]);
+    expect(records[0]?.inputKeys).toEqual(['text']);
+    expect(records[0]?.inputBytes).toBe(Buffer.byteLength('{"text":"secret-value"}'));
+    expect(JSON.stringify(records)).not.toContain('secret-value');
+    expect(records[1]?.error).toContain('upstream exploded');
+  });
+
+  it('a call past the deadline is recorded as a timeout', async () => {
+    records.length = 0;
+    const c = await client(100);
+    await c.callTool({ name: 'fs__slow', arguments: {} });
+    await c.close();
+    expect(records[0]?.outcome).toBe('timeout');
+  });
+});
+
+describe('races and odd inputs (stub engine)', () => {
+  // Only the two methods tools/call touches; everything else is never reached.
+  const stub = (callResolved: () => Promise<unknown>, resolve?: () => unknown): Engine =>
+    ({
+      resolve:
+        resolve ??
+        ((_s: unknown, name: string) => ({
+          sel: scope.servers[0],
+          bare: 'gone',
+          server: 'fs',
+          name,
+        })),
+      callResolved,
+    }) as unknown as Engine;
+
+  async function stubClient(engine: Engine): Promise<Client> {
+    const c = new Client({ name: 'test', version: '0.0.0' });
+    await c.connect(
+      new StreamableHTTPClientTransport(new URL('http://hub.test/mcp'), {
+        fetch: (url, init) =>
+          handleMcp(new Request(url, init), {
+            engine,
+            scope,
+            principal,
+            timeoutMs: 5_000,
+            audit: (r) => records.push(r),
+          }),
+      }),
+    );
+    return c;
+  }
+
+  it('a tool that vanishes between resolve and call is the one not-found error, recorded as not_found', async () => {
+    records.length = 0;
+    const c = await stubClient(stub(() => Promise.reject(new ToolUnavailableError('fs__gone'))));
+    await expect(c.callTool({ name: 'fs__gone' })).rejects.toThrow(/Tool not found: fs__gone/);
+    await c.close();
+    expect(records.map((r) => [r.server, r.outcome])).toEqual([['fs', 'not_found']]);
+  });
+
+  it('a call without arguments records no keys and 2 bytes', async () => {
+    records.length = 0;
+    const c = await stubClient(stub(() => Promise.resolve({ content: [] })));
+    await c.callTool({ name: 'fs__x' });
+    await c.close();
+    expect(records[0]).toMatchObject({ inputKeys: [], inputBytes: 2, outcome: 'ok' });
+  });
+
+  it('a non-Error rejection still becomes an error result with a generic message', async () => {
+    records.length = 0;
+    const c = await stubClient(stub(() => Promise.reject('weird')));
+    const res = await c.callTool({ name: 'fs__x' });
+    await c.close();
+    expect(res.isError).toBe(true);
+    expect(JSON.stringify(res.content)).toContain('tool call failed');
+  });
+
+  it('an unexpected resolve failure is a protocol error, not a hidden success', async () => {
+    const c = await stubClient(
+      stub(
+        () => Promise.resolve({ content: [] }),
+        () => {
+          throw new Error('registry exploded');
+        },
+      ),
+    );
+    await expect(c.callTool({ name: 'fs__x' })).rejects.toThrow(/registry exploded/);
+    await c.close();
   });
 });

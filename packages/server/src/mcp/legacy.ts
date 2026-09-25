@@ -18,15 +18,29 @@ import {
   ToolUnavailableError,
   VERSION,
   type Engine,
+  type Outcome,
   type Principal,
   type ResolvedScope,
+  type ToolDecision,
 } from '@mcprouter/core';
+
+export type CallRecord = {
+  server: string | null;
+  item: string;
+  outcome: Outcome;
+  durationMs: number;
+  /** metadata mode (§8): argument key names and byte size, never values. */
+  inputKeys: string[];
+  inputBytes: number;
+  error: string | null;
+};
 
 export type McpCall = {
   engine: Engine;
   scope: ResolvedScope;
   principal: Principal;
   timeoutMs: number;
+  audit?: ((r: CallRecord) => void) | undefined;
 };
 
 /** Hidden, missing and disabled are one protocol error with core's one message. */
@@ -53,18 +67,45 @@ export async function handleMcp(req: Request, call: McpCall): Promise<Response> 
     tools: await engine.listTools(scope, principal),
   }));
   server.setRequestHandler(CallToolRequestSchema, async (r) => {
+    const started = Date.now();
+    const args = r.params.arguments ?? {};
+    const rec = {
+      server: null as string | null,
+      item: r.params.name,
+      inputKeys: Object.keys(args),
+      inputBytes: Buffer.byteLength(JSON.stringify(args), 'utf8'),
+    };
+    const done = (outcome: Outcome, error: string | null = null): void =>
+      call.audit?.({ ...rec, outcome, durationMs: Date.now() - started, error });
+
+    // §11.4: resolve and execute stay two steps — P2b's policy gate sits between them.
+    let decision: ToolDecision;
     try {
-      return (await engine.callTool({
+      decision = engine.resolve(scope, r.params.name);
+    } catch (err) {
+      if (err instanceof ToolUnavailableError) done('not_found');
+      return notFound(err);
+    }
+    rec.server = decision.server;
+    rec.item = decision.bare;
+    try {
+      const res = (await engine.callResolved(decision, {
         scope,
         principal,
         name: r.params.name,
-        args: r.params.arguments ?? {},
+        args,
         signal,
       })) as CallToolResult;
+      done(res.isError === true ? 'error' : 'ok');
+      return res;
     } catch (err) {
-      if (err instanceof ToolUnavailableError) notFound(err);
+      if (err instanceof ToolUnavailableError) {
+        done('not_found');
+        return notFound(err);
+      }
       // An upstream failure is the tool's result, not the gateway's: the model sees it.
       const text = err instanceof Error ? err.message : 'tool call failed';
+      done(signal.aborted ? 'timeout' : 'error', text);
       return { content: [{ type: 'text', text }], isError: true };
     }
   });
