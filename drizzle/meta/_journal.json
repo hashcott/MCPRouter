@@ -15,6 +15,13 @@
       "when": 1790326605657,
       "tag": "0001_rapid_la_nuit",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790326961082,
+      "tag": "0002_closed_legion",
+      "breakpoints": true
     }
   ]
 }

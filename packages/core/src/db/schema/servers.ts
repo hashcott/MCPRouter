@@ -22,12 +22,15 @@ export const servers = pgTable(
     uniqueIndex('servers_slug_uq').on(t.slug),
     check('servers_slug_fmt', sql`${t.slug} ~ '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'`),
     check('servers_credential_mode', sql`${t.credentialMode} in ('shared', 'per-user')`),
-    // §5.4: a plaintext env/header value is unstorable, not merely unlikely. Every
-    // value must be an object — the {"$secret": uuid} ref; zod checks its shape.
+    // §5.4: a plaintext env/header value is unstorable, not merely unlikely.
+    // env/headers are absent or objects, and every value is exactly
+    // {"$secret": "<uuid>"} — no other key, no other type.
     check(
       'servers_no_inline_secret',
-      sql`not jsonb_path_exists(${t.config}, '$.env.* ? (@.type() != "object")')
-        and not jsonb_path_exists(${t.config}, '$.headers.* ? (@.type() != "object")')`,
+      sql`coalesce(jsonb_typeof(${t.config}->'env'), 'object') = 'object'
+        and coalesce(jsonb_typeof(${t.config}->'headers'), 'object') = 'object'
+        and not jsonb_path_exists(${t.config}, '$.env.* ? (@.type() != "object" || exists(@.keyvalue() ? (@.key != "$secret")) || !exists(@."$secret") || @."$secret".type() != "string" || !(@."$secret" like_regex "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))')
+        and not jsonb_path_exists(${t.config}, '$.headers.* ? (@.type() != "object" || exists(@.keyvalue() ? (@.key != "$secret")) || !exists(@."$secret") || @."$secret".type() != "string" || !(@."$secret" like_regex "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))')`,
     ),
   ],
 );

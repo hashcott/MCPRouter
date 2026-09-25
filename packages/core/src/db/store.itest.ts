@@ -113,6 +113,18 @@ describe('createServer + loadServerConfigs', () => {
     expect(n.rows[0].n).toBe(0);
   });
 
+  it('a secrets insert that fails rolls the server row back too', async () => {
+    // Over the 64 KiB secrets_ct_len CHECK: the servers insert succeeds, the secrets insert fails.
+    await expect(
+      createServer(db, KR1, {
+        slug: 'huge',
+        config: { type: 'stdio', command: 'x', env: { K: 'x'.repeat(70_000) } },
+      }),
+    ).rejects.toThrow();
+    const n = await pool.query('select count(*)::int as n from servers');
+    expect(n.rows[0].n).toBe(0);
+  });
+
   it('duplicate slug: the insert fails and no orphan secrets survive', async () => {
     await fs();
     await expect(fs()).rejects.toThrow();

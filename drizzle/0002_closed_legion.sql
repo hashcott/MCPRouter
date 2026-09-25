@@ -1,0 +1,5 @@
+ALTER TABLE "servers" DROP CONSTRAINT "servers_no_inline_secret";--> statement-breakpoint
+ALTER TABLE "servers" ADD CONSTRAINT "servers_no_inline_secret" CHECK (coalesce(jsonb_typeof("servers"."config"->'env'), 'object') = 'object'
+        and coalesce(jsonb_typeof("servers"."config"->'headers'), 'object') = 'object'
+        and not jsonb_path_exists("servers"."config", '$.env.* ? (@.type() != "object" || exists(@.keyvalue() ? (@.key != "$secret")) || !exists(@."$secret") || @."$secret".type() != "string" || !(@."$secret" like_regex "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))')
+        and not jsonb_path_exists("servers"."config", '$.headers.* ? (@.type() != "object" || exists(@.keyvalue() ? (@.key != "$secret")) || !exists(@."$secret") || @."$secret".type() != "string" || !(@."$secret" like_regex "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))'));

@@ -71,6 +71,20 @@ describe('servers', () => {
     ).rejects.toEqual(violates('servers_no_inline_secret'));
   });
 
+  it.each([
+    ['env as a string', { env: 'sk-live' }],
+    ['env as an array', { env: ['sk-live'] }],
+    ['a $secret that is not a uuid', { env: { K: { $secret: 'sk-live' } } }],
+    ['a value with a key other than $secret', { env: { K: { value: 'sk-live' } } }],
+    ['a ref with an extra key', { env: { K: { $secret: randomUUID(), value: 'sk-live' } } }],
+    ['headers as a string', { headers: 'Bearer t' }],
+    ['a header whose $secret is a number', { headers: { A: { $secret: 7 } } }],
+  ])('cannot store %s', async (_n, extra) => {
+    await expect(
+      insertServer(`shape-${randomUUID().slice(0, 8)}`, { type: 'stdio', command: 'x', ...extra }),
+    ).rejects.toEqual(violates('servers_no_inline_secret'));
+  });
+
   it.each(['a__b', 'Upper', '-lead', 'a_b'])('rejects slug %j', async (slug) => {
     await expect(insertServer(slug, { type: 'stdio', command: 'x' })).rejects.toEqual(
       violates('servers_slug_fmt'),
