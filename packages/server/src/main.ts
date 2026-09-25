@@ -66,7 +66,14 @@ if (config.migrateOnBoot) {
   log.warn({ evt: 'boot.migrate_skipped' }, 'MIGRATE_ON_BOOT=false');
 }
 
-sync = await startServerSync({ pool, db, keyring: config.secretKeys, engine, log });
+sync = await startServerSync({
+  pool,
+  db,
+  keyring: config.secretKeys,
+  engine,
+  log,
+  integrity: 'off',
+});
 
 let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {

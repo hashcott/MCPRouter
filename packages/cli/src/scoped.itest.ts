@@ -70,6 +70,7 @@ beforeAll(async () => {
     engine,
     log,
     intervalMs: 100,
+    integrity: 'off',
   });
   audit = new AuditWriter({ db, log, intervalMs: 50 });
   audit.start();

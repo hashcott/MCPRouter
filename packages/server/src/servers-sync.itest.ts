@@ -43,7 +43,15 @@ beforeAll(async () => {
   const log = pino({ level: 'silent' });
   log.error = ((o: unknown) => void errors.push(o)) as Logger['error'];
   await createServer(db, kr, { slug: 'fs', config: stdio() });
-  sync = await startServerSync({ pool, db, keyring: kr, engine, log, intervalMs: 50 });
+  sync = await startServerSync({
+    pool,
+    db,
+    keyring: kr,
+    engine,
+    log,
+    intervalMs: 50,
+    integrity: 'off',
+  });
 }, 120_000);
 
 afterAll(async () => {

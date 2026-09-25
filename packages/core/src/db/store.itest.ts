@@ -56,7 +56,7 @@ describe('createServer + loadServerConfigs', () => {
   it('round-trips into the Engine shape', async () => {
     await fs();
     await remote();
-    const r = await loadServerConfigs(db, KR1);
+    const r = await loadServerConfigs(db, KR1, { integrity: 'off' });
     expect(r.errors).toEqual([]);
     expect(r.configs).toEqual([
       {
@@ -64,6 +64,7 @@ describe('createServer + loadServerConfigs', () => {
         enabled: true,
         credentialMode: 'shared',
         tools: {},
+        integrity: { mode: 'off', reviews: {} },
         type: 'stdio',
         command: 'npx',
         args: ['-y', 'fs-mcp'],
@@ -75,6 +76,7 @@ describe('createServer + loadServerConfigs', () => {
         enabled: true,
         credentialMode: 'shared',
         tools: {},
+        integrity: { mode: 'off', reviews: {} },
         type: 'streamable-http',
         url: 'https://mcp.example.com/mcp',
         headers: { Authorization: 'Bearer tok-9' },
@@ -101,7 +103,7 @@ describe('createServer + loadServerConfigs', () => {
     await createServer(db, KR1, { slug: 'bare', config: { type: 'stdio', command: 'x' } });
     const n = await pool.query('select count(*)::int as n from secrets');
     expect(n.rows[0].n).toBe(0);
-    expect((await loadServerConfigs(db, KR1)).configs).toHaveLength(1);
+    expect((await loadServerConfigs(db, KR1, { integrity: 'off' })).configs).toHaveLength(1);
   });
 
   it('rejects plaintext it cannot validate before touching the DB', async () => {
@@ -144,7 +146,7 @@ describe('a server whose secrets cannot be opened', () => {
          (select iv, ciphertext, tag from secrets where label = 'Authorization')
        where label = 'API_KEY'`,
     );
-    const r = await loadServerConfigs(db, KR1);
+    const r = await loadServerConfigs(db, KR1, { integrity: 'off' });
     expect(r.configs.map((c) => c.name)).toEqual(['remote']);
     expect(r.errors).toEqual([
       { slug: 'fs', reason: expect.stringMatching(/cannot be opened: auth-failed/) },
@@ -159,7 +161,7 @@ describe('a server whose secrets cannot be opened', () => {
          (select config->'headers'->'Authorization' from servers where slug = 'remote'))
        where slug = 'fs'`,
     );
-    const r = await loadServerConfigs(db, KR1);
+    const r = await loadServerConfigs(db, KR1, { integrity: 'off' });
     expect(r.errors).toEqual([{ slug: 'fs', reason: expect.stringMatching(/is missing/) }]);
     // fs is left out entirely; only remote, the secret's real owner, holds the value.
     expect(r.configs.map((c) => c.name)).toEqual(['remote']);
@@ -171,14 +173,14 @@ describe('a server whose secrets cannot be opened', () => {
       `update servers set config = jsonb_set(config - 'env', '{env}',
          jsonb_build_object('OTHER', config->'env'->'API_KEY')) where slug = 'fs'`,
     );
-    const r = await loadServerConfigs(db, KR1);
+    const r = await loadServerConfigs(db, KR1, { integrity: 'off' });
     expect(r.errors).toEqual([{ slug: 'fs', reason: expect.stringMatching(/auth-failed/) }]);
   });
 
   it('a config that no longer parses is reported, not thrown', async () => {
     await fs();
     await pool.query(`update servers set config = config || '{"shell": true}' where slug = 'fs'`);
-    const r = await loadServerConfigs(db, KR1);
+    const r = await loadServerConfigs(db, KR1, { integrity: 'off' });
     expect(r.configs).toEqual([]);
     expect(r.errors).toHaveLength(1);
   });
@@ -187,7 +189,7 @@ describe('a server whose secrets cannot be opened', () => {
 describe('rotation', () => {
   it('rows sealed under v1 open with v2,v1; new rows seal under v2; v2 alone reports unknown-key', async () => {
     await fs();
-    expect((await loadServerConfigs(db, KR21)).errors).toEqual([]);
+    expect((await loadServerConfigs(db, KR21, { integrity: 'off' })).errors).toEqual([]);
 
     await createServer(db, KR21, {
       slug: 'new',
@@ -196,7 +198,7 @@ describe('rotation', () => {
     const kv = await pool.query(`select key_version from secrets where label = 'K'`);
     expect(kv.rows[0].key_version).toBe(2);
 
-    const r = await loadServerConfigs(db, KR2);
+    const r = await loadServerConfigs(db, KR2, { integrity: 'off' });
     expect(r.configs.map((c) => c.name)).toEqual(['new']);
     expect(r.errors).toEqual([{ slug: 'fs', reason: expect.stringMatching(/unknown-key/) }]);
   });
@@ -207,7 +209,7 @@ describe('§11.7 — a new column on secrets does not change the AAD', () => {
     await fs();
     await pool.query('alter table secrets add column scan_egress boolean not null default false');
     try {
-      const r = await loadServerConfigs(db, KR1);
+      const r = await loadServerConfigs(db, KR1, { integrity: 'off' });
       expect(r.errors).toEqual([]);
       expect(r.configs[0]).toMatchObject({ env: { API_KEY: 'sk-live-123' } });
     } finally {
@@ -226,7 +228,9 @@ describe('tool overrides', () => {
          ($1, 'prompt', 'p', false, null)`,
       [id],
     );
-    const cfg = (await loadServerConfigs(db, KR1)).configs.find((c) => c.name === 'ov');
+    const cfg = (await loadServerConfigs(db, KR1, { integrity: 'off' })).configs.find(
+      (c) => c.name === 'ov',
+    );
     expect(cfg?.tools).toEqual({
       rm: { enabled: false },
       ls: { enabled: true, description: 'List files, carefully' },
@@ -235,7 +239,32 @@ describe('tool overrides', () => {
 
   it('a server with no overrides gets an empty map', async () => {
     await createServer(db, KR1, { slug: 'plain', config: { type: 'stdio', command: 'x' } });
-    const cfg = (await loadServerConfigs(db, KR1)).configs.find((c) => c.name === 'plain');
+    const cfg = (await loadServerConfigs(db, KR1, { integrity: 'off' })).configs.find(
+      (c) => c.name === 'plain',
+    );
     expect(cfg?.tools).toEqual({});
+  });
+});
+
+describe('integrity reviews', () => {
+  it('carry every kind, keyed kind:name, and skip rows with no opinion (sparse)', async () => {
+    const id = await createServer(db, KR1, { slug: 'rv', config: { type: 'stdio', command: 'x' } });
+    await pool.query(
+      `insert into server_item_override (server_id, kind, item_name, enabled, review_state, approved_hash, approved_def, approved_at) values
+         ($1, 'tool', 'a', true, 'approved', 'h1', '{}', now()),
+         ($1, 'prompt', 'p', true, 'rejected', null, null, null),
+         ($1, 'tool', 'noopinion', false, null, null, null, null)`,
+      [id],
+    );
+    const cfg = (await loadServerConfigs(db, KR1, { integrity: 'enforce' })).configs.find(
+      (c) => c.name === 'rv',
+    );
+    expect(cfg?.integrity).toEqual({
+      mode: 'enforce',
+      reviews: {
+        'tool:a': { state: 'approved', approvedHash: 'h1' },
+        'prompt:p': { state: 'rejected', approvedHash: null },
+      },
+    });
   });
 });

@@ -77,6 +77,7 @@ beforeAll(async () => {
     engine,
     log,
     intervalMs: 200,
+    integrity: 'off',
   });
   app = createApp({
     config,

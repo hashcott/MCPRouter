@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull } from 'drizzle-orm';
 import { open, seal, type Keyring, type SealedSecret, type SecretScope } from '../security/seal.js';
-import type { ServerConfig } from '../types.js';
+import { reviewKey, type IntegrityMode, type Review, type ServerConfig } from '../types.js';
 import type { Db } from './client.js';
 import { secrets, serverItemOverride, servers } from './schema/index.js';
 import {
@@ -70,6 +70,7 @@ export async function createServer(db: Db, kr: Keyring, input: NewServer): Promi
 export async function loadServerConfigs(
   db: Pick<Db, 'select'>,
   kr: Keyring,
+  opts: { integrity: IntegrityMode },
 ): Promise<LoadedServers> {
   const rows = await db.select().from(servers).orderBy(servers.slug);
   const secretRows =
@@ -102,6 +103,23 @@ export async function loadServerConfigs(
             ),
           );
 
+  // Opinion rows of every kind; rows with no opinion stay out (sparse = unreviewed).
+  const reviewRows =
+    rows.length === 0
+      ? []
+      : await db
+          .select()
+          .from(serverItemOverride)
+          .where(
+            and(
+              isNotNull(serverItemOverride.reviewState),
+              inArray(
+                serverItemOverride.serverId,
+                rows.map((r) => r.id),
+              ),
+            ),
+          );
+
   const out: LoadedServers = { configs: [], errors: [] };
   for (const row of rows) {
     try {
@@ -127,7 +145,16 @@ export async function loadServerConfigs(
               : { enabled: o.enabled, description: o.description },
           ]),
       );
+      const reviews: Record<string, Review> = Object.fromEntries(
+        reviewRows
+          .filter((o) => o.serverId === row.id)
+          .map((o) => [
+            reviewKey(o.kind, o.itemName),
+            { state: o.reviewState ?? 'unreviewed', approvedHash: o.approvedHash },
+          ]),
+      );
       const base = {
+        integrity: { mode: opts.integrity, reviews },
         name: row.slug,
         enabled: row.enabled,
         credentialMode: row.credentialMode,

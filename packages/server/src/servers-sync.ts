@@ -7,6 +7,7 @@ import {
   schema,
   type Db,
   type Engine,
+  type IntegrityMode,
   type Keyring,
   type Selection,
 } from '@mcprouter/core';
@@ -40,6 +41,8 @@ export async function startServerSync(o: {
   engine: Engine;
   log: Logger;
   intervalMs?: number;
+  /** Always explicit (R11): the setting every applied config carries. */
+  integrity: IntegrityMode;
 }): Promise<ServerSync> {
   let fingerprint: string | undefined;
   let snap: Snapshot = EMPTY_SNAPSHOT;
@@ -68,7 +71,7 @@ export async function startServerSync(o: {
     // query can fail after applyConfig and leave the old snapshot routing to new servers.
     const read = await o.db.transaction(
       async (tx) => {
-        const loadedServers = await loadServerConfigs(tx, o.keyring);
+        const loadedServers = await loadServerConfigs(tx, o.keyring, { integrity: o.integrity });
         const serverRows = await tx
           .select({ id: schema.servers.id, slug: schema.servers.slug })
           .from(schema.servers)
