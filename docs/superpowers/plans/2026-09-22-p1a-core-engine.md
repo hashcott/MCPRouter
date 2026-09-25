@@ -134,6 +134,51 @@ per-registry memo there is nothing global to invalidate, and no test needed it.
 **Note:** a test that passes alone and fails in company is reporting shared state, not
 flakiness. Do not reach for `retry`; the global gate is `retry: 0` for this reason.
 
+**Ruling P10 — D11's `neverDelivered` must not match `Connection closed`, `ECONNRESET` or `EPIPE`.**
+Found in the preflight scan of Task 10, against the installed SDK. `Protocol._onclose` rejects every
+*in-flight* response handler with `McpError(ConnectionClosed, 'Connection closed')` — those requests
+were already written to the transport and may have run. Task 10's regex `/connection closed/i` would
+retry them, which is precisely the double-executed write D11 exists to forbid. `ECONNRESET` and
+`EPIPE` likewise arrive after bytes may have left.
+**So:** `neverDelivered` is true only for (a) an `UpstreamUnavailableError` (thrown by
+`#requireClient` before any send), (b) an error whose message is exactly `Not connected` (the SDK's
+pre-send rejection), (c) `code` `ENOTCONN` or `ECONNREFUSED`. Task 10's test gains a case: a
+`Connection closed` rejection is called exactly once. Cost if wrong: a genuinely undelivered call
+that surfaces as `Connection closed` fails once instead of retrying; the caller may retry.
+
+**Ruling P11 — `call:start` must always be paired with `call:end`.**
+Task 10's code emits `call:start` and then awaits `lease()` and `ensureReady()` *outside* the `try`,
+so a server that is down emits a start with no end — every observer that pairs them leaks. **So:**
+the lease and readiness wait move inside the `try`. Test: an `ensureReady` rejection produces
+`call:end` with `ok:false`.
+
+**Ruling P12 — prompts and resources go through the same predicate as tools.**
+Task 10's `getPrompt` resolves through `resolveTool`, which checks `kind: 'tool'`, so a prompt is
+reachable only if a same-named tool exists — and a hidden tool's name leaks a prompt. Its
+`readResource` takes a caller-supplied `server` and checks nothing: a URI hidden from
+`listResources` is readable, and a server outside the scope is reachable. That is the mcphub CVE
+class — list and read disagreeing — that `isExposed` exists to make impossible.
+**So:** `catalog.ts` gains one kind-parameterised resolver (still the only construction site of
+`ToolUnavailableError`); `resolveTool` stays as its `'tool'` wrapper. Prompts resolve by projected
+name like tools. Resources are not prefixed, so the resolver scans `scope.servers` in order for the
+first server whose `isExposed(…, 'resource', uri)` holds. `readResource`'s request drops `server`.
+Both redact errors. Cost if wrong: two servers exposing the same URI resolve to the first in scope
+order — the same rule `flatten` already uses for tools.
+
+**Ruling P13 — an invalid `MCPROUTER_MAX_ARG_BYTES` must not disable the cap.**
+`Number('abc')` is `NaN` and `size > NaN` is always false, so a typo fails open. Invalid or
+non-positive values fall back to 1 048 576.
+
+**Ruling P14 — Task 11 must follow P12, and cannot re-export `CatalogRegistry`.**
+`catalog.ts` imports `ServerRegistry` as a type and does not export it, so
+`type ServerRegistry as CatalogRegistry` from `./catalog.js` is TS2459. The line is dropped — nothing
+consumes it. `Engine.readResource` takes `{ scope, principal, uri, secrets? }` per P12.
+
+**Ruling P15 — Task 12's inline upstream must run with `cwd: packages/core`.**
+`node -e` resolves `require` from the working directory. Under `node-linker=isolated` the SDK is
+linked only into `packages/core/node_modules`, so from the repo root it is `MODULE_NOT_FOUND`. The
+config sets `cwd` to the absolute path of `packages/core`.
+
 ### Per-task self-consistency
 
 | Task | Finding |
