@@ -183,3 +183,62 @@ describe("newItems: 'approve'", () => {
     }
   });
 });
+
+describe('the truth write cannot get stuck', () => {
+  it('a NUL byte in a definition (unstorable in jsonb) still records truth and runs TOFU', async () => {
+    await createServer(db, kr, { slug: 'nul', config: { type: 'stdio', command: 'x' } });
+    const h = await hub(
+      {
+        nul: new FakeUpstream('nul', [{ name: 't', description: 'before\u0000after' }]),
+        fs: new FakeUpstream('fs', []),
+        gh: new FakeUpstream('gh', []),
+      },
+      'quarantine',
+    );
+    try {
+      await vi.waitFor(async () => expect(await h.visible()).toContain('nul__t'), {
+        timeout: 10_000,
+      });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a server deleted and re-created under the same slug and config gets its truth and TOFU again', async () => {
+    const fake = new FakeUpstream('again', [{ name: 't' }]);
+    await createServer(db, kr, { slug: 'again', config: { type: 'stdio', command: 'x' } });
+    const h = await hub(
+      {
+        again: fake,
+        fs: new FakeUpstream('fs', []),
+        gh: new FakeUpstream('gh', []),
+        nul: new FakeUpstream('nul', []),
+      },
+      'quarantine',
+    );
+    try {
+      await vi.waitFor(async () => expect(await h.visible()).toContain('again__t'), {
+        timeout: 10_000,
+      });
+      // One statement: no poll can observe the gap, so the Engine never sees a removal.
+      await pool.query(
+        `with old as (delete from servers where slug = 'again' returning config)
+         insert into servers (slug, config) select 'again', config from old`,
+      );
+      await vi.waitFor(
+        async () => {
+          const r = await pool.query(
+            `select first_enabled_at is not null as tofu from servers where slug = 'again'`,
+          );
+          expect(r.rows[0]?.tofu).toBe(true);
+        },
+        { timeout: 10_000 },
+      );
+      await vi.waitFor(async () => expect(await h.visible()).toContain('again__t'), {
+        timeout: 10_000,
+      });
+    } finally {
+      await h.close();
+    }
+  });
+});

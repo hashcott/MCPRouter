@@ -103,20 +103,35 @@ export function isExposed(
 }
 
 /**
- * Why a tool name did not resolve — for the audit row and the counter ONLY.
+ * Why a name did not resolve — for the audit row and the counter ONLY.
  * Never reaches a client: integrity tells the caller nothing (§11.1).
+ * Mirrors resolveByKind: tools and prompts by projected name, resources by URI.
  */
-export function explainTool(scope: ResolvedScope, reg: ServerRegistry, name: string): Exposure {
+export function explainItem(
+  scope: ResolvedScope,
+  reg: ServerRegistry,
+  kind: ItemKind,
+  name: string,
+): Exposure {
   for (const sel of scope.servers) {
     const prefix = `${label(sel)}${SEP}`;
-    const bare = scope.flatten ? name : name.startsWith(prefix) ? name.slice(prefix.length) : null;
+    const bare =
+      kind === 'resource' || scope.flatten
+        ? name
+        : name.startsWith(prefix)
+          ? name.slice(prefix.length)
+          : null;
     if (bare === null) continue;
     const srv = reg.shared(sel.serverName);
     if (srv === undefined) continue;
-    const why = exposure(srv, srv.config, sel, 'tool', bare);
+    const why = exposure(srv, srv.config, sel, kind, bare);
     if (why !== 'missing') return why;
   }
   return 'missing';
+}
+
+export function explainTool(scope: ResolvedScope, reg: ServerRegistry, name: string): Exposure {
+  return explainItem(scope, reg, 'tool', name);
 }
 
 /**

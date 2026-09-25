@@ -5,6 +5,25 @@ import { schema, type Db, type Engine, type ItemDef, type ItemKind } from '@mcpr
 const KINDS: ItemKind[] = ['tool', 'prompt', 'resource'];
 
 /**
+ * Postgres jsonb cannot store U+0000. The STORED copy (what an operator reads and
+ * approves) replaces it with U+FFFD; the hash was taken on the original, so an
+ * upstream cannot use a NUL to make its truth unwritable and itself unapprovable.
+ */
+function storable(v: unknown): unknown {
+  if (typeof v === 'string') return v.replaceAll('\u0000', '\ufffd');
+  if (Array.isArray(v)) return v.map(storable);
+  if (v !== null && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, x]) => [
+        storable(k) as string,
+        storable(x),
+      ]),
+    );
+  }
+  return v;
+}
+
+/**
  * The engine writes TRUTH (tool_embedding) on every catalog it sees; the one
  * automatic OPINION is TOFU, exactly once per server (§11.2):
  *   - an enabled server whose first_enabled_at IS NULL: approve what it lists,
@@ -47,7 +66,7 @@ export function startTruthWriter(o: {
             serverId: srv.id,
             kind,
             name: n,
-            def: item.def,
+            def: storable(item.def),
             defHash: h?.defHash ?? null,
             shapeHash: h?.shapeHash ?? null,
             defect: h === null ? 'too_deep' : null,
@@ -83,7 +102,7 @@ export function startTruthWriter(o: {
               itemName: n,
               reviewState: 'approved',
               approvedHash: item.hashes.defHash,
-              approvedDef: item.def,
+              approvedDef: storable(item.def),
               approvedAt: new Date(),
             })
             .onConflictDoUpdate({

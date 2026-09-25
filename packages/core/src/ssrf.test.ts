@@ -212,6 +212,20 @@ describe('capFrames — bytes between blank lines, counted before parsing', () =
     expect(await res.text()).toContain('bbbb');
   });
 
+  it('a JSON body is ONE frame: blank lines inside it never reset the count', async () => {
+    const padded = `[${Array.from({ length: 200 }, (_, i) => `{"i":${i}}`).join(',\n\n')}]`;
+    const res = capFrames(
+      new Response(padded, { headers: { 'content-type': 'application/json' } }),
+      128,
+    );
+    await expect(res.text()).rejects.toBeInstanceOf(FrameTooLargeError);
+  });
+
+  it('a body with no content type is counted whole too', async () => {
+    const res = capFrames(new Response('a\n\n'.repeat(100)), 50);
+    await expect(res.text()).rejects.toBeInstanceOf(FrameTooLargeError);
+  });
+
   it('keeps status and headers', () => {
     const res = capFrames(new Response('{}', { status: 202, headers: { 'x-a': '1' } }), 10);
     expect([res.status, res.headers.get('x-a')]).toEqual([202, '1']);

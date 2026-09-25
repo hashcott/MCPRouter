@@ -347,6 +347,24 @@ export class UpstreamServer {
     this.#timer.unref?.();
   }
 
+  /**
+   * A transport-level violation (§11.2 frame cap) during connect or discovery fails the
+   * SERVER permanently, with the reason — the SDK would otherwise surface only a
+   * disconnect or a timeout, and the server would retry the hostile upstream forever.
+   */
+  #fatal(epoch: number, err: Error): void {
+    if (epoch !== this.#epoch) return;
+    const t =
+      this.#state === 'connecting'
+        ? 'connectFail'
+        : this.#state === 'discovering'
+          ? 'discoverFail'
+          : undefined;
+    if (t === undefined) return; // later, the failing request itself reports the error
+    this.#dispatch({ t, err, permanent: true });
+    void (this.#client ?? this.#pending)?.close?.().catch(() => {});
+  }
+
   async #doConnect(): Promise<void> {
     this.#epoch += 1;
     const epoch = this.#epoch;
@@ -358,6 +376,7 @@ export class UpstreamServer {
           headers: this.#o.headers ?? {},
           signal: abort.signal,
           onStderr: (line) => this.#pushStderr(line),
+          onFatal: (err) => this.#fatal(epoch, err),
         }),
       );
       // The identity guard: a config change or a stop superseded us while we waited.
@@ -448,12 +467,21 @@ export class UpstreamServer {
    * embedding the unedited upstream text.
    */
   #buildCatalog(
-    tools: Tool[],
-    prompts: Prompt[],
-    resources: Resource[],
+    rawTools: Tool[],
+    rawPrompts: Prompt[],
+    rawResources: Resource[],
     resourceTemplates: ResourceTemplate[],
     capabilities: ServerCapabilities,
   ): ServerCatalog {
+    // One key, one definition: a name (or URI) listed twice keeps its LAST entry, and
+    // EVERY projection — list, resolver and hash — is built from that same entry. A
+    // duplicate must never put an unhashed twin next to the approved one.
+    const unique = <T>(items: T[], key: (t: T) => string): T[] => [
+      ...new Map(items.map((t) => [key(t), t])).values(),
+    ];
+    const tools = unique(rawTools, (t) => t.name);
+    const prompts = unique(rawPrompts, (p) => p.name);
+    const resources = unique(rawResources, (r) => r.uri);
     const overrides = this.#config.tools ?? {};
     const toolMap = new Map<string, Tool>(
       tools.map((t) => {

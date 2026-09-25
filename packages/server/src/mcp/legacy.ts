@@ -15,10 +15,12 @@ import {
   type ReadResourceResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import {
+  INTEGRITY_BLOCKS,
   ToolUnavailableError,
   VERSION,
   type Engine,
   type Exposure,
+  type ItemKind,
   type Outcome,
   type Principal,
   type ResolvedScope,
@@ -49,19 +51,37 @@ export type McpCall = {
   audit?: ((r: CallRecord) => void) | undefined;
 };
 
-/** §4.2: a result larger than the cap becomes its text, truncated, with the spec's marker. */
+/**
+ * §4.2: a result larger than the cap becomes its text, truncated, with the spec's
+ * marker — and the truncated result itself fits the cap, measured the way it goes on
+ * the wire (JSON escaping included). Structured content cannot be cut meaningfully,
+ * so it is dropped and the result flagged isError: an SDK client that cached an
+ * outputSchema rejects a success without it.
+ */
 export function capResult(res: CallToolResult, maxBytes: number): CallToolResult {
-  const size = Buffer.byteLength(JSON.stringify(res), 'utf8');
+  const bytes = (v: unknown): number => Buffer.byteLength(JSON.stringify(v), 'utf8');
+  const size = bytes(res);
   if (size <= maxBytes) return res;
   const text = res.content.map((c) => (c.type === 'text' ? c.text : JSON.stringify(c))).join('\n');
-  const keep = Buffer.from(text, 'utf8')
-    .subarray(0, Math.max(0, maxBytes - 256))
-    .toString('utf8');
-  const dropped = size - Buffer.byteLength(keep, 'utf8');
-  return {
-    ...(res.isError === undefined ? {} : { isError: res.isError }),
-    content: [{ type: 'text', text: `${keep}\n[mcprouter:truncated ${dropped} bytes]` }],
-  };
+  const isError = res.structuredContent !== undefined ? true : res.isError;
+  const build = (n: number): CallToolResult => ({
+    ...(isError === undefined ? {} : { isError }),
+    content: [
+      {
+        type: 'text',
+        text: `${text.slice(0, n)}\n[mcprouter:truncated ${size - bytes(text.slice(0, n))} bytes]`,
+      },
+    ],
+  });
+  // Largest prefix whose serialized result fits — binary search, O(log n) stringifies.
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (bytes(build(mid)) <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return build(lo);
 }
 
 /** Hidden, missing and disabled are one protocol error with core's one message. */
@@ -160,10 +180,34 @@ export async function handleMcp(original: Request, call: McpCall): Promise<Respo
       return { content: [{ type: 'text', text }], isError: true };
     }
   });
+  /**
+   * prompts/get and resources/read: an integrity block leaves an internal record
+   * (§11.2 "every integrity block"); the client still gets only the plain not-found.
+   */
+  const blocked = (kind: ItemKind, name: string, err: unknown, started: number): never => {
+    if (err instanceof ToolUnavailableError) {
+      const reason = engine.explain(scope, name, kind);
+      if (INTEGRITY_BLOCKS.has(reason)) {
+        call.audit?.({
+          server: null,
+          item: name,
+          outcome: 'not_found',
+          durationMs: Date.now() - started,
+          inputKeys: [],
+          inputBytes: 0,
+          error: null,
+          reason,
+        });
+      }
+    }
+    return notFound(err);
+  };
+
   server.setRequestHandler(ListPromptsRequestSchema, async () => ({
     prompts: await engine.listPrompts(scope, principal),
   }));
   server.setRequestHandler(GetPromptRequestSchema, async (r) => {
+    const started = Date.now();
     try {
       return (await engine.getPrompt({
         scope,
@@ -173,7 +217,7 @@ export async function handleMcp(original: Request, call: McpCall): Promise<Respo
         signal,
       })) as GetPromptResult;
     } catch (err) {
-      return notFound(err);
+      return blocked('prompt', r.params.name, err, started);
     }
   });
   server.setRequestHandler(ListResourcesRequestSchema, async () => ({
@@ -183,6 +227,7 @@ export async function handleMcp(original: Request, call: McpCall): Promise<Respo
     resourceTemplates: await engine.listResourceTemplates(scope, principal),
   }));
   server.setRequestHandler(ReadResourceRequestSchema, async (r) => {
+    const started = Date.now();
     try {
       return (await engine.readResource({
         scope,
@@ -191,7 +236,7 @@ export async function handleMcp(original: Request, call: McpCall): Promise<Respo
         signal,
       })) as ReadResourceResult;
     } catch (err) {
-      return notFound(err);
+      return blocked('resource', r.params.uri, err, started);
     }
   });
 

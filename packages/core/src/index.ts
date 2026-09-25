@@ -28,6 +28,7 @@ export {
   type ToolDecision,
 } from './call.js';
 export {
+  explainItem,
   explainTool,
   exposure,
   INTEGRITY_BLOCKS,

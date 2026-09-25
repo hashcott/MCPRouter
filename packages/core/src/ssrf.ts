@@ -121,12 +121,19 @@ async function resolveOrRefuse(host: string, deps: GuardDeps): Promise<string[]>
  * itself and our per-hop check never runs.
  */
 /**
- * §11.2: cap BEFORE parsing. Counts bytes since the last blank line — one SSE event,
- * or one whole JSON body — so a long stream of small frames is fine while a single
- * huge frame errors the stream before the SDK ever buffers or parses it.
+ * §11.2: cap BEFORE parsing. An event stream is capped per event (bytes since the
+ * last blank line), so a long stream of small events is fine. Anything else — a
+ * JSON body above all — is ONE frame counted whole: JSON allows any whitespace
+ * between tokens, so resetting on blank lines there would let a padded body of
+ * any size through to `response.json()`.
  */
-export function capFrames(res: Response, maxBytes: number): Response {
+export function capFrames(
+  res: Response,
+  maxBytes: number,
+  onViolation?: (err: Error) => void,
+): Response {
   if (res.body === null) return res;
+  const perEvent = (res.headers.get('content-type') ?? '').includes('text/event-stream');
   let since = 0;
   let prev = 0;
   const body = res.body.pipeThrough(
@@ -134,10 +141,12 @@ export function capFrames(res: Response, maxBytes: number): Response {
       transform(chunk, ctl) {
         for (const b of chunk) {
           if (b === 0x0d) continue; // CRLF framing counts like LF
-          since = b === 0x0a && prev === 0x0a ? 0 : since + 1;
+          since = perEvent && b === 0x0a && prev === 0x0a ? 0 : since + 1;
           prev = b;
           if (since > maxBytes) {
-            ctl.error(new FrameTooLargeError(maxBytes));
+            const err = new FrameTooLargeError(maxBytes);
+            onViolation?.(err);
+            ctl.error(err);
             return;
           }
         }
@@ -152,7 +161,11 @@ export function capFrames(res: Response, maxBytes: number): Response {
   });
 }
 
-export function guardedFetch(allowPrivate?: boolean, deps: GuardDeps = {}): typeof fetch {
+export function guardedFetch(
+  allowPrivate?: boolean,
+  deps: GuardDeps = {},
+  onViolation?: (err: Error) => void,
+): typeof fetch {
   const impl = deps.fetchImpl ?? fetch;
   return (async (input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
     const maxFrame = envInt('MCPROUTER_UPSTREAM_MAX_FRAME_BYTES', 16 * 1024 * 1024);
@@ -161,10 +174,10 @@ export function guardedFetch(allowPrivate?: boolean, deps: GuardDeps = {}): type
     for (let hop = 0; hop <= MAX_HOPS; hop += 1) {
       await assertSafeUrl(target, allowPrivate, deps);
       const res = await impl(target, { ...init, redirect: 'manual' });
-      if (res.status < 300 || res.status > 399) return capFrames(res, maxFrame);
+      if (res.status < 300 || res.status > 399) return capFrames(res, maxFrame, onViolation);
 
       const location = res.headers.get('location');
-      if (location === null) return capFrames(res, maxFrame);
+      if (location === null) return capFrames(res, maxFrame, onViolation);
       const next = new URL(location, target);
       // The same init — Authorization and per-user headers included — goes to
       // every hop, so a hop to another origin would hand it our credentials.

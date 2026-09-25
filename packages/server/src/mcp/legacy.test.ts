@@ -322,6 +322,29 @@ describe('result cap (§4.2)', () => {
   });
 });
 
+describe('result cap never exceeds the cap', () => {
+  const size = (r: unknown) => Buffer.byteLength(JSON.stringify(r), 'utf8');
+  it.each([
+    ['quotes (escape ×2)', '"'.repeat(5_000)],
+    ['control characters (escape ×6)', '\u0001'.repeat(5_000)],
+    ['multi-byte text', 'é'.repeat(5_000)],
+  ])('%s', (_n, text) => {
+    const out = capResult({ content: [{ type: 'text', text }] }, 1_024);
+    expect(size(out)).toBeLessThanOrEqual(1_024);
+    expect(JSON.stringify(out)).toMatch(/\[mcprouter:truncated \d+ bytes\]/);
+  });
+
+  it('structured content that cannot fit is dropped AND flagged isError, so a schema-checking client does not choke', () => {
+    const out = capResult(
+      { content: [{ type: 'text', text: 'x' }], structuredContent: { rows: 'y'.repeat(5_000) } },
+      1_024,
+    );
+    expect(out.structuredContent).toBeUndefined();
+    expect(out.isError).toBe(true);
+    expect(size(out)).toBeLessThanOrEqual(1_024);
+  });
+});
+
 describe('integrity reason on not_found', () => {
   it('records why a name did not resolve — internally only', async () => {
     records.length = 0;
@@ -331,5 +354,37 @@ describe('integrity reason on not_found', () => {
     );
     await c.close();
     expect(records[0]).toMatchObject({ outcome: 'not_found', reason: 'missing' });
+  });
+});
+
+describe('integrity blocks on prompts and resources are recorded too', () => {
+  const blocking = (kindSeen: string[]): Engine =>
+    ({
+      getPrompt: () => Promise.reject(new ToolUnavailableError('fs__p')),
+      readResource: () => Promise.reject(new ToolUnavailableError('mem://r')),
+      explain: (_s: unknown, _n: string, kind: string) => {
+        kindSeen.push(kind);
+        return 'changed';
+      },
+    }) as unknown as Engine;
+
+  it('a changed prompt or resource leaves a record with its reason — and the client the plain not-found', async () => {
+    records.length = 0;
+    const kinds: string[] = [];
+    const c = new Client({ name: 't', version: '0' });
+    await c.connect(
+      new StreamableHTTPClientTransport(new URL('http://hub.test/mcp'), {
+        fetch: (url, init) =>
+          handleMcp(new Request(url, init), { ...call(), engine: blocking(kinds) }),
+      }),
+    );
+    await expect(c.getPrompt({ name: 'fs__p' })).rejects.toThrow(/Tool not found: fs__p$/);
+    await expect(c.readResource({ uri: 'mem://r' })).rejects.toThrow(/Tool not found: mem:\/\/r$/);
+    await c.close();
+    expect(kinds).toEqual(['prompt', 'resource']);
+    expect(records.map((r) => [r.item, r.outcome, r.reason])).toEqual([
+      ['fs__p', 'not_found', 'changed'],
+      ['mem://r', 'not_found', 'changed'],
+    ]);
   });
 });

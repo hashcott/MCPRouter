@@ -19,6 +19,11 @@ export type TransportCtx = {
   /** Aborted when stop() lands mid-connect. */
   signal: AbortSignal;
   onStderr: (line: string) => void;
+  /**
+   * A violation the SDK would swallow (an SSE frame over the cap only disconnects the
+   * stream): report it so the SERVER fails with the reason instead of retrying.
+   */
+  onFatal?: ((err: Error) => void) | undefined;
 };
 
 export type TransportFactory = (cfg: ServerConfig, ctx: TransportCtx) => Promise<Transport>;
@@ -100,7 +105,7 @@ export const createTransport: TransportFactory = async (cfg, ctx) => {
         new StreamableHTTPClientTransport(new URL(cfg.url), {
           requestInit: { headers },
           ...(ctx.authProvider === undefined ? {} : { authProvider: ctx.authProvider }),
-          fetch: guardedFetch(cfg.allowPrivateNetwork),
+          fetch: guardedFetch(cfg.allowPrivateNetwork, {}, ctx.onFatal),
         }),
       );
     }
@@ -111,7 +116,7 @@ export const createTransport: TransportFactory = async (cfg, ctx) => {
         new SSEClientTransport(new URL(cfg.url), {
           requestInit: { headers },
           ...(ctx.authProvider === undefined ? {} : { authProvider: ctx.authProvider }),
-          fetch: guardedFetch(cfg.allowPrivateNetwork),
+          fetch: guardedFetch(cfg.allowPrivateNetwork, {}, ctx.onFatal),
         }),
       );
     }
