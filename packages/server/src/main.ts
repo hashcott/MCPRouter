@@ -4,6 +4,7 @@ import { serve } from '@hono/node-server';
 import { createDb, createLogger, createPool, Engine, runMigrations } from '@mcprouter/core';
 import { AuditWriter } from './audit.js';
 import { authenticateKey, createAuth } from './auth.js';
+import { startTruthWriter } from './integrity.js';
 import { loadConfig } from './config.js';
 import { createApp, type Readiness } from './app.js';
 import { createRegistry } from './metrics.js';
@@ -24,6 +25,7 @@ const pool = createPool(config.databaseUrl);
 const db = createDb(pool);
 const engine = new Engine({ logger: log });
 const auth = createAuth({ db, secret: config.authSecret, baseURL: config.publicUrl.href, log });
+const truth = startTruthWriter({ db, engine, log, newItems: config.newItems });
 const audit = new AuditWriter({ db, log });
 audit.start();
 let sync: ServerSync | undefined;
@@ -72,7 +74,7 @@ sync = await startServerSync({
   keyring: config.secretKeys,
   engine,
   log,
-  integrity: 'off',
+  integrity: config.integrity,
 });
 
 let shuttingDown = false;
@@ -91,6 +93,7 @@ async function shutdown(signal: string): Promise<void> {
   // The timer above caps the wait at SHUTDOWN_TIMEOUT_MS.
   await new Promise<void>((done) => server.close(() => done()));
   await audit.stop();
+  truth.stop();
   sync?.stop();
   await engine.shutdown();
   await pool.end();

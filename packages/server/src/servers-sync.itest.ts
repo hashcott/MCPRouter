@@ -138,3 +138,28 @@ describe('groups in the snapshot', () => {
     );
   });
 });
+
+it('every config the poller applies carries an integrity setting (R11)', async () => {
+  const seen: unknown[] = [];
+  const e = new Engine({
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    connect: fakeFactory({}),
+  });
+  const orig = e.applyConfig.bind(e);
+  e.applyConfig = async (configs) => {
+    seen.push(...configs.map((c) => c.integrity?.mode));
+    return orig(configs);
+  };
+  const s = await startServerSync({
+    pool,
+    db,
+    keyring: kr,
+    engine: e,
+    log: pino({ level: 'silent' }),
+    integrity: 'enforce',
+  });
+  s.stop();
+  await e.shutdown();
+  expect(seen.length).toBeGreaterThan(0);
+  expect(seen.every((m) => m === 'enforce')).toBe(true);
+});

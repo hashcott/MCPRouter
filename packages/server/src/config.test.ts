@@ -112,4 +112,10 @@ describe('parseConfig', () => {
     expect(d.ok && d.config.maxInflight).toBe(8);
     expect(parseConfig({ ...valid, MCP_MAX_INFLIGHT: '0' }).ok).toBe(false);
   });
+
+  it('integrity defaults to enforce and new items to quarantine (§11.2)', () => {
+    const r = parseConfig(valid);
+    expect(r.ok && [r.config.integrity, r.config.newItems]).toEqual(['enforce', 'quarantine']);
+    expect(parseConfig({ ...valid, MCPR_INTEGRITY: 'lax' }).ok).toBe(false);
+  });
 });

@@ -12,3 +12,4 @@ export { createRegistry } from './metrics.js';
 export { startServerSync, type ServerSync } from './servers-sync.js';
 export { canSee, checkGrant, parseGrant, toPermissions, type Grant } from './grant.js';
 export { EMPTY_SNAPSHOT, resolveTarget, type Route, type Snapshot, type Target } from './scope.js';
+export { startTruthWriter } from './integrity.js';
