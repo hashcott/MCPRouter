@@ -218,13 +218,48 @@ describe('prompts and resources go through the same predicate as tools (Ruling P
     await reg.shutdown();
   });
 
-  it('refuses a hidden or nonexistent prompt with the shared message', async () => {
-    const fake = new FakeUpstream('a', [], { prompts: [{ name: 'greet' }] });
+  it('refuses a nonexistent prompt with the shared message', async () => {
+    // No `prompts` knob at all: 'greet' does not exist upstream.
+    const fake = new FakeUpstream('a', [{ name: 'echo' }]);
     const { reg, deps } = await up(fake);
     await expect(
-      getPrompt(deps, { scope, principal, name: 'a__missing', args: {} }),
+      getPrompt(deps, { scope, principal, name: 'a__greet', args: {} }),
     ).rejects.toBeInstanceOf(ToolUnavailableError);
     await reg.shutdown();
+  });
+
+  it('gives a hidden prompt the byte-identical message of a nonexistent one (Ruling P12)', async () => {
+    // Case 1: 'greet' does not exist upstream at all.
+    const u1 = await up(new FakeUpstream('a', [{ name: 'echo' }]));
+    const nonexistent = await getPrompt(u1.deps, {
+      scope,
+      principal,
+      name: 'a__greet',
+      args: {},
+    }).catch((e: Error) => e);
+    await u1.reg.shutdown();
+
+    // Case 2: 'greet' genuinely exists upstream, but this scope's allowlist omits
+    // it — the pre-P12 resolver (which checked kind: 'tool') could not
+    // distinguish this from "never existed", and a same-named tool would leak
+    // the prompt.
+    const hiddenScope: ResolvedScope = {
+      key: 'hidden-prompt',
+      servers: [{ serverName: 'a', tools: 'all', prompts: ['other'], resources: 'all' }],
+      flatten: false,
+    };
+    const u2 = await up(new FakeUpstream('a', [], { prompts: [{ name: 'greet' }] }));
+    const hidden = await getPrompt(u2.deps, {
+      scope: hiddenScope,
+      principal,
+      name: 'a__greet',
+      args: {},
+    }).catch((e: Error) => e);
+    await u2.reg.shutdown();
+
+    expect(nonexistent).toBeInstanceOf(ToolUnavailableError);
+    expect(hidden).toBeInstanceOf(ToolUnavailableError);
+    expect((hidden as Error).message).toBe((nonexistent as Error).message);
   });
 
   it('reads a resource by scanning scope.servers for the first exposing server', async () => {
@@ -237,7 +272,24 @@ describe('prompts and resources go through the same predicate as tools (Ruling P
     await reg.shutdown();
   });
 
-  it('refuses a resource URI on a server outside scope, same as a hidden URI', async () => {
+  it('refuses a resource URI that exists on an in-scope server but is hidden by the scope allowlist (Ruling P12)', async () => {
+    // 'file:///hello.txt' genuinely exists on server 'a', and 'a' is in scope —
+    // but this scope's resource allowlist doesn't name it. A URI hidden from
+    // `listResources` must not be readable just because its server is reachable.
+    const fake = new FakeUpstream('a', [], { resources: [{ uri: 'file:///hello.txt' }] });
+    const { reg, deps } = await up(fake);
+    const hiddenScope: ResolvedScope = {
+      key: 'hidden-resource',
+      servers: [{ serverName: 'a', tools: 'all', prompts: 'all', resources: [] }],
+      flatten: false,
+    };
+    await expect(
+      readResource(deps, { scope: hiddenScope, principal, uri: 'file:///hello.txt' }),
+    ).rejects.toBeInstanceOf(ToolUnavailableError);
+    await reg.shutdown();
+  });
+
+  it('refuses a resource URI on a server that scope.servers never lists', async () => {
     const fakeA = new FakeUpstream('a', [{ name: 'echo' }]);
     const fakeB = new FakeUpstream('b', [], { resources: [{ uri: 'file:///secret.txt' }] });
     const bus = new Bus<EngineEvents>();
