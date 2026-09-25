@@ -1,3 +1,5 @@
+import { createInterface } from 'node:readline';
+import type { Readable } from 'node:stream';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import {
   StdioClientTransport,
@@ -75,15 +77,18 @@ export const createTransport: TransportFactory = async (cfg, ctx) => {
   switch (cfg.type) {
     case 'stdio': {
       const childEnv = assertPlainStringMap('env', cfg.env);
-      return asTransport(
-        new StdioClientTransport({
-          command: cfg.command,
-          args: cfg.args ?? [],
-          env: { ...augmentPath(getDefaultEnvironment()), ...childEnv },
-          ...(cfg.cwd === undefined ? {} : { cwd: cfg.cwd }),
-          stderr: 'pipe',
-        }),
-      );
+      const t = new StdioClientTransport({
+        command: cfg.command,
+        args: cfg.args ?? [],
+        env: { ...augmentPath(getDefaultEnvironment()), ...childEnv },
+        ...(cfg.cwd === undefined ? {} : { cwd: cfg.cwd }),
+        stderr: 'pipe',
+      });
+      // A piped stderr nobody reads fills the OS buffer and blocks the child.
+      // The SDK types it as Stream; with 'pipe' it is a PassThrough.
+      const stderr = t.stderr as Readable | null;
+      if (stderr !== null) createInterface({ input: stderr }).on('line', ctx.onStderr);
+      return asTransport(t);
     }
     case 'streamable-http': {
       await assertSafeUrl(cfg.url, cfg.allowPrivateNetwork);
