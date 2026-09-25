@@ -5,5 +5,13 @@
   "type": "module",
   "bin": {
     "mcprouter": "./dist/main.js"
+  },
+  "dependencies": {
+    "@mcprouter/core": "workspace:*",
+    "@mcprouter/server": "workspace:*"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "pino": "10.3.1"
   }
 }
