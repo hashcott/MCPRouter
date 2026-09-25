@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import { check, index, pgTable, smallint, text, uuid } from 'drizzle-orm/pg-core';
 import { SECRET_SCOPES, type SecretScope } from '../../security/seal.js';
 import { bytea, timestamps } from './_shared.js';
+import { user } from './auth.js';
 import { servers } from './servers.js';
 
 /**
@@ -15,8 +16,7 @@ export const secrets = pgTable(
     id: uuid('id').primaryKey(),
     scope: text('scope').$type<SecretScope>().notNull(),
     serverId: uuid('server_id').references(() => servers.id, { onDelete: 'cascade' }),
-    // FK to better-auth's "user" arrives with that table in P1c.
-    userId: text('user_id'),
+    userId: text('user_id').references(() => user.id, { onDelete: 'cascade' }),
     /** Env var name, header name, 'access_token', … */
     label: text('label').notNull(),
     keyVersion: smallint('key_version').notNull(),
@@ -36,5 +36,6 @@ export const secrets = pgTable(
     check('secrets_key_version', sql`${t.keyVersion} > 0`),
     // Makes the ON DELETE CASCADE probe from servers an index scan.
     index('secrets_server_idx').on(t.serverId),
+    index('secrets_user_idx').on(t.userId),
   ],
 );

@@ -1,8 +1,10 @@
 import { jsonb, pgTable, text } from 'drizzle-orm/pg-core';
 import { createdAt, updatedAt } from './_shared.js';
+import * as auth from './auth.js';
 import { secrets } from './secrets.js';
 import { servers } from './servers.js';
 
+export * from './auth.js';
 export { secrets, servers };
 
 /**
@@ -17,5 +19,5 @@ export const systemSetting = pgTable('system_setting', {
   updatedAt,
 });
 
-export const schema = { systemSetting, servers, secrets };
+export const schema = { systemSetting, servers, secrets, ...auth };
 export type Schema = typeof schema;
