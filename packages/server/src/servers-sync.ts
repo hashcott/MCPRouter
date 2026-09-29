@@ -11,11 +11,14 @@ import {
   type Keyring,
   type Selection,
 } from '@mcprouter/core';
+import { compileRules } from './policy.js';
 import { EMPTY_SNAPSHOT, reusedSlugs, type Member, type Snapshot } from './scope.js';
 
 export type ServerSync = {
   /** What the last successful poll applied. */
   snapshot(): Snapshot;
+  /** When the database last answered a poll. Stale-on-failure, never open (§11.3). */
+  lastOkAt(): number | undefined;
   refresh(): Promise<void>;
   stop(): void;
 };
@@ -46,6 +49,7 @@ export async function startServerSync(o: {
 }): Promise<ServerSync> {
   let fingerprint: string | undefined;
   let snap: Snapshot = EMPTY_SNAPSHOT;
+  let lastOk: number | undefined;
   let queue = Promise.resolve();
 
   const tick = async (): Promise<void> => {
@@ -60,10 +64,12 @@ export async function startServerSync(o: {
          coalesce((select string_agg(m::text, ',' order by m.group_id, m.server_id)
                    from group_server m), '') ||
          coalesce((select string_agg(o::text, ',' order by o.server_id, o.kind, o.item_name)
-                   from server_item_override o), '')
+                   from server_item_override o), '') ||
+         coalesce((select string_agg(p::text, ',' order by p.id) from policy_rule p), '')
        ) as v`,
     );
     const v = r.rows[0]?.v ?? '';
+    lastOk = Date.now();
     if (v === fingerprint) return;
 
     // One consistent read (a single REPEATABLE READ snapshot) BEFORE the Engine is
@@ -91,11 +97,33 @@ export async function startServerSync(o: {
           .leftJoin(schema.groupServer, eq(schema.groupServer.groupId, schema.groups.id))
           .leftJoin(schema.servers, eq(schema.servers.id, schema.groupServer.serverId))
           .orderBy(asc(schema.groups.slug), asc(schema.servers.slug));
-        return { ...loadedServers, serverRows, memberRows };
+        const ruleRows = await tx
+          .select({
+            id: schema.policyRule.id,
+            seq: schema.policyRule.seq,
+            enabled: schema.policyRule.enabled,
+            subjectKind: schema.policyRule.subjectKind,
+            subjectId: schema.policyRule.subjectId,
+            serverId: schema.policyRule.serverId,
+            serverSlug: schema.servers.slug,
+            itemKind: schema.policyRule.itemKind,
+            namePattern: schema.policyRule.namePattern,
+            effect: schema.policyRule.effect,
+            args: schema.policyRule.args,
+            note: schema.policyRule.note,
+            expiresAt: schema.policyRule.expiresAt,
+          })
+          .from(schema.policyRule)
+          .innerJoin(schema.servers, eq(schema.servers.id, schema.policyRule.serverId));
+        return { ...loadedServers, serverRows, memberRows, ruleRows };
       },
       { isolationLevel: 'repeatable read', accessMode: 'read only' },
     );
-    const { configs, errors, serverRows, memberRows } = read;
+    const { configs, errors, serverRows, memberRows, ruleRows } = read;
+    const policy = compileRules(ruleRows);
+    for (const id of policy.broken) {
+      o.log.error({ evt: 'policy.rule_invalid', rule: id }, 'invalid policy rule enforced as deny');
+    }
     for (const e of errors) {
       o.log.error(
         { evt: 'servers.load_failed', server: e.slug, reason: e.reason },
@@ -124,6 +152,7 @@ export async function startServerSync(o: {
         .filter((s) => loaded.has(s.slug))
         .map((s) => ({ id: s.id, slug: s.slug, enabled: loaded.get(s.slug) === true })),
       groups,
+      policy: policy.rules,
     };
 
     // A slug deleted and re-created: the old snapshot would route to the new upstream
@@ -151,5 +180,10 @@ export async function startServerSync(o: {
   await refresh();
   const timer = setInterval(() => void refresh(), o.intervalMs ?? 5_000);
   timer.unref();
-  return { snapshot: () => snap, refresh, stop: () => clearInterval(timer) };
+  return {
+    snapshot: () => snap,
+    lastOkAt: () => lastOk,
+    refresh,
+    stop: () => clearInterval(timer),
+  };
 }

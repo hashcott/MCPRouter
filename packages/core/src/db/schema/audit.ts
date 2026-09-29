@@ -26,6 +26,8 @@ export const auditEvent = pgTable(
     inputKeys: text('input_keys').array(),
     inputBytes: integer('input_bytes'),
     error: text('error'),
+    /** Identical policy denies inside one flush window collapse into one row (§11.8). */
+    count: integer('count').notNull().default(1),
   },
   (t) => [
     index('audit_event_at_idx').on(t.at),

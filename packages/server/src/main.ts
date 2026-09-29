@@ -8,7 +8,7 @@ import { startTruthWriter } from './integrity.js';
 import { loadConfig } from './config.js';
 import { createApp, type Readiness } from './app.js';
 import { createRegistry } from './metrics.js';
-import { EMPTY_SNAPSHOT, resolveTarget } from './scope.js';
+import { EMPTY_SNAPSHOT } from './scope.js';
 import { startServerSync, type ServerSync } from './servers-sync.js';
 
 const config = loadConfig();
@@ -29,7 +29,7 @@ const truth = startTruthWriter({ db, engine, log, newItems: config.newItems });
 const audit = new AuditWriter({ db, log });
 audit.start();
 let sync: ServerSync | undefined;
-const registry = createRegistry();
+const registry = createRegistry({ policyCheckedAt: () => sync?.lastOkAt() });
 const readiness: Readiness = { migrationsApplied: false, routesMounted: false };
 const app = createApp({
   config,
@@ -39,10 +39,10 @@ const app = createApp({
   readiness,
   webRoot,
   mcp: {
-    authenticate: (header) => authenticateKey(auth, header),
+    authenticate: (header) => authenticateKey(auth, db, header),
     engine,
     // Before the first sync lands, an empty snapshot — never "all" (P1a constraint).
-    resolve: (t) => resolveTarget(sync?.snapshot() ?? EMPTY_SNAPSHOT, t),
+    snapshot: () => sync?.snapshot() ?? EMPTY_SNAPSHOT,
     timeoutMs: config.mcpCallTimeoutMs,
     maxInflight: config.maxInflight,
     resultMaxBytes: config.resultMaxBytes,

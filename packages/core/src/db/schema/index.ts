@@ -3,14 +3,25 @@ import { createdAt, updatedAt } from './_shared.js';
 import { auditEvent } from './audit.js';
 import * as auth from './auth.js';
 import { toolEmbedding } from './catalog.js';
+import { policyRule } from './policy.js';
 import { groupServer, groups, serverItemOverride } from './groups.js';
 import { secrets } from './secrets.js';
 import { servers } from './servers.js';
 
 export * from './auth.js';
-export { auditEvent, groupServer, groups, secrets, servers, serverItemOverride, toolEmbedding };
+export {
+  auditEvent,
+  groupServer,
+  groups,
+  secrets,
+  servers,
+  serverItemOverride,
+  toolEmbedding,
+  policyRule,
+};
 export type { Outcome } from './audit.js';
 export type { Selection } from './groups.js';
+export type { PolicyRuleRow } from './policy.js';
 
 /**
  * Single-row-per-key system configuration. In P0 it exists to give the
@@ -33,6 +44,7 @@ export const schema = {
   serverItemOverride,
   auditEvent,
   toolEmbedding,
+  policyRule,
   ...auth,
 };
 export type Schema = typeof schema;

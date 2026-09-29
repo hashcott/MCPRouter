@@ -13,9 +13,10 @@ import {
 } from '@mcprouter/core';
 import type { KeyAuth } from './auth.js';
 import type { Config } from './config.js';
+import { makeGate } from './gate.js';
 import { canSee, checkGrant } from './grant.js';
 import { handleMcp, type CallRecord } from './mcp/legacy.js';
-import type { Route, Target } from './scope.js';
+import { resolveTarget, type Snapshot, type Target } from './scope.js';
 import type { Metrics } from './metrics.js';
 
 export interface Readiness {
@@ -36,7 +37,9 @@ export interface AppDeps {
 }
 
 export type AuditRow = CallRecord & {
-  evt: 'tool.call' | 'integrity.block';
+  evt: 'tool.call' | 'integrity.block' | 'policy.deny';
+  /** Identical denies in one flush window collapse into one row (§11.8). */
+  count?: number;
   requestId: string | null;
   principalId: string;
   keyId: string;
@@ -47,8 +50,11 @@ export interface McpDeps {
   /** `Authorization` header → key principal and grant, or null. */
   authenticate: (authorization: string | undefined) => Promise<KeyAuth | null>;
   engine: Engine;
-  /** Pure route resolution over the current snapshot; null → 404. */
-  resolve: (target: Target) => Route | null;
+  /**
+   * The current snapshot. Route AND policy are read from the same one per request,
+   * so a rule can never be evaluated against a routing table it was not loaded with.
+   */
+  snapshot: () => Snapshot;
   timeoutMs: number;
   /** Per-principal concurrent MCP requests (§4.2, default 8). */
   maxInflight: number;
@@ -182,7 +188,8 @@ function mountMcp(app: Hono, mcp: McpDeps, metrics: Metrics): void {
   // §4.2, in this order: authenticate → resolve + visibility (404) → checkGrant (403) → limit (429) → handle.
   const serve = (target: (c: Context) => Target) =>
     guarded(async (c, a) => {
-      const route = mcp.resolve(target(c));
+      const snap = mcp.snapshot();
+      const route = resolveTarget(snap, target(c));
       // A group this key cannot see is indistinguishable from one that does not exist.
       if (route === null || !canSee(a.grant, route)) return c.json({ error: 'not_found' }, 404);
       if (checkGrant(a.grant, route) !== 'ok') {
@@ -203,6 +210,12 @@ function mountMcp(app: Hono, mcp: McpDeps, metrics: Metrics): void {
           principal: a.principal,
           timeoutMs: mcp.timeoutMs,
           resultMaxBytes: mcp.resultMaxBytes,
+          gate: makeGate({
+            rules: snap.policy,
+            serverIdOf: (name) => snap.servers.find((s) => s.slug === name)?.id,
+            subject: { role: a.role, keyId: a.keyId },
+            onDecision: (effect) => metrics.policyDecisions.inc({ effect }),
+          }),
           audit: (r) => {
             const block =
               r.reason !== undefined && INTEGRITY_BLOCKS.has(r.reason) ? r.reason : undefined;
@@ -211,7 +224,11 @@ function mountMcp(app: Hono, mcp: McpDeps, metrics: Metrics): void {
             if (blocked) metrics.integrityBlocks.inc({ reason: block });
             mcp.audit({
               ...r,
-              evt: blocked ? 'integrity.block' : 'tool.call',
+              evt: blocked
+                ? 'integrity.block'
+                : r.outcome === 'denied'
+                  ? 'policy.deny'
+                  : 'tool.call',
               ...(blocked ? { error: `integrity:${block}` } : {}),
               requestId: currentContext()?.requestId ?? null,
               principalId: who,

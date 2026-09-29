@@ -1,4 +1,5 @@
 import type { ResolvedScope, Selection, ServerSelection } from '@mcprouter/core';
+import type { CompiledRule } from './policy.js';
 
 export type Target =
   { kind: 'all' } | { kind: 'group'; slug: string } | { kind: 'server'; slug: string };
@@ -16,9 +17,11 @@ export type Member = {
 export type Snapshot = {
   servers: readonly { id: string; slug: string; enabled: boolean }[];
   groups: ReadonlyMap<string, { id: string; members: readonly Member[] }>;
+  /** Policy rules in first-match order, read in the same transaction as the rest. */
+  policy: readonly CompiledRule[];
 };
 
-export const EMPTY_SNAPSHOT: Snapshot = { servers: [], groups: new Map() };
+export const EMPTY_SNAPSHOT: Snapshot = { servers: [], groups: new Map(), policy: [] };
 
 export type Route = {
   scope: ResolvedScope;

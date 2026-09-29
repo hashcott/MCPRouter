@@ -13,3 +13,21 @@ export { startServerSync, type ServerSync } from './servers-sync.js';
 export { canSee, checkGrant, parseGrant, toPermissions, type Grant } from './grant.js';
 export { EMPTY_SNAPSHOT, resolveTarget, type Route, type Snapshot, type Target } from './scope.js';
 export { startTruthWriter } from './integrity.js';
+export { ALLOW_ALL_GATE, denyText, makeGate, type Gate, type GateResult } from './gate.js';
+export {
+  ArgConstraint,
+  ArgConstraints,
+  compileRules,
+  describeRule,
+  evaluate,
+  findShadows,
+  globMatch,
+  pathUnder,
+  pointerGet,
+  ROLES,
+  type CompiledRule,
+  type PolicyDecision,
+  type PolicySubject,
+  type Role,
+  type RuleRow,
+} from './policy.js';

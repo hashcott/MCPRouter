@@ -6,6 +6,7 @@ import {
   readResource as readResourceImpl,
   resolveToolDecision,
   type CallDeps,
+  type Decision,
   type CallToolReq,
   type ReadResourceReq,
   type ToolDecision,
@@ -94,7 +95,8 @@ export class Engine {
   resolve(scope: ResolvedScope, name: string): ToolDecision {
     return resolveToolDecision(scope, this.#reg, name);
   }
-  callResolved(decision: ToolDecision, req: CallToolReq): Promise<unknown> {
+  /** Accepts ONLY a stamped Decision (§11.4); the arguments travel inside it. */
+  callResolved(decision: Decision, req: Omit<CallToolReq, 'args' | 'name'>): Promise<unknown> {
     return callResolved(this.#deps, decision, req);
   }
 

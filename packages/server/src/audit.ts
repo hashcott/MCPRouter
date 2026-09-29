@@ -2,7 +2,7 @@ import type { Logger } from 'pino';
 import { schema, type Db } from '@mcprouter/core';
 import type { AuditRow } from './app.js';
 
-type Entry = { row: AuditRow; retried: boolean };
+type Entry = { row: AuditRow; retried: boolean; denyKey?: string };
 
 /**
  * Audit writes stay OFF the tool-call path (§8): a bounded in-process queue,
@@ -19,12 +19,34 @@ export class AuditWriter {
   #flushing: Promise<void> | undefined;
   /** The batch whose INSERT is awaiting the database — spilled if we give up on it. */
   #inflight: Entry[] | undefined;
+  /** Queued policy denies by (principal, rule, server, item): one row per key per window. */
+  #denies = new Map<string, Entry>();
 
   constructor(o: { db: Db; log: Logger; cap?: number; batch?: number; intervalMs?: number }) {
     this.#o = { cap: 10_000, batch: 200, intervalMs: 250, ...o };
   }
 
   push(row: AuditRow): void {
+    // §11.8: a deny is free and caller-controlled. Without coalescing, one agent looping
+    // on a denied call would push every other row out of this bounded queue — the
+    // guardrail blinding the very log it shares.
+    if (row.evt === 'policy.deny') {
+      const denyKey = [row.principalId, row.error, row.server, row.item].join('\u001f');
+      const same = this.#denies.get(denyKey);
+      if (same !== undefined) {
+        same.row = { ...same.row, count: (same.row.count ?? 1) + 1 };
+        return;
+      }
+      if (this.#queue.length >= this.#o.cap) {
+        this.#spill(row);
+        return;
+      }
+      const e: Entry = { row: { ...row, count: 1 }, retried: false, denyKey };
+      this.#denies.set(denyKey, e);
+      this.#queue.push(e);
+      if (this.#queue.length >= this.#o.batch) void this.flush();
+      return;
+    }
     if (this.#queue.length >= this.#o.cap) {
       this.#spill(row);
       return;
@@ -67,12 +89,15 @@ export class AuditWriter {
     clearInterval(this.#timer);
     const abandoned = this.#inflight ?? [];
     this.#inflight = undefined; // #drain sees the swap and leaves this batch alone
+    this.#denies.clear();
     for (const e of [...abandoned, ...this.#queue.splice(0)]) this.#spill(e.row);
   }
 
   async #drain(): Promise<void> {
     while (this.#queue.length > 0) {
       const batch = this.#queue.splice(0, this.#o.batch);
+      // Out of the queue = out of the coalescing window.
+      for (const e of batch) if (e.denyKey !== undefined) this.#denies.delete(e.denyKey);
       this.#inflight = batch;
       try {
         // `reason` has no column: what matters of it is already in evt/error.

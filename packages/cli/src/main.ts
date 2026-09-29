@@ -3,14 +3,18 @@ import { createDb, createLogger, createPool, createServer } from '@mcprouter/cor
 import { createAuth, loadConfig } from '@mcprouter/server';
 import {
   addGroup,
+  addPolicy,
   addUser,
   approveItem,
   CliError,
   createKey,
+  listPolicies,
   listReviews,
   parseGroupAdd,
+  parsePolicyAdd,
   parseServerAdd,
   rejectItem,
+  removePolicy,
   secretLines,
   setToolEnabled,
 } from './commands.js';
@@ -27,6 +31,13 @@ const HELP = `mcprouter <command>
   review list [--server <s>]                          items needing a human: unreviewed, changed, rejected, defective
   review approve <server> <kind> <name> --hash <h>    approve exactly the definition you were shown
   review reject <server> <kind> <name>
+
+  policy add <server> (--allow | --deny) [--name <pattern>] [--kind tool|prompt|resource]
+             [--role <r> | --key <apikey-id>] [--arg op:/pointer[=value]]… [--note <text>]
+             [--expires 30m|2h|1d|<ISO>] [--seq <n>]
+             ops: present absent equals oneOf prefix pathUnder maxLen — first match wins
+  policy list                                         every rule as a sentence, with shadow warnings
+  policy rm <id>
 
 Every command except 'secret' reads the server's configuration from the environment.
 `;
@@ -137,6 +148,14 @@ async function run(): Promise<void> {
       } else {
         await rejectItem(pool, { server, kind, name });
       }
+    } else if (cmd === 'policy' && sub === 'add') {
+      process.stdout.write(`${await addPolicy(pool, parsePolicyAdd(rest))}\n`);
+    } else if (cmd === 'policy' && sub === 'list') {
+      for (const line of await listPolicies(pool)) process.stdout.write(`${line}\n`);
+    } else if (cmd === 'policy' && sub === 'rm') {
+      const [id] = rest;
+      if (id === undefined) throw new CliError('usage: mcprouter policy rm <id>');
+      await removePolicy(pool, id);
     } else {
       throw new CliError(`unknown command: ${[cmd, sub].filter(Boolean).join(' ')}`);
     }

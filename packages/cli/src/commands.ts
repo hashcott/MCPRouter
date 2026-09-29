@@ -2,7 +2,18 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import type pg from 'pg';
 import { generateKeyLine, type NewServer } from '@mcprouter/core';
-import { toPermissions, type Auth, type Grant } from '@mcprouter/server';
+import {
+  ArgConstraint,
+  compileRules,
+  describeRule,
+  findShadows,
+  ROLES,
+  toPermissions,
+  type Auth,
+  type Grant,
+  type Role,
+  type RuleRow,
+} from '@mcprouter/server';
 
 /** A usage error: printed as one line, exit 1, no stack. */
 export class CliError extends Error {
@@ -319,4 +330,178 @@ export async function rejectItem(
        set review_state = 'rejected', approved_hash = null, approved_def = null, approved_at = null, updated_at = now()`,
     [serverId, kindOf(input.kind), input.name],
   );
+}
+
+export type PolicyAdd = {
+  server: string;
+  effect: 'allow' | 'deny';
+  kind: 'tool' | 'prompt' | 'resource';
+  pattern: string;
+  subject: { kind: 'any' } | { kind: 'role' | 'api_key'; id: string };
+  args: ArgConstraint[];
+  note: string | null;
+  expiresAt: Date | null;
+  seq: number | null;
+};
+
+/** `30m`, `2h`, `1d`, or an ISO timestamp. */
+function parseExpiry(v: string, now = Date.now()): Date {
+  const m = /^(\d+)([mhd])$/.exec(v);
+  if (m !== null) {
+    const unit = { m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as 'm' | 'h' | 'd'];
+    return new Date(now + Number(m[1]) * unit);
+  }
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime()))
+    throw new CliError(`--expires: expected 30m, 2h, 1d or an ISO time — got ${v}`);
+  return d;
+}
+
+/**
+ * `op:/json/pointer[=value]` — present:/p · absent:/p · equals:/p=v · oneOf:/p=a,b ·
+ * prefix:/p=v · pathUnder:/p=/tmp · maxLen:/p=100
+ */
+export function parseArgSpec(spec: string): ArgConstraint {
+  const colon = spec.indexOf(':');
+  if (colon < 0) throw new CliError(`--arg ${spec}: expected op:/pointer[=value]`);
+  const op = spec.slice(0, colon);
+  const rest = spec.slice(colon + 1);
+  const eq = rest.indexOf('=');
+  const ptr = eq < 0 ? rest : rest.slice(0, eq);
+  const value = eq < 0 ? undefined : rest.slice(eq + 1);
+  const raw =
+    op === 'oneOf'
+      ? { op, ptr, values: (value ?? '').split(',').filter((x) => x.length > 0) }
+      : op === 'maxLen'
+        ? { op, ptr, n: Number(value) }
+        : value === undefined
+          ? { op, ptr }
+          : { op, ptr, value };
+  const r = ArgConstraint.safeParse(raw);
+  if (!r.success) throw new CliError(`--arg ${spec}: ${r.error.issues[0]?.message ?? 'invalid'}`);
+  return r.data;
+}
+
+export function parsePolicyAdd(argv: string[], now = Date.now()): PolicyAdd {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: argv,
+      allowPositionals: true,
+      strict: true,
+      options: {
+        allow: { type: 'boolean', default: false },
+        deny: { type: 'boolean', default: false },
+        kind: { type: 'string', default: 'tool' },
+        name: { type: 'string', default: '*' },
+        role: { type: 'string' },
+        key: { type: 'string' },
+        arg: { type: 'string', multiple: true, default: [] },
+        note: { type: 'string' },
+        expires: { type: 'string' },
+        seq: { type: 'string' },
+      },
+    });
+  } catch (err) {
+    throw new CliError(err instanceof Error ? err.message : String(err));
+  }
+  const { values, positionals } = parsed;
+  const [server] = positionals;
+  if (server === undefined || values.allow === values.deny) {
+    throw new CliError(
+      'usage: mcprouter policy add <server> (--allow | --deny) [--name <pattern>] …',
+    );
+  }
+  if (!['tool', 'prompt', 'resource'].includes(values.kind)) {
+    throw new CliError('--kind must be tool, prompt or resource');
+  }
+  if (!/^[A-Za-z0-9_*.:/-]{1,128}$/.test(values.name)) {
+    throw new CliError('--name: letters, digits, _ . : / - and * only (no regex)');
+  }
+  if (values.role !== undefined && values.key !== undefined) {
+    throw new CliError('a rule targets a role OR an API key, not both');
+  }
+  if (values.role !== undefined && !ROLES.includes(values.role as Role)) {
+    throw new CliError('--role must be viewer, operator or admin');
+  }
+  const args = values.arg.map(parseArgSpec);
+  if (values.deny && args.length > 0) {
+    throw new CliError('--arg belongs on an --allow rule; a deny rule is unconditional');
+  }
+  if (values.note !== undefined && values.note.length > 200)
+    throw new CliError('--note: at most 200 characters');
+  const seq = values.seq === undefined ? null : Number(values.seq);
+  if (seq !== null && (!Number.isInteger(seq) || seq < 0))
+    throw new CliError('--seq must be a non-negative integer');
+  return {
+    server,
+    effect: values.allow ? 'allow' : 'deny',
+    kind: values.kind as PolicyAdd['kind'],
+    pattern: values.name,
+    subject:
+      values.role !== undefined
+        ? { kind: 'role', id: values.role }
+        : values.key !== undefined
+          ? { kind: 'api_key', id: values.key }
+          : { kind: 'any' },
+    args,
+    note: values.note ?? null,
+    expiresAt: values.expires === undefined ? null : parseExpiry(values.expires, now),
+    seq,
+  };
+}
+
+/** Appends at the end unless --seq is given: first match means position is meaning. */
+export async function addPolicy(pool: pg.Pool, p: PolicyAdd): Promise<string> {
+  const [serverId] = await idsOf(pool, 'servers', [p.server]);
+  const r = await pool.query<{ id: string }>(
+    `insert into policy_rule
+       (seq, subject_kind, subject_id, server_id, item_kind, name_pattern, effect, args, note, expires_at)
+     values (coalesce($1, (select coalesce(max(seq), 0) + 10 from policy_rule)),
+             $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     returning id`,
+    [
+      p.seq,
+      p.subject.kind,
+      p.subject.kind === 'any' ? null : p.subject.id,
+      serverId,
+      p.kind,
+      p.pattern,
+      p.effect,
+      JSON.stringify(p.args),
+      p.note,
+      p.expiresAt,
+    ],
+  );
+  return r.rows[0]?.id as string;
+}
+
+/** Every enabled rule as one sentence, in evaluation order, with shadow warnings. */
+export async function listPolicies(pool: pg.Pool): Promise<string[]> {
+  const r = await pool.query<RuleRow & { serverSlug: string }>(
+    `select p.id, p.seq, p.enabled, p.subject_kind as "subjectKind", p.subject_id as "subjectId",
+            p.server_id as "serverId", s.slug as "serverSlug", p.item_kind as "itemKind",
+            p.name_pattern as "namePattern", p.effect, p.args, p.note, p.expires_at as "expiresAt"
+     from policy_rule p join servers s on s.id = p.server_id`,
+  );
+  const { rules, broken } = compileRules(r.rows);
+  const now = Date.now();
+  const lines = rules.map((rule) => {
+    const flags = [
+      broken.includes(rule.id) ? 'INVALID — enforced as deny' : null,
+      rule.expiresAt !== null && rule.expiresAt <= now ? 'expired' : null,
+    ].filter((x) => x !== null);
+    return `${rule.id}  #${rule.seq}  ${describeRule(rule)}${flags.length > 0 ? `  [${flags.join(', ')}]` : ''}`;
+  });
+  for (const s of findShadows(rules)) {
+    lines.push(
+      `WARNING: ${s.shadowed} never matches — ${s.by} above it matches everything it would.`,
+    );
+  }
+  return lines;
+}
+
+export async function removePolicy(pool: pg.Pool, id: string): Promise<void> {
+  const r = await pool.query('delete from policy_rule where id = $1', [id]);
+  if (r.rowCount === 0) throw new CliError(`no policy rule ${id}`);
 }

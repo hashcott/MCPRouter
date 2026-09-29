@@ -22,8 +22,10 @@ export {
   getPrompt,
   readResource,
   resolveToolDecision,
+  stampDecision,
   type CallDeps,
   type CallToolReq,
+  type Decision,
   type ReadResourceReq,
   type ToolDecision,
 } from './call.js';

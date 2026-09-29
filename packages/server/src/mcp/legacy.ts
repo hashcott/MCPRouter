@@ -26,6 +26,7 @@ import {
   type ResolvedScope,
   type ToolDecision,
 } from '@mcprouter/core';
+import { denyText, type Gate } from '../gate.js';
 
 export type CallRecord = {
   server: string | null;
@@ -48,6 +49,11 @@ export type McpCall = {
   timeoutMs: number;
   /** §4.2: the largest result returned downstream. */
   resultMaxBytes: number;
+  /**
+   * REQUIRED (§11.4): the policy gate between resolve and execute. Tests pass
+   * ALLOW_ALL_GATE explicitly; there is no default that could be forgotten.
+   */
+  gate: Gate;
   audit?: ((r: CallRecord) => void) | undefined;
 };
 
@@ -156,12 +162,17 @@ export async function handleMcp(original: Request, call: McpCall): Promise<Respo
     }
     rec.server = decision.server;
     rec.item = decision.bare;
+    const gated = call.gate(decision, args);
+    if (!gated.ok) {
+      // Policy tells the caller what the operator chose to say, so the model stops
+      // retrying and tells a human why (§11.1) — unlike integrity, which says nothing.
+      done('denied', `policy:${gated.ruleId}`);
+      return { content: [{ type: 'text', text: denyText(gated.note) }], isError: true };
+    }
     try {
-      const res = (await engine.callResolved(decision, {
+      const res = (await engine.callResolved(gated.decision, {
         scope,
         principal,
-        name: r.params.name,
-        args,
         signal,
       })) as CallToolResult;
       done(res.isError === true ? 'error' : 'ok');

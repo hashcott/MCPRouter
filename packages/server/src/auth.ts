@@ -2,8 +2,10 @@ import { apiKey } from '@better-auth/api-key';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import type { Logger } from 'pino';
+import { eq } from 'drizzle-orm';
 import { schema, type Db, type Principal } from '@mcprouter/core';
 import { parseGrant, toPermissions, type Grant } from './grant.js';
+import { ROLES, type Role } from './policy.js';
 
 /** The unscoped grant. Scoped keys are minted with toPermissions({ kind: 'groups' | 'servers', … }). */
 export const KEY_GRANT_ALL = toPermissions({ kind: 'all' });
@@ -14,7 +16,17 @@ export const KEY_GRANT_ALL = toPermissions({ kind: 'all' });
  */
 export type MachinePrincipal = Principal & { isAdmin: false };
 
-export type KeyAuth = { principal: MachinePrincipal; keyId: string; grant: Grant };
+export type KeyAuth = {
+  principal: MachinePrincipal;
+  keyId: string;
+  grant: Grant;
+  /**
+   * The OWNING user's role, read at every authenticate — never stamped on the key at
+   * mint time (§11.3 HIGH): a viewer's key matches `role viewer` rules, and a
+   * demotion reaches keys minted before it.
+   */
+  role: Role;
+};
 
 export type AuthDeps = { db: Db; secret: string; baseURL: string; log: Logger };
 
@@ -55,6 +67,7 @@ const BEARER = /^Bearer\s+(\S+)$/i;
 
 export async function authenticateKey(
   auth: Auth,
+  db: Db,
   authorization: string | undefined,
 ): Promise<KeyAuth | null> {
   const key = BEARER.exec(authorization ?? '')?.[1];
@@ -65,6 +78,13 @@ export async function authenticateKey(
   // Parsed on every read, fail-closed (§5.2): a grant this build does not know denies.
   const grant = parseGrant(r.key.permissions);
   if (grant === null) return null;
+  const [owner] = await db
+    .select({ role: schema.user.role })
+    .from(schema.user)
+    .where(eq(schema.user.id, r.key.referenceId));
+  // No owner, or a role this build does not know: fail closed.
+  const role = ROLES.find((x) => x === owner?.role);
+  if (role === undefined) return null;
   // §5.2: a machine credential is never admin, whatever its owner's role.
-  return { principal: { id: r.key.referenceId, isAdmin: false }, keyId: r.key.id, grant };
+  return { principal: { id: r.key.referenceId, isAdmin: false }, keyId: r.key.id, grant, role };
 }

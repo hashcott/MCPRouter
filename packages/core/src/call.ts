@@ -13,6 +13,34 @@ export type CallDeps = { reg: ServerRegistry; bus: Bus<EngineEvents>; logger: Mi
 
 export type ToolDecision = { sel: ServerSelection; bare: string; server: string };
 
+declare const CHECKED: unique symbol;
+
+/**
+ * §11.4: the stamp goes on the DECISION, not on the resolution. The gate serializes
+ * the arguments exactly once and `callResolved` dispatches exactly those bytes, so no
+ * code in between (credential injection, schema defaulting, normalization) can change
+ * what was checked. The symbol is type-only: nothing can build one without
+ * `stampDecision`, and a bare ToolDecision does not compile where a Decision is due.
+ */
+export type Decision = {
+  readonly [CHECKED]: true;
+  readonly tool: ToolDecision;
+  /** The arguments serialized ONCE by the gate; exactly these bytes go upstream. */
+  readonly bytes: Uint8Array;
+};
+
+/**
+ * Mints a Decision. In packages/server ONLY the policy gate calls this (pinned by a
+ * source-scan test there); core's own `callTool` uses it for embedders and tests,
+ * which is the explicit, visible no-policy path (§11.4 "ALLOW_ALL must be passed").
+ */
+export function stampDecision(tool: ToolDecision, args: Record<string, unknown>): Decision {
+  return Object.freeze({
+    tool,
+    bytes: new Uint8Array(Buffer.from(JSON.stringify(args), 'utf8')),
+  }) as unknown as Decision;
+}
+
 export type CallToolReq = {
   scope: ResolvedScope;
   principal: Principal;
@@ -66,16 +94,19 @@ function neverDelivered(err: unknown): boolean {
  */
 export async function callResolved(
   deps: CallDeps,
-  decision: ToolDecision,
-  req: CallToolReq,
+  stamped: Decision,
+  req: Omit<CallToolReq, 'args' | 'name'>,
 ): Promise<unknown> {
+  const decision = stamped.tool;
   const callId = randomUUID();
   const started = Date.now();
-  const size = Buffer.byteLength(JSON.stringify(req.args ?? {}), 'utf8');
+  const size = stamped.bytes.byteLength;
   const cap = maxArgBytes();
   if (size > cap) {
     throw new PayloadTooLargeError(`Arguments too large: ${size} bytes (max ${cap})`);
   }
+  // The very bytes the gate checked — parsed here, at the last step, and nowhere else.
+  const args = JSON.parse(Buffer.from(stamped.bytes).toString('utf8')) as Record<string, unknown>;
 
   deps.bus.emit('call:start', {
     callId,
@@ -84,7 +115,7 @@ export async function callResolved(
     target: decision.bare,
     principalId: req.principal.id,
     scopeKey: req.scope.key,
-    args: req.args,
+    args,
   });
 
   const opts = {
@@ -102,12 +133,12 @@ export async function callResolved(
 
     let result: unknown;
     try {
-      result = await srv.callTool(decision.bare, req.args, opts);
+      result = await srv.callTool(decision.bare, args, opts);
     } catch (err) {
       if (!neverDelivered(err)) throw err;
       deps.logger.debug({ evt: 'call.retry', callId, server: decision.server });
       await srv.ensureReady(req.deadlineMs);
-      result = await srv.callTool(decision.bare, req.args, opts);
+      result = await srv.callTool(decision.bare, args, opts);
     }
     const isError = (result as { isError?: boolean } | undefined)?.isError === true;
     deps.bus.emit('call:end', {
@@ -131,7 +162,10 @@ export async function callResolved(
   }
 }
 
-/** The composition. Nothing else may call an upstream tool. */
+/**
+ * The composition WITHOUT policy — for embedders and tests. packages/server never
+ * calls it: its tools/call goes resolve → policy gate → stampDecision → callResolved.
+ */
 export async function callTool(deps: CallDeps, req: CallToolReq): Promise<unknown> {
   let decision: ToolDecision;
   try {
@@ -146,7 +180,7 @@ export async function callTool(deps: CallDeps, req: CallToolReq): Promise<unknow
     });
     throw err;
   }
-  return callResolved(deps, decision, req);
+  return callResolved(deps, stampDecision(decision, req.args), req);
 }
 
 /**
