@@ -69,8 +69,10 @@ export async function startServerSync(o: {
        ) as v`,
     );
     const v = r.rows[0]?.v ?? '';
-    lastOk = Date.now();
-    if (v === fingerprint) return;
+    if (v === fingerprint) {
+      lastOk = Date.now(); // the database confirmed the snapshot is current
+      return;
+    }
 
     // One consistent read (a single REPEATABLE READ snapshot) BEFORE the Engine is
     // touched: configs, servers and memberships all describe the same moment, and no
@@ -160,6 +162,7 @@ export async function startServerSync(o: {
     if (reusedSlugs(snap, next).size > 0) snap = EMPTY_SNAPSHOT;
     await o.engine.applyConfig(configs);
     snap = next;
+    lastOk = Date.now();
     fingerprint = v;
     o.log.info(
       { evt: 'servers.applied', count: configs.length, failed: errors.length },

@@ -54,7 +54,8 @@ export function createRegistry(o: { policyCheckedAt?: () => number | undefined }
     registers: [registry],
     collect() {
       const at = o.policyCheckedAt?.();
-      if (at !== undefined) this.set((Date.now() - at) / 1000);
+      // Never confirmed yet reads as infinitely stale, not as fresh.
+      this.set(at === undefined ? Number.POSITIVE_INFINITY : (Date.now() - at) / 1000);
     },
   });
 

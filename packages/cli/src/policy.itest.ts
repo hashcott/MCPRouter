@@ -16,6 +16,7 @@ import { FakeUpstream, fakeFactory } from '../../core/test/fake-upstream.js';
 import {
   addPolicy,
   addUser,
+  CliError,
   createKey,
   listPolicies,
   parsePolicyAdd,
@@ -278,5 +279,35 @@ describe('P2c — policy rules, first match, role from the owner', () => {
     expect(
       await registry.registry.getSingleMetricAsString('mcprouter_policy_snapshot_age_seconds'),
     ).toMatch(/mcprouter_policy_snapshot_age_seconds \d/);
+  });
+
+  it('a key-scoped rule must name a key that exists; a real one matches only that key', async () => {
+    await expect(
+      addPolicy(pool, parsePolicyAdd(['fs', '--deny', '--key', 'no-such-key'])),
+    ).rejects.toBeInstanceOf(CliError);
+    const viewerKeyId = (
+      await pool.query(
+        `select a.id from apikey a join "user" u on u.id = a.reference_id where u.email = 'v@x.io'`,
+      )
+    ).rows[0].id;
+    await addPolicy(
+      pool,
+      parsePolicyAdd([
+        'fs',
+        '--deny',
+        '--name',
+        'read_file',
+        '--key',
+        viewerKeyId,
+        '--seq',
+        '0',
+        '--note',
+        'this key only',
+      ]),
+    );
+    await vi.waitFor(async () =>
+      expect((await call(viewerKey, 'fs__read_file')).text).toBe('Denied by policy: this key only'),
+    );
+    expect((await call(operatorKey, 'fs__read_file')).isError).toBe(false);
   });
 });

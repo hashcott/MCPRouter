@@ -212,7 +212,14 @@ function mountMcp(app: Hono, mcp: McpDeps, metrics: Metrics): void {
           resultMaxBytes: mcp.resultMaxBytes,
           gate: makeGate({
             rules: snap.policy,
-            serverIdOf: (name) => snap.servers.find((s) => s.slug === name)?.id,
+            // The route was resolved against `snap`, but dispatch goes by name to the
+            // engine's CURRENT server. If that name now belongs to a different server
+            // (deleted and re-created mid-request), evaluate nothing: deny.
+            serverIdOf: (name) => {
+              const then = snap.servers.find((s) => s.slug === name)?.id;
+              const now = mcp.snapshot().servers.find((s) => s.slug === name)?.id;
+              return then !== undefined && then === now ? then : undefined;
+            },
             subject: { role: a.role, keyId: a.keyId },
             onDecision: (effect) => metrics.policyDecisions.inc({ effect }),
           }),

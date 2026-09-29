@@ -193,3 +193,25 @@ describe('policy in the snapshot', () => {
     await vi.waitFor(() => expect(sync.lastOkAt() ?? 0).toBeGreaterThan(before));
   });
 });
+
+describe('fail STALE, visibly (§11.3)', () => {
+  it('while a changed snapshot cannot be applied, lastOkAt stops advancing — the age gauge climbs', async () => {
+    const original = engine.applyConfig.bind(engine);
+    engine.applyConfig = () => Promise.reject(new Error('apply keeps failing'));
+    try {
+      const fsId = (await pool.query(`select id from servers where slug = 'fs'`)).rows[0].id;
+      await pool.query(`insert into policy_rule (seq, server_id, effect) values (99, $1, 'deny')`, [
+        fsId,
+      ]);
+      await new Promise((r) => setTimeout(r, 200)); // several failing polls
+      const stuck = sync.lastOkAt();
+      await new Promise((r) => setTimeout(r, 200));
+      expect(sync.lastOkAt()).toBe(stuck);
+      // The old snapshot still serves — stale, never open, never empty.
+      expect(sync.snapshot().policy.some((r) => r.seq === 99)).toBe(false);
+    } finally {
+      engine.applyConfig = original;
+    }
+    await vi.waitFor(() => expect(sync.snapshot().policy.some((r) => r.seq === 99)).toBe(true));
+  });
+});

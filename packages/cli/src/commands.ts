@@ -412,8 +412,12 @@ export function parsePolicyAdd(argv: string[], now = Date.now()): PolicyAdd {
       'usage: mcprouter policy add <server> (--allow | --deny) [--name <pattern>] …',
     );
   }
-  if (!['tool', 'prompt', 'resource'].includes(values.kind)) {
-    throw new CliError('--kind must be tool, prompt or resource');
+  if (values.kind !== 'tool') {
+    // §11.4: prompt/resource policy is deferred. A rule that is not enforced must not look
+    // like one — refuse it rather than print a sentence the gateway does not honour.
+    throw new CliError(
+      '--kind: only tool rules are enforced in this version (prompts/resources: not yet)',
+    );
   }
   if (!/^[A-Za-z0-9_*.:/-]{1,128}$/.test(values.name)) {
     throw new CliError('--name: letters, digits, _ . : / - and * only (no regex)');
@@ -454,6 +458,11 @@ export function parsePolicyAdd(argv: string[], now = Date.now()): PolicyAdd {
 /** Appends at the end unless --seq is given: first match means position is meaning. */
 export async function addPolicy(pool: pg.Pool, p: PolicyAdd): Promise<string> {
   const [serverId] = await idsOf(pool, 'servers', [p.server]);
+  if (p.subject.kind === 'api_key') {
+    // A typo'd key id would make a break-glass deny that matches nobody and looks active.
+    const k = await pool.query('select 1 from apikey where id = $1', [p.subject.id]);
+    if (k.rowCount === 0) throw new CliError(`no API key with id ${p.subject.id}`);
+  }
   const r = await pool.query<{ id: string }>(
     `insert into policy_rule
        (seq, subject_kind, subject_id, server_id, item_kind, name_pattern, effect, args, note, expires_at)
@@ -494,9 +503,9 @@ export async function listPolicies(pool: pg.Pool): Promise<string[]> {
     return `${rule.id}  #${rule.seq}  ${describeRule(rule)}${flags.length > 0 ? `  [${flags.join(', ')}]` : ''}`;
   });
   for (const s of findShadows(rules)) {
-    lines.push(
-      `WARNING: ${s.shadowed} never matches — ${s.by} above it matches everything it would.`,
-    );
+    const when =
+      s.until === null ? 'never matches' : `cannot match until ${new Date(s.until).toISOString()}`;
+    lines.push(`WARNING: ${s.shadowed} ${when} — ${s.by} above it matches everything it would.`);
   }
   return lines;
 }

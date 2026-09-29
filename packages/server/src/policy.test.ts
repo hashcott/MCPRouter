@@ -277,7 +277,9 @@ describe('findShadows', () => {
   it('a broad unconditional rule above a narrower one shadows it', () => {
     const broad = rule({ effect: 'allow' });
     const narrow = rule({ namePattern: 'write_*' });
-    expect(findShadows([broad, narrow])).toEqual([{ shadowed: narrow.id, by: broad.id }]);
+    expect(findShadows([broad, narrow])).toEqual([
+      { shadowed: narrow.id, by: broad.id, until: null },
+    ]);
   });
 
   it.each([
@@ -290,15 +292,50 @@ describe('findShadows', () => {
       {},
       false,
     ],
-    ['an expiring rule above', { expiresAt: 9_999 }, {}, false],
+    ['an expiring rule above (shadows until it expires)', { expiresAt: 9_999 }, {}, true],
     [
-      'a constrained allow above',
+      'a constrained allow above (its failed constraints DENY, they do not fall through)',
       { effect: 'allow' as const, args: [{ op: 'present' as const, ptr: '/x' }] },
       {},
-      false,
+      true,
     ],
     ['disjoint names', { namePattern: 'read_*' }, { namePattern: 'write_*' }, false],
   ])('%s → %s', (_n, a, b, shadowed) => {
     expect(findShadows([rule(a), rule(b)]).length > 0).toBe(shadowed);
+  });
+});
+
+describe('findShadows agrees with evaluate', () => {
+  it('a constrained allow above a deny: the deny can never fire, and the warning says so', () => {
+    const allow = rule({
+      effect: 'allow',
+      namePattern: 'write_*',
+      args: [{ op: 'pathUnder', ptr: '/path', value: '/srv' }],
+    });
+    const deny = rule({ subjectKind: 'role', subjectId: 'viewer', namePattern: 'write_file' });
+    const viewer = input({ subject: { role: 'viewer', keyId: 'k' }, args: { path: '/srv/x' } });
+    // evaluate: the allow decides — the viewer deny below is dead code …
+    expect(evaluate([allow, deny], viewer).effect).toBe('allow');
+    // … and findShadows reports exactly that.
+    expect(findShadows([allow, deny])).toEqual([{ shadowed: deny.id, by: allow.id, until: null }]);
+  });
+
+  it('an expiring rule above reports when the shadow ends', () => {
+    const a = rule({ expiresAt: Date.UTC(2030, 0, 1) });
+    const b = rule({ namePattern: 'x' });
+    expect(findShadows([a, b])).toEqual([
+      { shadowed: b.id, by: a.id, until: Date.UTC(2030, 0, 1) },
+    ]);
+  });
+});
+
+describe('the enforcement ceiling is written down (§11.4)', () => {
+  it.each(['prompt', 'resource'] as const)('a %s rule says it is not enforced yet', (itemKind) => {
+    expect(describeRule(rule({ itemKind }))).toContain(
+      '[NOT ENFORCED: only tools/call is policy-gated yet]',
+    );
+  });
+  it('a tool rule does not', () => {
+    expect(describeRule(rule())).not.toContain('NOT ENFORCED');
   });
 });

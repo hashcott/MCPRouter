@@ -92,18 +92,26 @@ describe('the seam is structural (§11.4)', () => {
       return /\.ts$/.test(f) && !/\.(test|itest)\.ts$/.test(f) ? [p] : [];
     });
 
-  it('in server and cli code, ONLY gate.ts mints a Decision', () => {
-    const minting = [...sources(join(root, 'server/src')), ...sources(join(root, 'cli/src'))]
-      .filter((p) => readFileSync(p, 'utf8').includes('stampDecision('))
-      .map((p) => relative(root, p));
-    expect(minting).toEqual(['server/src/gate.ts']);
+  const code = () =>
+    [...sources(join(root, 'server/src')), ...sources(join(root, 'cli/src'))].map((p) => ({
+      p: relative(root, p),
+      text: readFileSync(p, 'utf8'),
+    }));
+
+  it('in server and cli code, ONLY gate.ts even mentions stampDecision (an alias import counts)', () => {
+    expect(
+      code()
+        .filter((f) => /\bstampDecision\b/.test(f.text))
+        .map((f) => f.p),
+    ).toEqual(['server/src/gate.ts']);
   });
 
-  it('server and cli code never call the policy-free engine.callTool', () => {
-    const offenders = [
-      ...sources(join(root, 'server/src')),
-      ...sources(join(root, 'cli/src')),
-    ].filter((p) => /\.callTool\(\{/.test(readFileSync(p, 'utf8')));
-    expect(offenders).toEqual([]);
+  it('server and cli code never call the policy-free callTool — by any receiver, any spacing', () => {
+    // `srv.callTool` is the upstream client call inside core; nothing in server/cli has one.
+    expect(
+      code()
+        .filter((f) => /\bcallTool\s*\(/.test(f.text))
+        .map((f) => f.p),
+    ).toEqual([]);
   });
 });

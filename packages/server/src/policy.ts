@@ -262,9 +262,12 @@ export function describeRule(r: CompiledRule): string {
   const what = `${r.itemKind} ${r.namePattern === '*' ? 'items' : `"${r.namePattern}"`} on ${r.serverSlug}`;
   const until = r.expiresAt === null ? '' : `, until ${new Date(r.expiresAt).toISOString()}`;
   const why = r.note === null ? '' : ` — "${r.note}"`;
-  if (r.effect === 'deny') return `${who} is DENIED every ${what}${until}${why}.`;
-  if (r.args.length === 0) return `${who} is ALLOWED every ${what}${until}${why}.`;
-  return `${who} is ALLOWED ${what} only when ${r.args.map((c) => OPS[c.op](c)).join(' and ')}; otherwise DENIED${until}${why}.`;
+  // §11.4 lets prompt/resource policy wait — "with the ceiling written down". Here it is.
+  const ceiling =
+    r.itemKind === 'tool' ? '' : ' [NOT ENFORCED: only tools/call is policy-gated yet]';
+  if (r.effect === 'deny') return `${who} is DENIED every ${what}${until}${why}.${ceiling}`;
+  if (r.args.length === 0) return `${who} is ALLOWED every ${what}${until}${why}.${ceiling}`;
+  return `${who} is ALLOWED ${what} only when ${r.args.map((c) => OPS[c.op](c)).join(' and ')}; otherwise DENIED${until}${why}.${ceiling}`;
 }
 
 function patternCovers(a: string, b: string): boolean {
@@ -279,22 +282,25 @@ function patternCovers(a: string, b: string): boolean {
  * narrower one silently disables it — above all an `allow` sitting over the rule that
  * carried the constraints. O(n²) over a few hundred rows.
  */
-export function findShadows(rules: readonly CompiledRule[]): { shadowed: string; by: string }[] {
-  const out: { shadowed: string; by: string }[] = [];
+export function findShadows(
+  rules: readonly CompiledRule[],
+): { shadowed: string; by: string; until: number | null }[] {
+  const out: { shadowed: string; by: string; until: number | null }[] = [];
   rules.forEach((b, j) => {
+    // ANY rule whose selector covers b ends the scan before b — including a constrained
+    // allow (its failed constraints deny, they do not fall through). An expiring one
+    // shadows b until it expires.
     const a = rules
       .slice(0, j)
       .find(
         (x) =>
-          x.args.length === 0 &&
-          x.expiresAt === null &&
           x.serverId === b.serverId &&
           x.itemKind === b.itemKind &&
           (x.subjectKind === 'any' ||
             (x.subjectKind === b.subjectKind && x.subjectId === b.subjectId)) &&
           patternCovers(x.namePattern, b.namePattern),
       );
-    if (a !== undefined) out.push({ shadowed: b.id, by: a.id });
+    if (a !== undefined) out.push({ shadowed: b.id, by: a.id, until: a.expiresAt });
   });
   return out;
 }

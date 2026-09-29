@@ -174,6 +174,8 @@ describe('parsePolicyAdd', () => {
     ['an unknown role', ['fs', '--deny', '--role', 'root']],
     ['a regex name', ['fs', '--deny', '--name', 'write_(a|b)']],
     ['a bad kind', ['fs', '--deny', '--kind', 'widget']],
+    ['a prompt rule (not enforced yet)', ['fs', '--deny', '--kind', 'prompt']],
+    ['a resource rule (not enforced yet)', ['fs', '--deny', '--kind', 'resource']],
     ['a bad expiry', ['fs', '--deny', '--expires', 'soon']],
     ['a negative seq', ['fs', '--deny', '--seq', '-1']],
     ['a note over 200 characters', ['fs', '--deny', '--note', 'x'.repeat(201)]],
