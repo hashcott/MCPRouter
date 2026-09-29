@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { CliError, parseGroupAdd, parseServerAdd, secretLines } from './commands.js';
+import {
+  CliError,
+  parseArgSpec,
+  parseGroupAdd,
+  parsePolicyAdd,
+  parseServerAdd,
+  secretLines,
+} from './commands.js';
 
 describe('secretLines', () => {
   it('prints an AUTH_SECRET and a keyring line, fresh each time', () => {
@@ -97,4 +104,78 @@ describe('parseGroupAdd', () => {
     ['an empty tool list', ['g', '--server', 'fs=']],
     ['an unknown flag', ['g', '--alias', 'x']],
   ])('rejects %s', (_n, argv) => expect(() => parseGroupAdd(argv)).toThrow(CliError));
+});
+
+describe('parseArgSpec — op:/pointer[=value]', () => {
+  it.each([
+    ['present:/path', { op: 'present', ptr: '/path' }],
+    ['absent:/opts/force', { op: 'absent', ptr: '/opts/force' }],
+    ['equals:/mode=ro', { op: 'equals', ptr: '/mode', value: 'ro' }],
+    ['oneOf:/mode=ro,rw', { op: 'oneOf', ptr: '/mode', values: ['ro', 'rw'] }],
+    ['prefix:/url=https://', { op: 'prefix', ptr: '/url', value: 'https://' }],
+    ['pathUnder:/path=/srv/data', { op: 'pathUnder', ptr: '/path', value: '/srv/data' }],
+    ['maxLen:/q=100', { op: 'maxLen', ptr: '/q', n: 100 }],
+    ['equals:/k=a=b', { op: 'equals', ptr: '/k', value: 'a=b' }],
+  ])('%s', (spec, want) => expect(parseArgSpec(spec)).toEqual(want));
+
+  it.each(['regex:/p=.*', 'present', 'maxLen:/q=lots', 'equals:not-a-pointer=x', 'oneOf:/m='])(
+    'rejects %s',
+    (spec) => expect(() => parseArgSpec(spec)).toThrow(CliError),
+  );
+});
+
+describe('parsePolicyAdd', () => {
+  const now = Date.UTC(2026, 0, 1);
+  it('a role-scoped deny with a note that expires', () => {
+    expect(
+      parsePolicyAdd(
+        [
+          'fs',
+          '--deny',
+          '--name',
+          'write_*',
+          '--role',
+          'viewer',
+          '--note',
+          'read only',
+          '--expires',
+          '2h',
+        ],
+        now,
+      ),
+    ).toEqual({
+      server: 'fs',
+      effect: 'deny',
+      kind: 'tool',
+      pattern: 'write_*',
+      subject: { kind: 'role', id: 'viewer' },
+      args: [],
+      note: 'read only',
+      expiresAt: new Date(now + 2 * 3_600_000),
+      seq: null,
+    });
+  });
+
+  it('a key-scoped constrained allow at an explicit position', () => {
+    const p = parsePolicyAdd(
+      ['fs', '--allow', '--key', 'k1', '--arg', 'pathUnder:/path=/srv', '--seq', '5'],
+      now,
+    );
+    expect(p).toMatchObject({ effect: 'allow', subject: { kind: 'api_key', id: 'k1' }, seq: 5 });
+    expect(p.args).toEqual([{ op: 'pathUnder', ptr: '/path', value: '/srv' }]);
+  });
+
+  it.each([
+    ['neither --allow nor --deny', ['fs']],
+    ['both', ['fs', '--allow', '--deny']],
+    ['no server', ['--deny']],
+    ['constraints on a deny', ['fs', '--deny', '--arg', 'present:/x']],
+    ['role and key together', ['fs', '--deny', '--role', 'viewer', '--key', 'k']],
+    ['an unknown role', ['fs', '--deny', '--role', 'root']],
+    ['a regex name', ['fs', '--deny', '--name', 'write_(a|b)']],
+    ['a bad kind', ['fs', '--deny', '--kind', 'widget']],
+    ['a bad expiry', ['fs', '--deny', '--expires', 'soon']],
+    ['a negative seq', ['fs', '--deny', '--seq', '-1']],
+    ['a note over 200 characters', ['fs', '--deny', '--note', 'x'.repeat(201)]],
+  ])('rejects %s', (_n, argv) => expect(() => parsePolicyAdd(argv, now)).toThrow(CliError));
 });

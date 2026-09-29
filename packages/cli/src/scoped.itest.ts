@@ -9,7 +9,6 @@ import {
   createAuth,
   createRegistry,
   parseConfig,
-  resolveTarget,
   startServerSync,
   type ServerSync,
 } from '@mcprouter/server';
@@ -81,9 +80,9 @@ beforeAll(async () => {
     registry: createRegistry(),
     readiness: { migrationsApplied: true, routesMounted: true },
     mcp: {
-      authenticate: (h) => authenticateKey(auth, h),
+      authenticate: (h) => authenticateKey(auth, db, h),
       engine,
-      resolve: (t) => resolveTarget(sync.snapshot(), t),
+      snapshot: () => sync.snapshot(),
       timeoutMs: 10_000,
       maxInflight: 8,
       resultMaxBytes: 1_048_576,

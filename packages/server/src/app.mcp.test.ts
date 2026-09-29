@@ -9,7 +9,7 @@ import { API_KEY_ROUTES, createApp, type AuditRow } from './app.js';
 import type { KeyAuth } from './auth.js';
 import { parseConfig } from './config.js';
 import { createRegistry } from './metrics.js';
-import { resolveTarget, type Snapshot } from './scope.js';
+import type { Snapshot } from './scope.js';
 
 const FS = '00000000-0000-4000-8000-0000000000f5';
 const TEAM = '00000000-0000-4000-8000-0000000000e1';
@@ -26,17 +26,25 @@ const snap: Snapshot = {
       },
     ],
   ]),
+  policy: [],
 };
 const keys: Record<string, KeyAuth> = {
-  'Bearer good': { principal: { id: 'u1', isAdmin: false }, keyId: 'k1', grant: { kind: 'all' } },
+  'Bearer good': {
+    principal: { id: 'u1', isAdmin: false },
+    keyId: 'k1',
+    role: 'operator',
+    grant: { kind: 'all' },
+  },
   'Bearer other-team': {
     principal: { id: 'u3', isAdmin: false },
     keyId: 'k3',
+    role: 'operator',
     grant: { kind: 'groups', ids: ['00000000-0000-4000-8000-0000000000e2'] },
   },
   'Bearer team': {
     principal: { id: 'u2', isAdmin: false },
     keyId: 'k2',
+    role: 'operator',
     grant: { kind: 'groups', ids: [TEAM] },
   },
 };
@@ -85,7 +93,7 @@ beforeAll(async () => {
     mcp: {
       authenticate: async (h) => keys[h ?? ''] ?? null,
       engine,
-      resolve: (t) => resolveTarget(snap, t),
+      snapshot: () => snap,
       timeoutMs: 5_000,
       maxInflight: 1,
       resultMaxBytes: 1_048_576,

@@ -163,3 +163,33 @@ it('every config the poller applies carries an integrity setting (R11)', async (
   expect(seen.length).toBeGreaterThan(0);
   expect(seen.every((m) => m === 'enforce')).toBe(true);
 });
+
+describe('policy in the snapshot', () => {
+  it('rules load in seq order with their server slug; a broken row is logged and enforced as deny', async () => {
+    const fsId = (await pool.query(`select id from servers where slug = 'fs'`)).rows[0].id;
+    await pool.query(
+      `insert into policy_rule (seq, server_id, effect, name_pattern, note) values (20, $1, 'deny', 'rm*', 'no deletes')`,
+      [fsId],
+    );
+    // Valid for Postgres (an array), invalid for the zod contract (unknown op).
+    await pool.query(
+      `insert into policy_rule (seq, server_id, effect, args) values (10, $1, 'allow', '[{"op":"regex","ptr":"/p","value":".*"}]')`,
+      [fsId],
+    );
+    await vi.waitFor(() => expect(sync.snapshot().policy).toHaveLength(2));
+    const [first, second] = sync.snapshot().policy;
+    expect(first).toMatchObject({ seq: 10, effect: 'deny', args: [], serverSlug: 'fs' });
+    expect(second).toMatchObject({
+      seq: 20,
+      effect: 'deny',
+      namePattern: 'rm*',
+      note: 'no deletes',
+    });
+    expect(errors).toContainEqual(expect.objectContaining({ evt: 'policy.rule_invalid' }));
+  });
+
+  it('lastOkAt advances on every successful poll, even when nothing changed', async () => {
+    const before = sync.lastOkAt() ?? 0;
+    await vi.waitFor(() => expect(sync.lastOkAt() ?? 0).toBeGreaterThan(before));
+  });
+});

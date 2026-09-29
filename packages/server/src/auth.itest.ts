@@ -48,11 +48,11 @@ describe('authenticateKey', () => {
     const id = await user('operator');
     const key = await mint(id, KEY_GRANT_ALL);
     expect(key.startsWith('mcpr_')).toBe(true);
-    expect((await authenticateKey(auth, `Bearer ${key}`))?.principal).toEqual({
+    expect((await authenticateKey(auth, createDb(pool), `Bearer ${key}`))?.principal).toEqual({
       id,
       isAdmin: false,
     });
-    expect((await authenticateKey(auth, `bearer ${key}`))?.principal).toEqual({
+    expect((await authenticateKey(auth, createDb(pool), `bearer ${key}`))?.principal).toEqual({
       id,
       isAdmin: false,
     });
@@ -60,7 +60,9 @@ describe('authenticateKey', () => {
 
   it("an admin's key is not admin", async () => {
     const key = await mint(await user('admin'), KEY_GRANT_ALL);
-    expect((await authenticateKey(auth, `Bearer ${key}`))?.principal.isAdmin).toBe(false);
+    expect((await authenticateKey(auth, createDb(pool), `Bearer ${key}`))?.principal.isAdmin).toBe(
+      false,
+    );
   });
 
   it.each([
@@ -70,13 +72,15 @@ describe('authenticateKey', () => {
     ['an unknown key', 'Bearer mcpr_doesnotexist'],
     ['a bare key', 'mcpr_abc'],
   ])('rejects %s', async (_n, header) => {
-    expect(await authenticateKey(auth, header)).toBeNull();
+    expect(await authenticateKey(auth, createDb(pool), header)).toBeNull();
   });
 
   it('rejects a key minted without the P1 grant', async () => {
     const id = await user('operator');
-    expect(await authenticateKey(auth, `Bearer ${await mint(id)}`)).toBeNull();
-    expect(await authenticateKey(auth, `Bearer ${await mint(id, { mcp: ['read'] })}`)).toBeNull();
+    expect(await authenticateKey(auth, createDb(pool), `Bearer ${await mint(id)}`)).toBeNull();
+    expect(
+      await authenticateKey(auth, createDb(pool), `Bearer ${await mint(id, { mcp: ['read'] })}`),
+    ).toBeNull();
   });
 
   it.each([
@@ -91,30 +95,45 @@ describe('authenticateKey', () => {
       'update apikey set permissions = $1 where key = (select key from apikey order by created_at desc limit 1)',
       [raw],
     );
-    expect(await authenticateKey(auth, `Bearer ${key}`)).toBeNull();
+    expect(await authenticateKey(auth, createDb(pool), `Bearer ${key}`)).toBeNull();
   });
 
   it('rejects a disabled or expired key', async () => {
     const id = await user('operator');
     const off = await mint(id, KEY_GRANT_ALL);
     await pool.query(`update apikey set enabled = false where start = $1`, [off.slice(0, 6)]);
-    expect(await authenticateKey(auth, `Bearer ${off}`)).toBeNull();
+    expect(await authenticateKey(auth, createDb(pool), `Bearer ${off}`)).toBeNull();
 
     const old = await mint(id, KEY_GRANT_ALL);
     await pool.query(
       `update apikey set expires_at = now() - interval '1 minute' where start = $1`,
       [old.slice(0, 6)],
     );
-    expect(await authenticateKey(auth, `Bearer ${old}`)).toBeNull();
+    expect(await authenticateKey(auth, createDb(pool), `Bearer ${old}`)).toBeNull();
   });
 
   it('carries the key id and a scoped grant', async () => {
     const id = await user('operator');
     const g = '00000000-0000-4000-8000-0000000000aa';
     const key = await mint(id, { groups: [g] });
-    const a = await authenticateKey(auth, `Bearer ${key}`);
+    const a = await authenticateKey(auth, createDb(pool), `Bearer ${key}`);
     expect(a?.grant).toEqual({ kind: 'groups', ids: [g] });
     expect(a?.keyId).toMatch(/.+/);
     expect(a?.principal).toEqual({ id, isAdmin: false });
+  });
+
+  it("carries the OWNER's role, read at every authenticate — a demotion reaches keys minted before it", async () => {
+    const id = await user('operator');
+    const key = await mint(id, KEY_GRANT_ALL);
+    expect((await authenticateKey(auth, createDb(pool), `Bearer ${key}`))?.role).toBe('operator');
+    await pool.query(`update "user" set role = 'viewer' where id = $1`, [id]);
+    expect((await authenticateKey(auth, createDb(pool), `Bearer ${key}`))?.role).toBe('viewer');
+  });
+
+  it('an owner whose role this build does not know is refused (fail closed)', async () => {
+    const id = await user('operator');
+    const key = await mint(id, KEY_GRANT_ALL);
+    await pool.query(`update "user" set role = 'superuser' where id = $1`, [id]);
+    expect(await authenticateKey(auth, createDb(pool), `Bearer ${key}`)).toBeNull();
   });
 });

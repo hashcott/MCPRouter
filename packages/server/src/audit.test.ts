@@ -100,3 +100,47 @@ describe('AuditWriter at shutdown', () => {
     expect(spilled).toEqual([row('a')]); // exactly once
   });
 });
+
+describe('AuditWriter coalesces identical policy denies (§11.8)', () => {
+  const deny = (item: string, principalId = 'u1'): AuditRow => ({
+    ...row(item),
+    evt: 'policy.deny',
+    outcome: 'denied',
+    error: 'policy:r1',
+    principalId,
+  });
+
+  it('one row per (principal, rule, server, item) per window, with a count', () => {
+    const { log, spilled } = capture();
+    const w = new AuditWriter({ db: deadDb(), log, batch: 1_000 });
+    for (let i = 0; i < 5; i += 1) w.push(deny('write'));
+    w.push(deny('write', 'u2'));
+    w.push(deny('delete'));
+    w.push(row('ordinary'));
+    w.push(row('ordinary'));
+    w.spillAll();
+    expect(
+      spilled.map((r) => [
+        (r as AuditRow).item,
+        (r as AuditRow).principalId,
+        (r as AuditRow).count,
+      ]),
+    ).toEqual([
+      ['write', 'u1', 5],
+      ['write', 'u2', 1],
+      ['delete', 'u1', 1],
+      ['ordinary', 'u1', undefined],
+      ['ordinary', 'u1', undefined],
+    ]);
+  });
+
+  it('a deny loop cannot fill the queue and push other rows out', () => {
+    const { log, spilled } = capture();
+    const w = new AuditWriter({ db: deadDb(), log, cap: 3, batch: 1_000 });
+    for (let i = 0; i < 10_000; i += 1) w.push(deny('write'));
+    w.push(row('a'));
+    w.push(row('b'));
+    w.spillAll();
+    expect(spilled.map((r) => (r as AuditRow).item)).toEqual(['write', 'a', 'b']);
+  });
+});

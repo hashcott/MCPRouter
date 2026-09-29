@@ -3,6 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Engine, ToolUnavailableError, type Principal, type ResolvedScope } from '@mcprouter/core';
 import { FakeUpstream, fakeFactory } from '../../../core/test/fake-upstream.js';
+import { ALLOW_ALL_GATE } from '../gate.js';
 import { capResult, handleMcp, type CallRecord, type McpCall } from './legacy.js';
 
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -57,6 +58,7 @@ const call = (timeoutMs = 5_000): McpCall => ({
   principal,
   timeoutMs,
   resultMaxBytes: 1_048_576,
+  gate: ALLOW_ALL_GATE,
   audit: (r) => records.push(r),
 });
 const handleMcpCap = (resultMaxBytes: number): McpCall => ({ ...call(), resultMaxBytes });
@@ -223,6 +225,7 @@ describe('races and odd inputs (stub engine)', () => {
             principal,
             timeoutMs: 5_000,
             resultMaxBytes: 1_048_576,
+            gate: ALLOW_ALL_GATE,
             audit: (r) => records.push(r),
           }),
       }),
@@ -385,6 +388,45 @@ describe('integrity blocks on prompts and resources are recorded too', () => {
     expect(records.map((r) => [r.item, r.outcome, r.reason])).toEqual([
       ['fs__p', 'not_found', 'changed'],
       ['mem://r', 'not_found', 'changed'],
+    ]);
+  });
+});
+
+describe('policy deny (stub gate)', () => {
+  it('the caller reads the note as an error result; nothing reaches the upstream; the record says denied', async () => {
+    records.length = 0;
+    let called = false;
+    const guarded: McpCall = {
+      ...call(),
+      engine: {
+        resolve: () => ({ sel: scope.servers[0], bare: 'echo', server: 'fs' }),
+        callResolved: () => {
+          called = true;
+          return Promise.resolve({ content: [] });
+        },
+      } as unknown as Engine,
+      gate: () => ({
+        ok: false,
+        ruleId: 'r9',
+        note: 'writes are frozen today',
+        reason: { k: 'selector' },
+      }),
+    };
+    const c = new Client({ name: 't', version: '0' });
+    await c.connect(
+      new StreamableHTTPClientTransport(new URL('http://hub.test/mcp'), {
+        fetch: (url, init) => handleMcp(new Request(url, init), guarded),
+      }),
+    );
+    const res = await c.callTool({ name: 'fs__echo', arguments: { text: 'x' } });
+    await c.close();
+    expect(res).toMatchObject({
+      isError: true,
+      content: [{ type: 'text', text: 'Denied by policy: writes are frozen today' }],
+    });
+    expect(called).toBe(false);
+    expect(records).toEqual([
+      expect.objectContaining({ outcome: 'denied', error: 'policy:r9', item: 'echo' }),
     ]);
   });
 });
