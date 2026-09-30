@@ -6,7 +6,9 @@ import { FakeUpstream, fakeFactory } from '../../core/test/fake-upstream.js';
 import { createApp, type AuditRow } from './app.js';
 import { authenticateKey, createAuth } from './auth.js';
 import { parseConfig } from './config.js';
+import { createHash } from 'node:crypto';
 import { ensureBootstrap } from './console/bootstrap.js';
+import * as ops from './console/ops.js';
 import { createRegistry } from './metrics.js';
 import { startServerSync, type ServerSync } from './servers-sync.js';
 
@@ -34,11 +36,13 @@ beforeAll(async () => {
   const silent = pino({ level: 'silent' });
   await runMigrations(pool, silent);
   const db = createDb(pool);
+  // Tests sign in many people quickly; each gets its own (trusted-in-test) client IP bucket.
   const auth = createAuth({
     db,
     secret: config.authSecret,
     baseURL: config.publicUrl.href,
     log: silent,
+    clientIpHeader: 'x-test-ip',
   });
 
   // Capture the one-time token the boot log prints.
@@ -98,11 +102,18 @@ afterAll(async () => {
   await pg?.stop();
 });
 
-type Opts = { cookie?: string; bearer?: string; origin?: string | null; contentType?: string };
+type Opts = {
+  cookie?: string;
+  bearer?: string;
+  origin?: string | null;
+  contentType?: string;
+  ip?: string;
+};
 async function api(method: string, path: string, body?: unknown, o: Opts = {}) {
   const headers: Record<string, string> = {};
   if (o.cookie !== undefined) headers['cookie'] = o.cookie;
   if (o.bearer !== undefined) headers['authorization'] = `Bearer ${o.bearer}`;
+  if (o.ip !== undefined) headers['x-test-ip'] = o.ip;
   if (o.origin !== null) headers['origin'] = o.origin ?? ORIGIN;
   if (body !== undefined) headers['content-type'] = o.contentType ?? 'application/json';
   const res = await app.request(path, {
@@ -124,8 +135,14 @@ const cookieOf = (res: Response): string =>
     .getSetCookie()
     .map((c) => c.split(';')[0])
     .join('; ');
+let signIns = 0;
 async function signIn(email: string, password: string): Promise<string> {
-  const r = await api('POST', '/api/auth/sign-in/email', { email, password });
+  const r = await api(
+    'POST',
+    '/api/auth/sign-in/email',
+    { email, password },
+    { ip: `203.0.113.${(signIns += 1)}` },
+  );
   expect(r.status).toBe(200);
   return cookieOf(r.res);
 }
@@ -482,5 +499,112 @@ describe('policy over the API', () => {
         )
       ).status,
     ).toBe(400);
+  });
+});
+
+const tokenRow = (t: string) =>
+  pool.query(
+    `insert into system_setting (key, value) values ('bootstrap_admin', $1)
+     on conflict (key) do update set value = excluded.value`,
+    [JSON.stringify({ hash: createHash('sha256').update(t).digest('hex') })],
+  );
+const hasTokenRow = async () =>
+  (await pool.query(`select 1 from system_setting where key = 'bootstrap_admin'`)).rowCount === 1;
+
+describe('review fixes — the bootstrap token only works on an EMPTY install', () => {
+  it('a token still present after users exist (no reboot yet) is refused — and retired', async () => {
+    await tokenRow('leaked-from-the-log');
+    const r = await api('POST', '/api/bootstrap', {
+      token: 'leaked-from-the-log',
+      email: 'thief@x.io',
+      name: 'T',
+      password: 'correct horse battery',
+    });
+    expect(r.status).toBe(403);
+    expect(await hasTokenRow()).toBe(false);
+    expect((await pool.query(`select 1 from "user" where email = 'thief@x.io'`)).rowCount).toBe(0);
+  });
+
+  it('creating any user (CLI or console) retires the token in the same transaction', async () => {
+    await tokenRow('another');
+    await ops.addUser(pool, { email: 'cli@x.io', name: 'C', role: 'viewer' });
+    expect(await hasTokenRow()).toBe(false);
+  });
+
+  it('an oversized body is refused before it is parsed', async () => {
+    const r = await api('POST', '/api/bootstrap', { token: 'x'.repeat(100_000) });
+    expect(r.status).toBe(413);
+  });
+});
+
+describe('review fixes — ownership, sessions, errors, policy', () => {
+  let op2 = '';
+  let op3 = '';
+
+  it('two operators each see and revoke only their own keys', async () => {
+    for (const email of ['op2@x.io', 'op3@x.io']) {
+      await api(
+        'POST',
+        '/api/users',
+        { email, name: email, role: 'operator', password: 'a long enough pw' },
+        { cookie: admin },
+      );
+    }
+    op2 = await signIn('op2@x.io', 'a long enough pw');
+    op3 = await signIn('op3@x.io', 'a long enough pw');
+    const mine = (await api('POST', '/api/keys', { name: 'op2-key' }, { cookie: op2 })).json as {
+      id: string;
+    };
+    await api('POST', '/api/keys', { name: 'op3-key' }, { cookie: op3 });
+    const listed = (await api('GET', '/api/keys', undefined, { cookie: op3 })).json as {
+      name: string;
+    }[];
+    expect(listed.map((k) => k.name)).toEqual(['op3-key']);
+    expect((await api('DELETE', `/api/keys/${mine.id}`, undefined, { cookie: op3 })).status).toBe(
+      404,
+    );
+    expect((await api('DELETE', `/api/keys/${mine.id}`, undefined, { cookie: op2 })).status).toBe(
+      200,
+    );
+  });
+
+  it('a demotion reaches the session already open; deleting a user ends their sessions', async () => {
+    const id = (await pool.query(`select id from "user" where email = 'op3@x.io'`)).rows[0].id;
+    expect(
+      (await api('POST', '/api/groups', { slug: 'before', members: [] }, { cookie: op3 })).status,
+    ).toBe(201);
+    await api('PATCH', `/api/users/${id}`, { role: 'viewer' }, { cookie: admin });
+    expect(
+      (await api('POST', '/api/groups', { slug: 'after', members: [] }, { cookie: op3 })).status,
+    ).toBe(403);
+    await api('DELETE', `/api/users/${id}`, undefined, { cookie: admin });
+    expect((await api('GET', '/api/me', undefined, { cookie: op3 })).status).toBe(401);
+  });
+
+  it('constraint errors wrapped by the driver still map to 409/404, never 500', async () => {
+    const dup = await api(
+      'POST',
+      '/api/servers',
+      { slug: 'fs', config: { type: 'stdio', command: 'x' } },
+      { cookie: op2 },
+    );
+    expect(dup.status).toBe(409);
+    expect(
+      (await api('DELETE', '/api/policy/not-a-uuid', undefined, { cookie: admin })).status,
+    ).toBe(404);
+  });
+
+  it('an operator cannot delete a server that admin policy targets; an admin can', async () => {
+    // The policy tests above left a deny rule on fs.
+    const r = await api('DELETE', '/api/servers/fs', undefined, { cookie: op2 });
+    expect(r.status).toBe(409);
+    expect(
+      (
+        await pool.query(
+          `select 1 from policy_rule p join servers s on s.id = p.server_id where s.slug = 'fs'`,
+        )
+      ).rowCount,
+    ).toBe(1);
+    expect((await api('DELETE', '/api/servers/fs', undefined, { cookie: admin })).status).toBe(200);
   });
 });

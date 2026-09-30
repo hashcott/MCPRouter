@@ -123,4 +123,12 @@ describe('parseConfig', () => {
     const r = parseConfig(valid);
     expect(r.ok && r.config.resultMaxBytes).toBe(1_048_576);
   });
+
+  it('trusts no client-IP header unless told which proxies or header to believe', () => {
+    const d = parseConfig(valid);
+    expect(d.ok && [d.config.trustedProxies, d.config.clientIpHeader]).toEqual([[], undefined]);
+    const t = parseConfig({ ...valid, MCPR_TRUSTED_PROXIES: '10.0.0.0/8, 192.0.2.1' });
+    expect(t.ok && t.config.trustedProxies).toEqual(['10.0.0.0/8', '192.0.2.1']);
+    expect(parseConfig({ ...valid, MCPR_CLIENT_IP_HEADER: 'Bad Header' }).ok).toBe(false);
+  });
 });

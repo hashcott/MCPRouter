@@ -25,7 +25,20 @@ const webRoot =
 const pool = createPool(config.databaseUrl);
 const db = createDb(pool);
 const engine = new Engine({ logger: log });
-const auth = createAuth({ db, secret: config.authSecret, baseURL: config.publicUrl.href, log });
+const auth = createAuth({
+  db,
+  secret: config.authSecret,
+  baseURL: config.publicUrl.href,
+  log,
+  trustedProxies: config.trustedProxies,
+  clientIpHeader: config.clientIpHeader,
+});
+if (config.trustedProxies.length === 0 && config.clientIpHeader === undefined) {
+  log.warn(
+    { evt: 'boot.no_client_ip' },
+    'no MCPR_TRUSTED_PROXIES / MCPR_CLIENT_IP_HEADER: sign-in is rate-limited in one shared bucket',
+  );
+}
 const truth = startTruthWriter({ db, engine, log, newItems: config.newItems });
 const audit = new AuditWriter({ db, log });
 audit.start();

@@ -16,6 +16,13 @@ import {
  * write, so the two surfaces cannot drift. They throw OpError: the console maps it to
  * an HTTP status, the CLI to a one-line message.
  */
+/** drizzle 0.45 wraps driver errors; the Postgres SQLSTATE lives on `.cause`. */
+export function pgCode(err: unknown): string | undefined {
+  const e = err as { code?: unknown; cause?: { code?: unknown } };
+  const code = typeof e.code === 'string' ? e.code : e.cause?.code;
+  return typeof code === 'string' ? code : undefined;
+}
+
 export class OpError extends Error {
   override name = 'OpError';
   constructor(
@@ -43,6 +50,9 @@ export async function addUser(
   const client = await pool.connect();
   try {
     await client.query('begin');
+    // Same lock as the bootstrap claim; any user at all retires the one-time token.
+    await client.query('lock table "user" in share row exclusive mode');
+    await client.query(`delete from system_setting where key = 'bootstrap_admin'`);
     await client.query('insert into "user" (id, name, email, role) values ($1, $2, $3, $4)', [
       id,
       input.name,
@@ -60,7 +70,7 @@ export async function addUser(
     return id;
   } catch (err) {
     await client.query('rollback');
-    if ((err as { code?: string }).code === '23505') {
+    if (pgCode(err) === '23505') {
       throw new OpError(409, `a user with email ${input.email} already exists`);
     }
     throw err;

@@ -61,6 +61,23 @@ const Schema = z.object({
   MCP_MAX_INFLIGHT: z.coerce.number().int().min(1).default(8),
   MCPR_INTEGRITY: z.enum(['enforce', 'observe', 'off']).default('enforce'),
   MCPR_NEW_ITEMS: z.enum(['quarantine', 'approve']).default('quarantine'),
+  /** Comma-separated IPs/CIDRs of the reverse proxies whose X-Forwarded-For we believe. */
+  MCPR_TRUSTED_PROXIES: z
+    .string()
+    .optional()
+    .transform((v) =>
+      v === undefined
+        ? []
+        : v
+            .split(',')
+            .map((x) => x.trim())
+            .filter((x) => x.length > 0),
+    ),
+  /** Or: one header a trusted edge sets to the client IP (e.g. cf-connecting-ip). */
+  MCPR_CLIENT_IP_HEADER: z
+    .string()
+    .regex(/^[a-z0-9-]+$/)
+    .optional(),
   MCPR_RESULT_MAX_BYTES: z.coerce.number().int().min(1_024).default(1_048_576),
 });
 
@@ -79,6 +96,8 @@ export interface Config {
   readonly integrity: 'enforce' | 'observe' | 'off';
   readonly newItems: 'quarantine' | 'approve';
   readonly resultMaxBytes: number;
+  readonly trustedProxies: readonly string[];
+  readonly clientIpHeader: string | undefined;
   toJSON(): Record<string, unknown>;
 }
 
@@ -114,6 +133,8 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
     integrity: v.MCPR_INTEGRITY,
     newItems: v.MCPR_NEW_ITEMS,
     resultMaxBytes: v.MCPR_RESULT_MAX_BYTES,
+    trustedProxies: v.MCPR_TRUSTED_PROXIES,
+    clientIpHeader: v.MCPR_CLIENT_IP_HEADER,
     toJSON() {
       return {
         databaseUrl: '[redacted]',
@@ -130,6 +151,8 @@ export function parseConfig(raw: Record<string, string | undefined>): ParseResul
         integrity: this.integrity,
         newItems: this.newItems,
         resultMaxBytes: this.resultMaxBytes,
+        trustedProxies: this.trustedProxies,
+        clientIpHeader: this.clientIpHeader,
       };
     },
   };

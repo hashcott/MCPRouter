@@ -2,7 +2,8 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { Logger } from 'pino';
 import type pg from 'pg';
 
-const KEY = 'bootstrap_admin';
+export const BOOTSTRAP_KEY = 'bootstrap_admin';
+const KEY = BOOTSTRAP_KEY;
 const sha = (s: string): string => createHash('sha256').update(s).digest('hex');
 
 /**
@@ -38,11 +39,31 @@ export async function ensureBootstrap(pool: pg.Pool, log: Logger): Promise<void>
  */
 export async function claimBootstrap(
   pool: pg.Pool,
-  input: { token: string; email: string; name: string; passwordHash: string },
+  input: { token: string; email: string; name: string; password: string },
+  hash: (password: string) => Promise<string>,
 ): Promise<string | null> {
+  // Cheap refusal first: an unauthenticated endpoint must not run scrypt for every junk
+  // token (CPU amplification). The locked re-check below is what actually decides.
+  const known = await pool.query(
+    `select 1 from system_setting where key = $1 and value->>'hash' = $2`,
+    [KEY, sha(input.token)],
+  );
+  if (known.rowCount !== 1) return null;
+  const passwordHash = await hash(input.password);
+
   const client = await pool.connect();
   try {
     await client.query('begin');
+    // The token is only good on an EMPTY install. Every user-creating path takes this
+    // lock too (ops.addUser clears the token in its transaction), so a CLI-created
+    // admin and a claim cannot interleave into two admins.
+    await client.query('lock table "user" in share row exclusive mode');
+    const users = await client.query<{ n: number }>('select count(*)::int as n from "user"');
+    if ((users.rows[0]?.n ?? 0) > 0) {
+      await client.query('delete from system_setting where key = $1', [KEY]);
+      await client.query('commit');
+      return null;
+    }
     const claimed = await client.query(
       `delete from system_setting where key = $1 and value->>'hash' = $2 returning key`,
       [KEY, sha(input.token)],
@@ -59,7 +80,7 @@ export async function claimBootstrap(
     await client.query(
       `insert into account (id, account_id, provider_id, user_id, password, created_at, updated_at)
        values ($1, $2, 'credential', $2, $3, now(), now())`,
-      [randomUUID(), id, input.passwordHash],
+      [randomUUID(), id, passwordHash],
     );
     await client.query('commit');
     return id;

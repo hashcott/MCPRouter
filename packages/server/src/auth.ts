@@ -28,10 +28,21 @@ export type KeyAuth = {
   role: Role;
 };
 
-export type AuthDeps = { db: Db; secret: string; baseURL: string; log: Logger };
+export type AuthDeps = {
+  db: Db;
+  secret: string;
+  baseURL: string;
+  log: Logger;
+  /**
+   * Who may tell us the client IP. With neither set, NO header is trusted: sign-in is
+   * rate-limited in one shared bucket — a forged X-Forwarded-For buys no extra guesses.
+   */
+  trustedProxies?: readonly string[] | undefined;
+  clientIpHeader?: string | undefined;
+};
 
 /** better-auth is configuration, not code (§13 P1). We store, hash and look up nothing ourselves. */
-export function createAuth({ db, secret, baseURL, log }: AuthDeps) {
+export function createAuth({ db, secret, baseURL, log, trustedProxies, clientIpHeader }: AuthDeps) {
   return betterAuth({
     secret,
     baseURL,
@@ -40,6 +51,18 @@ export function createAuth({ db, secret, baseURL, log }: AuthDeps) {
     // Humans sign in to the console. Sign-UP stays closed: people are created by an admin
     // (or claim the one bootstrap token on a fresh install), never by a stranger (P1c R2).
     emailAndPassword: { enabled: true, disableSignUp: true, minPasswordLength: 12 },
+    // Always on (better-auth's default is production-only). Sign-in: 3 tries / 10 s per IP.
+    // ponytail: in-memory per replica; move to storage 'database' when running several.
+    rateLimit: { enabled: true },
+    advanced: {
+      ipAddress:
+        trustedProxies !== undefined && trustedProxies.length > 0
+          ? { trustedProxies: [...trustedProxies] }
+          : clientIpHeader !== undefined
+            ? { ipAddressHeaders: [clientIpHeader] }
+            : // A header nobody sends: no client IP is believed from the request.
+              { ipAddressHeaders: ['x-mcprouter-untrusted'] },
+    },
     user: {
       additionalFields: {
         // input:false — otherwise a sign-up payload could set role:'admin' (§5.3).

@@ -1,4 +1,5 @@
 import type { Context, Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import type pg from 'pg';
 import { z } from 'zod';
 import {
@@ -65,6 +66,12 @@ async function body<T extends z.ZodType>(c: Context, schema: T): Promise<z.infer
 export function mountConsole(app: Hono, d: ConsoleDeps): void {
   const hash = passwordHasher(d.auth);
 
+  // No console body is large; an unauthenticated one (bootstrap, sign-in) must not buffer GBs.
+  app.use(
+    '/api/*',
+    bodyLimit({ maxSize: 64 * 1024, onError: (c) => c.json({ error: 'payload_too_large' }, 413) }),
+  );
+
   // CSRF, for every state-changing console request (better-auth guards its own /api/auth/*).
   app.use('/api/*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
@@ -116,10 +123,10 @@ export function mountConsole(app: Hono, d: ConsoleDeps): void {
         if (err instanceof HttpError)
           return c.json({ error: err.message, ...err.extra }, err.status);
         if (err instanceof ops.OpError) return c.json({ error: err.message }, err.status);
-        if ((err as { code?: string }).code === '23505')
-          return c.json({ error: 'already exists' }, 409);
-        if ((err as { code?: string }).code === '23514')
-          return c.json({ error: 'invalid value' }, 400);
+        const code = ops.pgCode(err);
+        if (code === '23505') return c.json({ error: 'already exists' }, 409);
+        if (code === '23514') return c.json({ error: 'invalid value' }, 400);
+        if (code === '22P02') return c.json({ error: 'not found' }, 404); // a malformed id names nothing
         throw err;
       }
     };
@@ -136,12 +143,11 @@ export function mountConsole(app: Hono, d: ConsoleDeps): void {
           password: Password,
         }),
       );
-      const id = await claimBootstrap(d.pool, {
-        token: b.token,
-        email: b.email,
-        name: b.name,
-        passwordHash: await hash(b.password),
-      });
+      const id = await claimBootstrap(
+        d.pool,
+        { token: b.token, email: b.email, name: b.name, password: b.password },
+        hash,
+      );
       // Wrong token, or already claimed: one answer for both.
       if (id === null) return c.json({ error: 'invalid or already used bootstrap token' }, 403);
       audit({ id, email: b.email, name: b.name, role: 'admin' }, 'bootstrap.claimed');
@@ -239,6 +245,17 @@ export function mountConsole(app: Hono, d: ConsoleDeps): void {
     '/api/servers/:slug',
     as('operator', async (c, u) => {
       const slug = c.req.param('slug') ?? '';
+      if (u.role !== 'admin') {
+        // Policy is the admin's (§5.3); a delete would cascade it away and a re-add would
+        // bring the server back without its denies. Only an admin may do that.
+        const rules = await d.pool.query(
+          'select 1 from policy_rule p join servers s on s.id = p.server_id where s.slug = $1 limit 1',
+          [slug],
+        );
+        if (rules.rowCount === 1) {
+          throw new HttpError(409, `policy rules target ${slug}; an admin must delete this server`);
+        }
+      }
       const r = await d.pool.query('delete from servers where slug = $1', [slug]);
       if (r.rowCount === 0) throw new HttpError(404, `no server named ${slug}`);
       audit(u, 'config.server.delete', { server: slug });
