@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { serve } from '@hono/node-server';
 import { createDb, createLogger, createPool, Engine, runMigrations } from '@mcprouter/core';
 import { AuditWriter } from './audit.js';
+import { ensureBootstrap } from './console/bootstrap.js';
 import { authenticateKey, createAuth } from './auth.js';
 import { startTruthWriter } from './integrity.js';
 import { loadConfig } from './config.js';
@@ -38,6 +39,15 @@ const app = createApp({
   registry,
   readiness,
   webRoot,
+  console: {
+    auth,
+    db,
+    pool,
+    engine,
+    keyring: config.secretKeys,
+    publicUrl: config.publicUrl,
+    audit: (row) => audit.push(row),
+  },
   mcp: {
     authenticate: (header) => authenticateKey(auth, db, header),
     engine,
@@ -68,6 +78,9 @@ if (config.migrateOnBoot) {
   readiness.migrationsApplied = true;
   log.warn({ evt: 'boot.migrate_skipped' }, 'MIGRATE_ON_BOOT=false');
 }
+
+// A fresh install prints its one-time admin claim token here (§6).
+await ensureBootstrap(pool, log);
 
 sync = await startServerSync({
   pool,

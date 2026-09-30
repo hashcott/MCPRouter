@@ -30,7 +30,7 @@ import { denyText, type Gate } from '../gate.js';
 
 export type CallRecord = {
   server: string | null;
-  item: string;
+  item: string | null;
   outcome: Outcome;
   durationMs: number;
   /** metadata mode (§8): argument key names and byte size, never values. */

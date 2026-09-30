@@ -37,8 +37,9 @@ export function createAuth({ db, secret, baseURL, log }: AuthDeps) {
     baseURL,
     basePath: '/api/auth',
     database: drizzleAdapter(db, { provider: 'pg', schema }),
-    // Humans sign in with the console (P3). Until then users are created by the CLI.
-    emailAndPassword: { enabled: false },
+    // Humans sign in to the console. Sign-UP stays closed: people are created by an admin
+    // (or claim the one bootstrap token on a fresh install), never by a stranger (P1c R2).
+    emailAndPassword: { enabled: true, disableSignUp: true, minPasswordLength: 12 },
     user: {
       additionalFields: {
         // input:false — otherwise a sign-up payload could set role:'admin' (§5.3).
@@ -87,4 +88,24 @@ export async function authenticateKey(
   if (role === undefined) return null;
   // §5.2: a machine credential is never admin, whatever its owner's role.
   return { principal: { id: r.key.referenceId, isAdmin: false }, keyId: r.key.id, grant, role };
+}
+
+/** better-auth's own password hash, so accounts we insert verify on sign-in. */
+export function passwordHasher(auth: Auth): (password: string) => Promise<string> {
+  return async (password) => (await auth.$context).password.hash(password);
+}
+
+export type SessionUser = { id: string; email: string; name: string; role: Role };
+
+/**
+ * The console's principal: a better-auth SESSION only. API keys never authenticate a
+ * console route (§5.2: a key never implies a human, let alone an admin) — the plugin
+ * mints no session for them (`enableSessionForAPIKeys: false`).
+ */
+export async function sessionUser(auth: Auth, headers: Headers): Promise<SessionUser | null> {
+  const s = await auth.api.getSession({ headers });
+  if (s === null) return null;
+  const role = ROLES.find((x) => x === (s.user as { role?: unknown }).role);
+  if (role === undefined) return null; // an unknown role is no role: fail closed
+  return { id: s.user.id, email: s.user.email, name: s.user.name, role };
 }

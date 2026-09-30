@@ -13,6 +13,7 @@ import {
 } from '@mcprouter/core';
 import type { KeyAuth } from './auth.js';
 import type { Config } from './config.js';
+import { mountConsole, type ConsoleDeps } from './console/index.js';
 import { makeGate } from './gate.js';
 import { canSee, checkGrant } from './grant.js';
 import { handleMcp, type CallRecord } from './mcp/legacy.js';
@@ -34,15 +35,25 @@ export interface AppDeps {
   webRoot?: string | undefined;
   /** Absent: the MCP surface and /api/auth are not mounted. */
   mcp?: McpDeps | undefined;
+  /** Absent: the console REST API is not mounted. */
+  console?: ConsoleDeps | undefined;
 }
 
 export type AuditRow = CallRecord & {
-  evt: 'tool.call' | 'integrity.block' | 'policy.deny';
+  /** tools/call outcomes, and console/config changes (`config.*`, `review.*`, `bootstrap.claimed`). */
+  evt:
+    | 'tool.call'
+    | 'integrity.block'
+    | 'policy.deny'
+    | 'bootstrap.claimed'
+    | `config.${string}`
+    | `review.${string}`;
   /** Identical denies in one flush window collapse into one row (§11.8). */
   count?: number;
   requestId: string | null;
   principalId: string;
-  keyId: string;
+  /** null for a console action: a person with a session, no key involved. */
+  keyId: string | null;
   route: string;
 };
 
@@ -66,9 +77,11 @@ export interface McpDeps {
 }
 
 /** §5.2: the plugin's client-facing routes. Keys are minted only by our own path. */
-export const API_KEY_ROUTES = ['create', 'get', 'list', 'update', 'delete'].map(
-  (r) => `/api/auth/api-key/${r}`,
-);
+export const API_KEY_ROUTES = [
+  ...['create', 'get', 'list', 'update', 'delete'].map((r) => `/api/auth/api-key/${r}`),
+  // Sign-up is closed (disableSignUp); dark it as well, so it is not even a probe surface.
+  '/api/auth/sign-up/email',
+];
 
 const KNOWN_ROUTES = new Set(['/health/live', '/health/ready', '/metrics', '/mcp']);
 const UNMATCHED = '__unmatched__';
@@ -128,6 +141,7 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   if (deps.mcp !== undefined) mountMcp(app, deps.mcp, registry);
+  if (deps.console !== undefined) mountConsole(app, deps.console);
 
   if (deps.webRoot !== undefined) {
     const root = deps.webRoot;

@@ -6,7 +6,16 @@ export function describe(): string {
 
 export { createApp, type AppDeps, type AuditRow, type McpDeps } from './app.js';
 export { AuditWriter } from './audit.js';
-export { authenticateKey, createAuth, KEY_GRANT_ALL, type Auth, type KeyAuth } from './auth.js';
+export {
+  authenticateKey,
+  createAuth,
+  KEY_GRANT_ALL,
+  passwordHasher,
+  sessionUser,
+  type Auth,
+  type KeyAuth,
+  type SessionUser,
+} from './auth.js';
 export { loadConfig, parseConfig, type Config } from './config.js';
 export { createRegistry } from './metrics.js';
 export { startServerSync, type ServerSync } from './servers-sync.js';
@@ -31,3 +40,7 @@ export {
   type Role,
   type RuleRow,
 } from './policy.js';
+export * as ops from './console/ops.js';
+export type { PolicyAdd } from './console/ops.js';
+export { claimBootstrap, ensureBootstrap } from './console/bootstrap.js';
+export { clientConfig, mountConsole, type ConsoleDeps } from './console/index.js';

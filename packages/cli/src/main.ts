@@ -1,6 +1,6 @@
 import { parseArgs } from 'node:util';
 import { createDb, createLogger, createPool, createServer } from '@mcprouter/core';
-import { createAuth, loadConfig } from '@mcprouter/server';
+import { createAuth, loadConfig, passwordHasher } from '@mcprouter/server';
 import {
   addGroup,
   addPolicy,
@@ -22,7 +22,7 @@ import {
 const HELP = `mcprouter <command>
 
   secret                                      print a fresh AUTH_SECRET and MCPR_SECRET_KEYS
-  users add --email <e> --name <n> [--role viewer|operator|admin]
+  users add --email <e> --name <n> [--role viewer|operator|admin] [--password-env VAR]
   keys create --email <e> [--name <n>] [--group <g>]… | [--server <s>]…   print a new API key (shown once); neither: every server
   servers add <slug> --url <url> [--sse] [--header K=V | --header K]… [--allow-private-network] [--disabled]
   servers add <slug> [--env K=V | --env K]… [--cwd <dir>] -- <command> [args…]
@@ -64,6 +64,7 @@ async function run(): Promise<void> {
           email: { type: 'string' },
           name: { type: 'string' },
           role: { type: 'string', default: 'viewer' },
+          'password-env': { type: 'string' },
         },
       });
       const role = values.role;
@@ -71,8 +72,24 @@ async function run(): Promise<void> {
         throw new CliError('--email and --name are required');
       if (role !== 'viewer' && role !== 'operator' && role !== 'admin')
         throw new CliError('--role must be viewer, operator or admin');
+      const passwordVar = values['password-env'];
+      const password = passwordVar === undefined ? undefined : process.env[passwordVar];
+      if (passwordVar !== undefined && (password === undefined || password.length < 12)) {
+        throw new CliError(`${passwordVar} must hold a password of at least 12 characters`);
+      }
+      const hash =
+        password === undefined
+          ? undefined
+          : passwordHasher(
+              createAuth({
+                db,
+                secret: config.authSecret,
+                baseURL: config.publicUrl.href,
+                log: createLogger({ level: 'warn', file: undefined, pretty: false }),
+              }),
+            );
       process.stdout.write(
-        `${await addUser(pool, { email: values.email, name: values.name, role })}\n`,
+        `${await addUser(pool, { email: values.email, name: values.name, role, password }, hash)}\n`,
       );
     } else if (cmd === 'keys' && sub === 'create') {
       const { values } = parseArgs({
